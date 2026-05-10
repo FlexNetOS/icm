@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.47](https://github.com/rtk-ai/icm/compare/icm-v0.10.46...icm-v0.10.47) (2026-05-10)
+
+
+### Bug Fixes
+
+* **hook:** extract output from per-tool tool_response shapes (Bash/Read/Write) ([#216](https://github.com/rtk-ai/icm/issues/216)) ([fa8a20c](https://github.com/rtk-ai/icm/commit/fa8a20cac30a2b8f5f2876c8367a8d42fd3bed2a))
+
 ## [0.10.46](https://github.com/rtk-ai/icm/compare/icm-v0.10.45...icm-v0.10.46) (2026-05-10)
 
 
