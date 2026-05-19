@@ -12,6 +12,7 @@ mod recall_format;
 mod summarizer;
 #[cfg(feature = "tui")]
 mod tui;
+mod uninstall;
 mod upgrade;
 #[cfg(feature = "web")]
 mod web;
@@ -307,6 +308,15 @@ enum Commands {
 
     /// Diagnose ICM integration: check hook binary paths in Claude Code settings
     Doctor,
+
+    /// Reverse `icm init`: remove ICM config from every detected AI tool.
+    ///
+    /// Default behavior: timestamped backups under
+    /// `~/.icm-uninstall-backups/<ts>/`, preserves your SQLite memory DB.
+    /// Use `--purge-data` to delete the DB and fastembed cache too.
+    /// Use `--dry-run` or `--audit` for a preview; `--check` for an exit-code
+    /// signal (0 = clean). See issue #229.
+    Uninstall(uninstall::UninstallOpts),
 
     /// Run performance benchmark on in-memory store
     Bench {
@@ -1318,6 +1328,10 @@ fn main() -> Result<()> {
         },
         Commands::Init { mode, force } => cmd_init(mode, force),
         Commands::Doctor => cmd_doctor(),
+        Commands::Uninstall(opts) => {
+            let code = uninstall::run(opts)?;
+            std::process::exit(code);
+        }
         Commands::Extract {
             project,
             text,
