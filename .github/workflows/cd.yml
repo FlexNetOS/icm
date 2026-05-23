@@ -117,8 +117,18 @@ jobs:
       release_created: ${{ steps.release.outputs.releases_created }}
       tag_name: ${{ steps.release.outputs['crates/icm-cli--tag_name'] }}
     steps:
+      # The default workflow token cannot open PRs in this org; mint a
+      # short-lived token from the configured GitHub App instead.
+      - uses: actions/create-github-app-token@v3
+        id: app-token
+        with:
+          app-id: ${{ secrets.APP_CLIENT_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+
       - uses: googleapis/release-please-action@v4
         id: release
+        with:
+          token: ${{ steps.app-token.outputs.token }}
 
   build-release:
     name: Build and upload release assets
