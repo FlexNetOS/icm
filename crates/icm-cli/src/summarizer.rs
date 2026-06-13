@@ -55,10 +55,34 @@ impl ProviderKind {
     }
 }
 
+/// True when we are running inside a Claude Code session (hook, tool, or
+/// `claude -p` subprocess). Claude Code exports these in every child process.
+pub fn inside_claude_code() -> bool {
+    std::env::var("CLAUDECODE").is_ok() || std::env::var("CLAUDE_CODE_SESSION_ID").is_ok()
+}
+
 /// Resolve `Auto` into a concrete provider by inspecting environment hints
 /// left by the invoking tool. Falls back to the configured `fallback` when
 /// no hint matches.
+///
+/// CONTAINMENT (runaway-session fix, 2026-06-12): if detection resolves to the
+/// Claude CLI *while we are already inside a Claude Code session*, it is clamped
+/// to `None`. Spawning `claude -p` from within a session re-enters the
+/// `SessionEnd → icm hook end → extract-pending → claude -p` path — an unbounded
+/// recursion that spawned ~571k sessions and burned ~70% of quota on
+/// 2026-06-12. The agent CLI must never summarize for the agent that hosts it.
 pub fn detect_provider(fallback: ProviderKind) -> ProviderKind {
+    let chosen = detect_provider_raw(fallback);
+    if inside_claude_code() && matches!(chosen, ProviderKind::Claude) {
+        return ProviderKind::None;
+    }
+    chosen
+}
+
+/// Raw environment-hint detection, before the containment clamp in
+/// [`detect_provider`]. Kept separate so the clamp is the single authoritative
+/// guard against Claude-inside-Claude recursion.
+fn detect_provider_raw(fallback: ProviderKind) -> ProviderKind {
     if let Ok(forced) = std::env::var("ICM_INVOKER") {
         if let Ok(p) = ProviderKind::parse(&forced) {
             if p != ProviderKind::Auto {
@@ -173,9 +197,27 @@ impl Summarizer for ClaudeCliSummarizer {
         "claude"
     }
     fn summarize(&self, req: &SummarizeRequest<'_>) -> Result<String> {
+        // CONTAINMENT (runaway-session fix, 2026-06-12): refuse to spawn
+        // `claude -p` from inside a Claude session or recursively from another
+        // icm-spawned summarization. This is the last guard before the exact
+        // call that caused the cascade; detect_provider() should already have
+        // clamped us to None, but a misconfigured explicit `provider = "claude"`
+        // must not re-open the loop.
+        if inside_claude_code() {
+            bail!(
+                "refusing to spawn `claude -p` from inside a Claude Code session \
+                 (recursion containment — see 2026-06-12 runaway audit)"
+            );
+        }
+        if std::env::var("ICM_SUMMARIZE_GUARD").is_ok() {
+            bail!("refusing recursive `claude -p` (ICM_SUMMARIZE_GUARD already set)");
+        }
         let model = req.model.unwrap_or("claude-haiku-4-5");
         let args = vec!["-p", "--model", model];
-        run_cli("claude", &args, req.prompt, req.timeout).map(trim_response)
+        std::env::set_var("ICM_SUMMARIZE_GUARD", "1");
+        let out = run_cli("claude", &args, req.prompt, req.timeout).map(trim_response);
+        std::env::remove_var("ICM_SUMMARIZE_GUARD");
+        out
     }
 }
 
@@ -339,6 +381,7 @@ mod tests {
         let snapshot: Vec<_> = [
             "ICM_INVOKER",
             "CLAUDECODE",
+            "CLAUDE_CODE_SESSION_ID",
             "CLAUDE_CLI",
             "CODEX_HOME",
             "CODEX_CLI",
@@ -363,6 +406,47 @@ mod tests {
         }
 
         assert_eq!(result, ProviderKind::Claude);
+    }
+
+    /// CONTAINMENT regression test (2026-06-12 runaway): inside a Claude Code
+    /// session, auto-detection must NEVER resolve to the Claude CLI — even when
+    /// the fallback is explicitly `Claude` (as `resolve_consolidate_provider`
+    /// passes). It must clamp to `None` so extraction drains via fastembed
+    /// instead of spawning a recursive `claude -p`.
+    #[test]
+    fn detect_clamps_claude_to_none_inside_claude_code() {
+        let keys = [
+            "ICM_INVOKER",
+            "CLAUDECODE",
+            "CLAUDE_CODE_SESSION_ID",
+            "CLAUDE_CLI",
+            "CODEX_HOME",
+            "CODEX_CLI",
+            "GEMINI_CLI",
+            "GOOGLE_CLOUD_PROJECT",
+            "OLLAMA_HOST",
+        ];
+        let snapshot: Vec<_> = keys.iter().map(|k| (*k, std::env::var(k).ok())).collect();
+        for k in &keys {
+            std::env::remove_var(k);
+        }
+        // Simulate running inside a Claude Code hook/session.
+        std::env::set_var("CLAUDECODE", "1");
+
+        // Fallback = Claude is exactly what resolve_consolidate_provider passes.
+        let clamped_fallback = detect_provider(ProviderKind::Claude);
+        // Fallback = Auto is the bare auto path.
+        let clamped_auto = detect_provider(ProviderKind::Auto);
+
+        for (k, v) in snapshot {
+            std::env::remove_var(k);
+            if let Some(val) = v {
+                std::env::set_var(k, val);
+            }
+        }
+
+        assert_eq!(clamped_fallback, ProviderKind::None);
+        assert_eq!(clamped_auto, ProviderKind::None);
     }
 
     #[test]
