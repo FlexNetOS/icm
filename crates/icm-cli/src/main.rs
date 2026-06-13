@@ -5171,6 +5171,39 @@ fn cli_on_path(name: &str) -> bool {
 /// whether facts were extracted (so an output with no extractable
 /// content doesn't loop forever).
 #[allow(clippy::too_many_arguments)]
+/// Acquire a single-instance lock for the extraction drain.
+///
+/// CONTAINMENT (runaway-session fix, 2026-06-12): overlapping `extract-pending`
+/// runs amplified the cascade — each drain could spawn its own summarizer and
+/// re-fire hooks. A non-blocking `flock` caps concurrent drains at one. Returns
+/// the held lock file on success, `Ok(None)` if another drain holds it, and is
+/// best-effort (a lock-setup error degrades to "proceed without the guard").
+fn acquire_extract_lock() -> Result<Option<std::fs::File>> {
+    use std::os::unix::io::AsRawFd;
+    let dir = std::env::var_os("XDG_CACHE_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".cache")))
+        .unwrap_or_else(std::env::temp_dir)
+        .join("icm");
+    std::fs::create_dir_all(&dir).ok();
+    let path = dir.join("extract-pending.lock");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&path)
+        .with_context(|| format!("opening extract-pending lock {}", path.display()))?;
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if rc == 0 {
+        return Ok(Some(file));
+    }
+    let err = std::io::Error::last_os_error();
+    match err.raw_os_error() {
+        Some(code) if code == libc::EWOULDBLOCK || code == libc::EAGAIN => Ok(None),
+        _ => bail!("flock on extract-pending lock failed: {err}"),
+    }
+}
+
 fn cmd_extract_pending(
     store: &SqliteStore,
     embedder: Option<&dyn icm_core::Embedder>,
@@ -5180,6 +5213,20 @@ fn cmd_extract_pending(
     cli_model: Option<&str>,
     dry_run: bool,
 ) -> Result<()> {
+    // Single-instance containment guard: only one drain may run at a time. Held
+    // for the lifetime of this call (released on drop / process exit).
+    let _drain_lock: Option<std::fs::File> = match acquire_extract_lock() {
+        Ok(Some(lock)) => Some(lock),
+        Ok(None) => {
+            eprintln!("[extract-pending] another drain already in progress — skipping");
+            return Ok(());
+        }
+        Err(e) => {
+            eprintln!("[extract-pending] single-instance lock unavailable ({e}) — proceeding best-effort");
+            None
+        }
+    };
+
     let pending = store.list_pending_extractions(limit)?;
     if pending.is_empty() {
         println!("No pending extractions.");
