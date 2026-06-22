@@ -5222,7 +5222,9 @@ fn cmd_extract_pending(
             return Ok(());
         }
         Err(e) => {
-            eprintln!("[extract-pending] single-instance lock unavailable ({e}) — proceeding best-effort");
+            eprintln!(
+                "[extract-pending] single-instance lock unavailable ({e}) — proceeding best-effort"
+            );
             None
         }
     };
