@@ -1,15 +1,19 @@
-//! Output formats for `icm recall`.
+//! Output formats for `icm recall` (and `icm list`, which reuses the
+//! same renderers).
 //!
-//! Three modes:
+//! Four modes:
 //! - `Toon` (default) — TOON one-row-per-memory, header declared once.
 //!   Smallest token cost when stdout gets piped into an LLM context.
 //! - `Detail` — the legacy multi-line labelled view, for humans reading
 //!   the terminal (also the format expected by older scripts).
 //! - `Json` — `serde_json` array, for tooling that wants to parse.
+//! - `Toml` — TOML `[[memories]]` array for config-friendly consumption
+//!   (issue #269 — used by TakoIA-style agents reading their memory map
+//!   straight from a TOML file).
 
 use anyhow::Result;
 use clap::ValueEnum;
-use icm_core::Memory;
+use icm_core::{format_local, Memory};
 use serde::Serialize;
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -20,6 +24,10 @@ pub enum RecallFormat {
     Detail,
     /// Machine-readable JSON array.
     Json,
+    /// TOML `[[memories]]` array. Config-friendly: easy to embed in
+    /// `~/.icm/config.toml`-style files or consume from Rust/Python TOML
+    /// parsers.
+    Toml,
 }
 
 /// Render a list of `(memory, score)` pairs into the chosen format.
@@ -33,6 +41,7 @@ pub fn render(results: &[(Memory, Option<f32>)], format: RecallFormat) -> Result
         RecallFormat::Toon => render_toon(results),
         RecallFormat::Detail => render_detail(results),
         RecallFormat::Json => render_json(results)?,
+        RecallFormat::Toml => render_toml(results)?,
     })
 }
 
@@ -99,12 +108,12 @@ fn render_detail(results: &[(Memory, Option<f32>)]) -> String {
         let _ = writeln!(
             &mut out,
             "  created:    {}",
-            m.created_at.format("%Y-%m-%d %H:%M")
+            format_local(&m.created_at, "%Y-%m-%d %H:%M")
         );
         let _ = writeln!(
             &mut out,
             "  accessed:   {} (x{})",
-            m.last_accessed.format("%Y-%m-%d %H:%M"),
+            format_local(&m.last_accessed, "%Y-%m-%d %H:%M"),
             m.access_count
         );
         let _ = writeln!(&mut out, "  summary:    {}", m.summary);
@@ -138,6 +147,52 @@ fn render_json(results: &[(Memory, Option<f32>)]) -> Result<String> {
         })
         .collect();
     Ok(serde_json::to_string_pretty(&rows)?)
+}
+
+fn render_toml(results: &[(Memory, Option<f32>)]) -> Result<String> {
+    /// Mirror of `Memory`'s public shape but `Serialize`-friendly for
+    /// `toml::to_string`. The base `Memory` impls already derive
+    /// `Serialize`, but we cherry-pick fields so the TOML stays compact
+    /// (skip `embedding`, the per-memory float vector — usually 384+
+    /// dims, useless in a human-readable TOML).
+    #[derive(Serialize)]
+    struct Row<'a> {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        score: Option<f32>,
+        id: &'a str,
+        topic: &'a str,
+        importance: String,
+        weight: f32,
+        access_count: u32,
+        created_at: String,
+        last_accessed: String,
+        summary: &'a str,
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        keywords: Vec<&'a str>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        raw_excerpt: Option<&'a str>,
+    }
+    #[derive(Serialize)]
+    struct Doc<'a> {
+        memories: Vec<Row<'a>>,
+    }
+    let rows: Vec<Row> = results
+        .iter()
+        .map(|(m, s)| Row {
+            score: *s,
+            id: &m.id,
+            topic: &m.topic,
+            importance: m.importance.to_string(),
+            weight: m.weight,
+            access_count: m.access_count,
+            created_at: m.created_at.to_rfc3339(),
+            last_accessed: m.last_accessed.to_rfc3339(),
+            summary: &m.summary,
+            keywords: m.keywords.iter().map(String::as_str).collect(),
+            raw_excerpt: m.raw_excerpt.as_deref(),
+        })
+        .collect();
+    Ok(toml::to_string(&Doc { memories: rows })?)
 }
 
 #[cfg(test)]
@@ -207,6 +262,42 @@ mod tests {
         assert!(s.contains("\"id\": \"01HZZ0\""));
     }
 
+    /// Regression for issue #254: the `--format detail` path used to
+    /// call `m.created_at.format(...)` directly on the `DateTime<Utc>`,
+    /// printing UTC timestamps even when the user's `TZ` shifted the
+    /// local clock. The fix routes through `icm_core::format_local` so
+    /// the displayed string matches `icm list` / `icm stats`.
+    #[test]
+    fn detail_renders_timestamps_in_local_timezone() {
+        use chrono::{Local, TimeZone, Utc};
+        let mut m = Memory::new("topic-tz".into(), "tz fixture".into(), Importance::High);
+        m.id = "01HZZTZ".into();
+        m.created_at = Utc.with_ymd_and_hms(2026, 5, 10, 12, 34, 0).unwrap();
+        m.last_accessed = m.created_at;
+
+        let s = render_detail(&[(m.clone(), None)]);
+
+        let expected_created = m
+            .created_at
+            .with_timezone(&Local)
+            .format("%Y-%m-%d %H:%M")
+            .to_string();
+        let expected_accessed = m
+            .last_accessed
+            .with_timezone(&Local)
+            .format("%Y-%m-%d %H:%M")
+            .to_string();
+
+        assert!(
+            s.contains(&format!("created:    {expected_created}")),
+            "expected local-formatted created, output was:\n{s}",
+        );
+        assert!(
+            s.contains(&format!("accessed:   {expected_accessed} (x0)")),
+            "expected local-formatted accessed, output was:\n{s}",
+        );
+    }
+
     #[test]
     fn empty_list_renders_clean() {
         let empty: Vec<(Memory, Option<f32>)> = Vec::new();
@@ -216,5 +307,45 @@ mod tests {
         );
         assert_eq!(render_detail(&empty), "");
         assert_eq!(render_json(&empty).unwrap(), "[]");
+    }
+
+    #[test]
+    fn toml_round_trips_through_a_parser() {
+        // Take the fixture, render it as TOML, parse it back, and check
+        // we still see the field shape from issue #269.
+        let s = render_toml(&fixture()).unwrap();
+        let parsed: toml::Value = toml::from_str(&s).unwrap();
+        let memories = parsed
+            .get("memories")
+            .and_then(|v| v.as_array())
+            .expect("expected [[memories]] array");
+        assert_eq!(memories.len(), 2);
+        let first = &memories[0];
+        for required in [
+            "id",
+            "topic",
+            "importance",
+            "weight",
+            "access_count",
+            "created_at",
+            "last_accessed",
+            "summary",
+        ] {
+            assert!(
+                first.get(required).is_some(),
+                "missing field {required} in TOML row: {first}"
+            );
+        }
+    }
+
+    #[test]
+    fn toml_empty_list_renders_clean() {
+        let empty: Vec<(Memory, Option<f32>)> = Vec::new();
+        let s = render_toml(&empty).unwrap();
+        // toml crate emits no header line when the array is empty.
+        assert!(
+            s.trim().is_empty() || s == "memories = []\n",
+            "unexpected empty TOML: {s:?}"
+        );
     }
 }

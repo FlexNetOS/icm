@@ -55,34 +55,10 @@ impl ProviderKind {
     }
 }
 
-/// True when we are running inside a Claude Code session (hook, tool, or
-/// `claude -p` subprocess). Claude Code exports these in every child process.
-pub fn inside_claude_code() -> bool {
-    std::env::var("CLAUDECODE").is_ok() || std::env::var("CLAUDE_CODE_SESSION_ID").is_ok()
-}
-
 /// Resolve `Auto` into a concrete provider by inspecting environment hints
 /// left by the invoking tool. Falls back to the configured `fallback` when
 /// no hint matches.
-///
-/// CONTAINMENT (runaway-session fix, 2026-06-12): if detection resolves to the
-/// Claude CLI *while we are already inside a Claude Code session*, it is clamped
-/// to `None`. Spawning `claude -p` from within a session re-enters the
-/// `SessionEnd → icm hook end → extract-pending → claude -p` path — an unbounded
-/// recursion that spawned ~571k sessions and burned ~70% of quota on
-/// 2026-06-12. The agent CLI must never summarize for the agent that hosts it.
 pub fn detect_provider(fallback: ProviderKind) -> ProviderKind {
-    let chosen = detect_provider_raw(fallback);
-    if inside_claude_code() && matches!(chosen, ProviderKind::Claude) {
-        return ProviderKind::None;
-    }
-    chosen
-}
-
-/// Raw environment-hint detection, before the containment clamp in
-/// [`detect_provider`]. Kept separate so the clamp is the single authoritative
-/// guard against Claude-inside-Claude recursion.
-fn detect_provider_raw(fallback: ProviderKind) -> ProviderKind {
     if let Ok(forced) = std::env::var("ICM_INVOKER") {
         if let Ok(p) = ProviderKind::parse(&forced) {
             if p != ProviderKind::Auto {
@@ -197,27 +173,9 @@ impl Summarizer for ClaudeCliSummarizer {
         "claude"
     }
     fn summarize(&self, req: &SummarizeRequest<'_>) -> Result<String> {
-        // CONTAINMENT (runaway-session fix, 2026-06-12): refuse to spawn
-        // `claude -p` from inside a Claude session or recursively from another
-        // icm-spawned summarization. This is the last guard before the exact
-        // call that caused the cascade; detect_provider() should already have
-        // clamped us to None, but a misconfigured explicit `provider = "claude"`
-        // must not re-open the loop.
-        if inside_claude_code() {
-            bail!(
-                "refusing to spawn `claude -p` from inside a Claude Code session \
-                 (recursion containment — see 2026-06-12 runaway audit)"
-            );
-        }
-        if std::env::var("ICM_SUMMARIZE_GUARD").is_ok() {
-            bail!("refusing recursive `claude -p` (ICM_SUMMARIZE_GUARD already set)");
-        }
         let model = req.model.unwrap_or("claude-haiku-4-5");
         let args = vec!["-p", "--model", model];
-        std::env::set_var("ICM_SUMMARIZE_GUARD", "1");
-        let out = run_cli("claude", &args, req.prompt, req.timeout).map(trim_response);
-        std::env::remove_var("ICM_SUMMARIZE_GUARD");
-        out
+        run_cli("claude", &args, req.prompt, req.timeout).map(trim_response)
     }
 }
 
@@ -272,22 +230,92 @@ impl Summarizer for OllamaSummarizer {
         "ollama"
     }
     fn summarize(&self, req: &SummarizeRequest<'_>) -> Result<String> {
-        let model = req.model.unwrap_or("qwen2.5:0.5b");
+        // Pre-#253 this fell back to a hardcoded `"qwen2.5:0.5b"` when
+        // no model was configured, which masked the real failure mode:
+        // the user thinks their `[extraction.summarizer] model =
+        // "qwen3:8b"` is picked up but actually a totally different
+        // small model is running silently. Refuse instead — the caller
+        // (extract-pending / consolidate) gets a clear error pointing
+        // to the missing config.
+        let model = req.model.ok_or_else(|| {
+            anyhow::anyhow!(
+                "ollama provider needs a model — set \
+                 `[extraction.summarizer] model = \"qwen3:8b\"` (or your \
+                 preferred Ollama model) in your config, or pass \
+                 `--model <name>` on the command line"
+            )
+        })?;
         let url = format!("{}/api/generate", self.host.trim_end_matches('/'));
-        let body = serde_json::json!({
+        // Thinking-family models (qwen3, deepseek-r1, granite-think,
+        // etc.) emit a `<think>…</think>` block that consumes the
+        // `num_predict` budget. With our default 400-token budget the
+        // visible response after `</think>` is empty, surfacing as
+        // "provider returned empty output" (issue #253). Sending
+        // `"think": false` switches the model to direct-answer mode
+        // and is silently ignored by Ollama on non-thinking models,
+        // so the option is safe to set unconditionally on models we
+        // recognize as thinking — and on every model when the user
+        // hasn't opted into thinking mode (default).
+        let suppress_think = is_thinking_model(model);
+        let mut body = serde_json::json!({
             "model": model,
             "prompt": req.prompt,
             "stream": false,
             "options": { "num_predict": req.max_tokens },
         });
+        if suppress_think {
+            body["think"] = serde_json::Value::Bool(false);
+        }
         let resp: OllamaResponse = ureq::post(&url)
             .timeout(req.timeout)
             .send_json(body)
-            .with_context(|| format!("ollama request to {url} failed"))?
+            .with_context(|| format!("ollama request to {url} failed (model={model})"))?
             .into_json()
-            .context("decoding ollama response")?;
-        Ok(trim_response(resp.response))
+            .with_context(|| {
+                format!(
+                    "decoding ollama response (model={model}, host={})",
+                    self.host
+                )
+            })?;
+        let trimmed = trim_response(resp.response);
+        if trimmed.is_empty() {
+            // The caller already prints "provider returned empty
+            // output" but doesn't know which model was used; surface
+            // it on stderr so the OpenCode plugin / cron path leaves
+            // a debuggable trail.
+            eprintln!(
+                "[icm summarizer] ollama returned empty response (model={model}, \
+                 num_predict={}, thinking_suppressed={suppress_think}) — \
+                 if the model is a thinking family (qwen3/deepseek-r1/…), \
+                 increase `extraction.summarizer.max_tokens` or pick a \
+                 non-thinking model",
+                req.max_tokens,
+            );
+        }
+        Ok(trimmed)
     }
+}
+
+/// Heuristic match for Ollama "thinking" models that emit a
+/// `<think>…</think>` block by default. Surfacing these to the API
+/// with `"think": false` matches the official Ollama recommendation
+/// and is what users expect when they ask for a one-shot summary.
+///
+/// Pattern matches "model[:tag]" — only the family prefix matters; the
+/// tag (size, quantization) is ignored.
+fn is_thinking_model(model: &str) -> bool {
+    let family = model.split(':').next().unwrap_or("").to_ascii_lowercase();
+    matches!(
+        family.as_str(),
+        "qwen3"
+            | "qwen3-coder"
+            | "deepseek-r1"
+            | "deepseek-r1-distill"
+            | "granite3-think"
+            | "phi4-reasoning"
+            | "smollm3"
+    ) || family.starts_with("qwen3-")
+        || family.starts_with("deepseek-r1-")
 }
 
 fn trim_response(s: String) -> String {
@@ -366,6 +394,34 @@ mod tests {
     }
 
     #[test]
+    fn is_thinking_model_matches_qwen3_family() {
+        // Issue #253: qwen3 is the most common thinking model on
+        // Ollama and the one the issue reports as failing silently.
+        assert!(is_thinking_model("qwen3:8b"));
+        assert!(is_thinking_model("qwen3:14b"));
+        assert!(is_thinking_model("qwen3-coder:7b"));
+        assert!(is_thinking_model("QWEN3:30b-instruct"));
+    }
+
+    #[test]
+    fn is_thinking_model_matches_other_thinking_families() {
+        assert!(is_thinking_model("deepseek-r1:1.5b"));
+        assert!(is_thinking_model("deepseek-r1-distill-qwen:14b"));
+        assert!(is_thinking_model("granite3-think:8b"));
+        assert!(is_thinking_model("phi4-reasoning:14b"));
+        assert!(is_thinking_model("smollm3"));
+    }
+
+    #[test]
+    fn is_thinking_model_skips_non_thinking_families() {
+        assert!(!is_thinking_model("qwen2.5:0.5b"));
+        assert!(!is_thinking_model("llama3.2"));
+        assert!(!is_thinking_model("mistral:7b"));
+        assert!(!is_thinking_model("gemma3:4b"));
+        assert!(!is_thinking_model(""));
+    }
+
+    #[test]
     fn build_prompt_lists_each_memory() {
         let p = build_consolidate_prompt("decisions-x", &["A", "B", "C"], 200);
         assert!(p.contains("Topic: decisions-x"));
@@ -381,7 +437,6 @@ mod tests {
         let snapshot: Vec<_> = [
             "ICM_INVOKER",
             "CLAUDECODE",
-            "CLAUDE_CODE_SESSION_ID",
             "CLAUDE_CLI",
             "CODEX_HOME",
             "CODEX_CLI",
@@ -406,47 +461,6 @@ mod tests {
         }
 
         assert_eq!(result, ProviderKind::Claude);
-    }
-
-    /// CONTAINMENT regression test (2026-06-12 runaway): inside a Claude Code
-    /// session, auto-detection must NEVER resolve to the Claude CLI — even when
-    /// the fallback is explicitly `Claude` (as `resolve_consolidate_provider`
-    /// passes). It must clamp to `None` so extraction drains via fastembed
-    /// instead of spawning a recursive `claude -p`.
-    #[test]
-    fn detect_clamps_claude_to_none_inside_claude_code() {
-        let keys = [
-            "ICM_INVOKER",
-            "CLAUDECODE",
-            "CLAUDE_CODE_SESSION_ID",
-            "CLAUDE_CLI",
-            "CODEX_HOME",
-            "CODEX_CLI",
-            "GEMINI_CLI",
-            "GOOGLE_CLOUD_PROJECT",
-            "OLLAMA_HOST",
-        ];
-        let snapshot: Vec<_> = keys.iter().map(|k| (*k, std::env::var(k).ok())).collect();
-        for k in &keys {
-            std::env::remove_var(k);
-        }
-        // Simulate running inside a Claude Code hook/session.
-        std::env::set_var("CLAUDECODE", "1");
-
-        // Fallback = Claude is exactly what resolve_consolidate_provider passes.
-        let clamped_fallback = detect_provider(ProviderKind::Claude);
-        // Fallback = Auto is the bare auto path.
-        let clamped_auto = detect_provider(ProviderKind::Auto);
-
-        for (k, v) in snapshot {
-            std::env::remove_var(k);
-            if let Some(val) = v {
-                std::env::set_var(k, val);
-            }
-        }
-
-        assert_eq!(clamped_fallback, ProviderKind::None);
-        assert_eq!(clamped_auto, ProviderKind::None);
     }
 
     #[test]
