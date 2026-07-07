@@ -1,5 +1,34 @@
 # Changelog
 
+## [0.10.57](https://github.com/rtk-ai/icm/compare/icm-v0.10.56...icm-v0.10.57) (2026-06-24)
+
+
+### Features
+
+* **store:** runtime backend selection via ICM_DB_BACKEND ([#301](https://github.com/rtk-ai/icm/issues/301)) ([ae6c205](https://github.com/rtk-ai/icm/commit/ae6c20599be49f868d4c0f183d7758890c645d1f))
+* **store:** select storage backend at runtime via ICM_DB_BACKEND ([#301](https://github.com/rtk-ai/icm/issues/301)) ([13a3fbd](https://github.com/rtk-ai/icm/commit/13a3fbd31d8b71a97be1f6a214c47cfd0e78a6bd))
+
+## [0.10.56](https://github.com/rtk-ai/icm/compare/icm-v0.10.55...icm-v0.10.56) (2026-06-23)
+
+
+### Features
+
+* **store:** add opt-in pluggable OpenSearch backend ([#301](https://github.com/rtk-ai/icm/issues/301)) ([0f03cab](https://github.com/rtk-ai/icm/commit/0f03cab8a830fc9fd2ed84d01b03e2b94e1c1bc0))
+* **store:** opt-in pluggable OpenSearch backend ([#301](https://github.com/rtk-ai/icm/issues/301)) ([9722daa](https://github.com/rtk-ai/icm/commit/9722daaf1ad8b2d5f47292660f27855608884f9e))
+
+## [0.10.55](https://github.com/rtk-ai/icm/compare/icm-v0.10.54...icm-v0.10.55) (2026-06-23)
+
+
+### Features
+
+* **store:** add opt-in pluggable PostgreSQL backend ([#301](https://github.com/rtk-ai/icm/issues/301)) ([9d3426b](https://github.com/rtk-ai/icm/commit/9d3426bdb8cb7855728e92341294bff537645c62))
+* **store:** opt-in pluggable PostgreSQL backend ([#301](https://github.com/rtk-ai/icm/issues/301)) ([f5325b5](https://github.com/rtk-ai/icm/commit/f5325b5d0dff3c074a9b8697aca952e57eea4b3c))
+
+
+### Bug Fixes
+
+* **cli:** compile the postgres backend without the embeddings feature ([6f7dff1](https://github.com/rtk-ai/icm/commit/6f7dff15979b1cda50bddcf46e40b9862f9d5847))
+
 ## [0.10.54](https://github.com/rtk-ai/icm/compare/icm-v0.10.53...icm-v0.10.54) (2026-06-21)
 
 
