@@ -1,10 +1,14 @@
+mod archive;
 mod bench_data;
 mod bench_format;
 mod bench_knowledge;
+
 pub mod cloud;
 mod config;
 mod extract;
 mod extract_semantic;
+#[cfg(feature = "http-api")]
+mod http_api;
 mod import;
 mod install_manifest;
 #[cfg(test)]
@@ -26,11 +30,12 @@ use clap::{Parser, Subcommand, ValueEnum};
 use serde_json::Value;
 
 use icm_core::{
-    build_wake_up, format_local, is_preference_topic, keyword_matches, project_matches,
-    topic_matches, Concept, ConceptLink, Feedback, FeedbackStore, Importance, Label, Memoir,
-    MemoirStore, Memory, MemoryStore, Relation, WakeUpFormat, WakeUpOptions, MSG_NO_MEMORIES,
+    build_wake_up, find_similar_memory, format_local, is_preference_topic, keyword_matches,
+    project_matches, topic_matches, Concept, ConceptLink, Feedback, FeedbackStore, Importance,
+    Label, Memoir, MemoirStore, Memory, MemoryStore, Relation, WakeUpFormat, WakeUpOptions,
+    DEDUP_SIMILARITY_THRESHOLD, MSG_NO_MEMORIES,
 };
-use icm_store::SqliteStore;
+use icm_store::Store;
 
 #[derive(Parser)]
 #[command(
@@ -39,18 +44,28 @@ use icm_store::SqliteStore;
     about = "Infinite Context Memory - persistent memory for LLMs"
 )]
 struct Cli {
-    /// Path to the SQLite database. Audit #185 medium: `clap`'s
-    /// `global = true` lets the same flag appear at both the parent
-    /// and subcommand level (`icm --db A stats --db B`), with the
-    /// last occurrence winning silently. We collect into a `Vec` so
-    /// we can detect that case and reject it with a clear error
-    /// instead of letting the user lose data with the wrong DB.
+    /// Path to the SQLite database (overrides config and ICM_DB env var).
+    /// Used by the default SQLite backend; ignored when ICM_DB_BACKEND
+    /// selects a remote backend (postgres / opensearch).
     #[arg(long, global = true, action = clap::ArgAction::Append)]
     db: Vec<PathBuf>,
 
     /// Disable embeddings (skip model download, use keyword search only)
     #[arg(long, global = true)]
     no_embeddings: bool,
+
+    /// Open the database in read-only mode (issue #263).
+    ///
+    /// Read-like commands (`recall`, `list`, `stats`, `topics`, `health`)
+    /// work against an existing DB in environments where the
+    /// filesystem cannot be written to (sandboxed CI, Codex
+    /// scheduled read-only automations). Auto-decay and
+    /// `last_accessed` / `access_count` bookkeeping are skipped.
+    /// Write commands (`store`, `update`, `forget`, `decay`, `prune`,
+    /// `consolidate`, etc.) error out clearly. Also enabled via
+    /// `ICM_READONLY=1`.
+    #[arg(long, global = true)]
+    read_only: bool,
 
     #[command(subcommand)]
     command: Commands,
@@ -79,6 +94,25 @@ enum Commands {
         /// Raw excerpt (verbatim code, error message, etc.)
         #[arg(short, long)]
         raw: Option<String>,
+    },
+
+    /// Shorthand for `store` with positional content. Topic defaults to the
+    /// auto-detected project name (git remote or cwd).
+    Remember {
+        /// Fact to remember
+        content: String,
+
+        /// Topic/category (default: auto-detected project name)
+        #[arg(short, long)]
+        topic: Option<String>,
+
+        /// Importance level
+        #[arg(short, long, default_value = "medium")]
+        importance: CliImportance,
+
+        /// Keywords (comma-separated)
+        #[arg(short, long)]
+        keywords: Option<String>,
     },
 
     /// Search memories
@@ -127,6 +161,17 @@ enum Commands {
         /// Sort by field
         #[arg(short, long, default_value = "weight")]
         sort: SortField,
+
+        /// Output format. `human` (default) is the legacy multi-line
+        /// labelled view kept for terminal users; `toon`, `json`, and
+        /// `toml` reuse the `icm recall` serializers so external
+        /// tooling can enumerate a topic programmatically (issue #269).
+        #[arg(short = 'f', long, default_value = "human")]
+        format: ListFormat,
+
+        /// Maximum rows to return. Default: no limit.
+        #[arg(short = 'l', long)]
+        limit: Option<usize>,
     },
 
     /// Forget (delete) a memory by ID, or all memories in a topic
@@ -164,6 +209,15 @@ enum Commands {
         topic: Option<String>,
     },
 
+    /// Structured-facts subcommands (issue #273) — exact (entity, key,
+    /// value) lookup distinct from semantic recall. `set` on an
+    /// existing key supersedes the previous value while keeping the
+    /// history.
+    Facts {
+        #[command(subcommand)]
+        command: FactsCommands,
+    },
+
     /// Feedback subcommands — record and search prediction corrections
     Feedback {
         #[command(subcommand)]
@@ -174,6 +228,15 @@ enum Commands {
     Transcript {
         #[command(subcommand)]
         command: TranscriptCommands,
+    },
+
+    /// Session archive (issue #272) — UX-friendly entry point for the
+    /// verbatim sessions/messages tables that the hook auto-archive
+    /// feeds. Internally delegates to the same store as `transcript`,
+    /// but exposes the read-only subset most agents care about.
+    Sessions {
+        #[command(subcommand)]
+        command: SessionsCommands,
     },
 
     /// Detect recurring patterns in a topic and optionally create memoir concepts
@@ -314,6 +377,18 @@ enum Commands {
         /// doesn't pollute every project tree.
         #[arg(long)]
         per_project: bool,
+
+        /// Install the Codex CLI PostToolUse hook (`icm hook post`).
+        /// Off by default since Codex fires PostToolUse on every shell
+        /// command — a reasonable session generates ~14k events / 24h
+        /// (issue #288) and the auto-extracted memories are mostly
+        /// tool-output bloat (paths, patch snippets, help text). With
+        /// MCP + AGENTS.md alone, Codex still stores via the
+        /// `icm_memory_store` MCP tool. Opt in if you want PostToolUse
+        /// extraction on Codex anyway; tune `[extraction]` first
+        /// (`extract_every`, `min_score`, `store_raw=false`).
+        #[arg(long)]
+        with_codex_post_hook: bool,
     },
 
     /// Diagnose ICM integration: check hook binary paths in Claude Code settings
@@ -327,6 +402,38 @@ enum Commands {
     /// Use `--dry-run` or `--audit` for a preview; `--check` for an exit-code
     /// signal (0 = clean). See issue #229.
     Uninstall(uninstall::UninstallOpts),
+
+    /// List files the agent has worked in during recent sessions.
+    ///
+    /// Rows are populated automatically by the PostToolUse hook
+    /// (`icm hook post`) whenever Claude Code / Codex / Gemini /
+    /// Copilot calls Edit / Write / MultiEdit / NotebookEdit on a
+    /// file. Same `(project, file_path)` increments `touch_count`
+    /// instead of duplicating rows. See issue #196.
+    CodeAreas {
+        /// Filter to a single path (exact match, or a suffix like
+        /// `src/foo.rs` to match any project rooted above it).
+        #[arg(long, value_name = "PATH")]
+        in_file: Option<String>,
+
+        /// Limit to a specific project. Default: all projects.
+        #[arg(short, long)]
+        project: Option<String>,
+
+        /// Only show files touched since this ISO-8601 timestamp
+        /// (e.g. `2026-05-01T00:00:00Z`).
+        #[arg(long)]
+        since: Option<String>,
+
+        /// Maximum rows to return.
+        #[arg(short, long, default_value = "50")]
+        limit: usize,
+
+        /// Output format. `table` is the default human view; `json`
+        /// emits one JSON array per stdout line for scripts.
+        #[arg(long, default_value = "table")]
+        format: CodeAreasFormat,
+    },
 
     /// Run performance benchmark on in-memory store
     Bench {
@@ -418,6 +525,31 @@ enum Commands {
         /// Exclude global preferences/identity memories
         #[arg(long)]
         no_preferences: bool,
+    },
+
+    /// Print the deterministic identity/preferences snapshot (issue #271)
+    ///
+    /// Unlike `wake-up` which mixes decisions/errors/milestones into a
+    /// semantic-ish pack, this is the always-on baseline: identity +
+    /// durable preferences (+ project-context bullets when `--project`
+    /// is set). Designed to be injected at SessionStart **separately
+    /// from semantic recall** so the agent always has its baseline.
+    ///
+    /// Emits an `over_budget` consolidate hint when the snapshot is
+    /// `>=80%` of the budget AND at least one entry was dropped
+    /// (Hermes pattern: never silently drop without warning).
+    Context {
+        /// Project filter (default: auto-detect from PWD/git remote; use "-" to disable)
+        #[arg(short, long)]
+        project: Option<String>,
+
+        /// Approximate token budget (1 token ≈ 4 characters)
+        #[arg(short = 't', long, default_value = "1200")]
+        max_tokens: usize,
+
+        /// Output format
+        #[arg(short, long, default_value = "markdown")]
+        format: CliSnapshotFormat,
     },
 
     /// Auto-save context for the current project (detects from PWD / git remote)
@@ -531,9 +663,28 @@ enum Commands {
         #[cfg(feature = "web")]
         #[arg(long)]
         expose: bool,
+
+        /// Run a persistent local HTTP API on the given address instead
+        /// of the MCP stdio server. The embedding model and SQLite
+        /// store load ONCE and stay warm across requests (~9 s saved
+        /// per call vs. one-shot CLI). Default bind is what you pass;
+        /// `127.0.0.1:<port>` keeps the server localhost-only.
+        /// Endpoints: POST /recall, POST /store, POST /consolidate,
+        /// GET /stats, GET /topics, GET /health. Issue #290.
+        #[cfg(feature = "http-api")]
+        #[arg(long, value_name = "ADDR")]
+        http: Option<std::net::SocketAddr>,
+
+        /// Require `Authorization: Bearer <TOKEN>` on every HTTP
+        /// request (only meaningful with `--http`). Absent token =
+        /// open localhost API.
+        #[cfg(feature = "http-api")]
+        #[arg(long, value_name = "TOKEN")]
+        token: Option<String>,
     },
 
-    /// Claude Code hook handlers (read JSON from stdin, output hook response)
+    /// Hook handlers shared across Claude Code, Codex, Gemini, and
+    /// Copilot (read JSON from stdin, output hook response).
     Hook {
         #[command(subcommand)]
         command: HookCommands,
@@ -782,6 +933,51 @@ enum MemoirCommands {
 }
 
 #[derive(Subcommand)]
+enum FactsCommands {
+    /// Set a fact: `entity.key = value`. If a row already exists for
+    /// the same `(entity, key)` and its value differs, the previous
+    /// row is marked `superseded_at = now` (history retained) and a
+    /// new active row is inserted.
+    Set {
+        /// Entity (e.g. "project:icm", "host:db-prod-1", "service:api")
+        entity: String,
+        /// Key (e.g. "gcp.project", "version", "owner")
+        key: String,
+        /// Value to set
+        value: String,
+        /// Where this fact came from (optional)
+        #[arg(short, long, default_value = "cli")]
+        source: String,
+    },
+
+    /// Get the active value for `entity.key`. Exits 1 if absent.
+    Get {
+        /// Entity to look up
+        entity: String,
+        /// Key to look up
+        key: String,
+    },
+
+    /// List active facts for an entity (optionally prefix-filtered).
+    List {
+        /// Entity to enumerate
+        entity: String,
+        /// Optional key prefix (e.g. "gcp." or "deploy.")
+        #[arg(short, long)]
+        prefix: Option<String>,
+    },
+
+    /// Show the supersession history for an `(entity, key)` slot.
+    History { entity: String, key: String },
+
+    /// Delete every row (active + history) for an `(entity, key)` slot.
+    Forget { entity: String, key: String },
+
+    /// Global facts statistics.
+    Stats,
+}
+
+#[derive(Subcommand)]
 enum FeedbackCommands {
     /// Record a prediction correction (what AI predicted vs what was correct)
     Record {
@@ -937,6 +1133,52 @@ enum TranscriptCommands {
     },
 }
 
+#[derive(Subcommand)]
+enum SessionsCommands {
+    /// Full-text search across archived messages (BM25)
+    Search {
+        /// Query (FTS5 syntax: `OR`, `*` prefix, `"phrase"`)
+        query: String,
+        /// Only within this session id
+        #[arg(short, long)]
+        session: Option<String>,
+        /// Only within this project
+        #[arg(short, long)]
+        project: Option<String>,
+        /// Max results
+        #[arg(short, long, default_value = "10")]
+        limit: usize,
+    },
+
+    /// List archived sessions, newest first
+    List {
+        /// Filter by project
+        #[arg(short, long)]
+        project: Option<String>,
+        /// Max results
+        #[arg(short, long, default_value = "20")]
+        limit: usize,
+    },
+
+    /// Replay the full message thread of a session, chronologically
+    Show {
+        /// Session id
+        session: String,
+        /// Max messages to show
+        #[arg(short, long, default_value = "200")]
+        limit: usize,
+    },
+
+    /// Show global session-archive statistics
+    Stats,
+
+    /// Delete an archived session and all its messages
+    Forget {
+        /// Session id
+        session: String,
+    },
+}
+
 #[derive(Clone, ValueEnum)]
 enum CliImportance {
     Critical,
@@ -969,6 +1211,16 @@ impl From<CliWakeUpFormat> for WakeUpFormat {
             CliWakeUpFormat::Plain => WakeUpFormat::Plain,
         }
     }
+}
+
+#[derive(Clone, ValueEnum)]
+enum CliSnapshotFormat {
+    Markdown,
+    Plain,
+    /// JSON object with structured `sections` + `over_budget` + `dropped`
+    /// fields. Useful for downstream tools that want to render their own
+    /// hint UI instead of the in-band blockquote.
+    Json,
 }
 
 #[derive(Clone, ValueEnum)]
@@ -1017,6 +1269,46 @@ enum SortField {
     Accessed,
 }
 
+/// Output format for `icm list` (issue #269).
+///
+/// `Human` is the legacy multi-line view kept as the default to avoid
+/// breaking terminal users; `Toon`, `Json`, and `Toml` route through
+/// `recall_format::render` so the structured output matches what
+/// `icm recall --format <…>` produces for consistency.
+#[derive(Clone, Copy, ValueEnum, Debug)]
+enum ListFormat {
+    /// Legacy multi-line labelled view, for terminal reading. Default.
+    Human,
+    /// Compact TOON (header + CSV rows). Best token cost for LLM piping.
+    Toon,
+    /// `serde_json` array. Machine-readable.
+    Json,
+    /// TOML `[[memories]]` array. Config-friendly.
+    Toml,
+}
+
+impl ListFormat {
+    /// Whether this format reuses the `recall_format` renderer. `Human`
+    /// is handled inline by `cmd_list` to preserve the existing
+    /// `print_memory_detail` output verbatim.
+    fn as_recall_format(self) -> Option<recall_format::RecallFormat> {
+        match self {
+            ListFormat::Human => None,
+            ListFormat::Toon => Some(recall_format::RecallFormat::Toon),
+            ListFormat::Json => Some(recall_format::RecallFormat::Json),
+            ListFormat::Toml => Some(recall_format::RecallFormat::Toml),
+        }
+    }
+}
+
+#[derive(Clone, Copy, ValueEnum, Debug)]
+enum CodeAreasFormat {
+    /// Human-readable aligned table (default).
+    Table,
+    /// JSON array — one row per file. Machine-friendly.
+    Json,
+}
+
 #[derive(Clone, ValueEnum)]
 enum InitMode {
     /// MCP server plugin (Claude calls icm tools natively)
@@ -1044,9 +1336,77 @@ fn default_db_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("memories.db"))
 }
 
-fn open_store(db: Option<PathBuf>, embedding_dims: usize) -> Result<SqliteStore> {
+fn open_store(db: Option<PathBuf>, embedding_dims: usize) -> Result<Store> {
     let path = db.unwrap_or_else(default_db_path);
-    SqliteStore::with_dims(&path, embedding_dims).context("failed to open database")
+    Store::with_dims(&path, embedding_dims).context("failed to open database")
+}
+
+/// Open the store in read-only mode (issue #263). Resolves the path
+/// the same way as [`open_store`] and rejects with a helpful message
+/// if the DB doesn't exist yet — read-only mode cannot bootstrap a
+/// fresh DB.
+fn open_store_readonly(db: Option<PathBuf>) -> Result<Store> {
+    let path = db.unwrap_or_else(default_db_path);
+    Store::open_readonly(&path).with_context(|| {
+        format!(
+            "failed to open database read-only at {} \
+             (--read-only requires the DB to already exist)",
+            path.display()
+        )
+    })
+}
+
+/// True when the user asked for read-only mode either via the CLI
+/// flag or the `ICM_READONLY` env var (any non-empty / non-"0" value
+/// counts). Centralized so the env-var test mirrors what we document
+/// in the flag's help text.
+fn read_only_requested(cli_flag: bool) -> bool {
+    if cli_flag {
+        return true;
+    }
+    match std::env::var("ICM_READONLY") {
+        Ok(v) => !v.is_empty() && v != "0",
+        Err(_) => false,
+    }
+}
+
+/// Resolve the embedding dimension to open the store with.
+///
+/// Rules (issue #267):
+/// 1. An embedder is loaded → use its native dimension.
+/// 2. No embedder AND an existing DB has stored dims → use stored dims.
+///    This is the safe path: `--no-embeddings` (or a missing model) must
+///    not trigger the schema-init "stored != requested" branch that
+///    DROPs `vec_memories` and NULL-s every `memories.embedding`.
+/// 3. No embedder AND no existing DB → fall back to
+///    `DEFAULT_EMBEDDING_DIMS` (fresh install, nothing to lose).
+fn resolve_embedding_dims(
+    embedder: Option<&dyn icm_core::Embedder>,
+    cli_db: Option<&PathBuf>,
+    _cfg: &crate::config::Config,
+) -> usize {
+    if let Some(e) = embedder {
+        return e.dimensions();
+    }
+    let path = cli_db.cloned().unwrap_or_else(default_db_path);
+    match Store::read_stored_embedding_dims(&path) {
+        Ok(Some(dims)) => dims,
+        // No DB or no metadata row → fresh install path; default is safe.
+        Ok(None) => icm_core::DEFAULT_EMBEDDING_DIMS,
+        // Treat read failure as "don't know" and refuse to clobber: keep
+        // the default but trace a warning. Schema init will then refuse
+        // to migrate (its own dim check still runs), so worst-case the
+        // run errors loudly instead of silently dropping data.
+        Err(e) => {
+            tracing::warn!(
+                "could not peek stored embedding dims at {} ({}); \
+                 falling back to DEFAULT_EMBEDDING_DIMS",
+                path.display(),
+                e,
+            );
+            icm_core::DEFAULT_EMBEDDING_DIMS
+        }
+    }
 }
 
 #[cfg(feature = "embeddings")]
@@ -1054,8 +1414,35 @@ fn init_embedder(model: &str) -> Option<icm_core::FastEmbedder> {
     Some(icm_core::FastEmbedder::with_model(model))
 }
 
+/// Placeholder embedder for builds without the `embeddings` feature.
+///
+/// It is never instantiated (`init_embedder` always returns `None` and the
+/// runtime guards on `embeddings_enabled`), but giving the no-embeddings
+/// build a concrete `Embedder` type lets the many
+/// `embedder.as_ref().map(|e| e as &dyn Embedder)` call sites compile
+/// without per-site `#[cfg]` gates.
 #[cfg(not(feature = "embeddings"))]
-fn init_embedder(_model: &str) -> Option<()> {
+struct DisabledEmbedder;
+
+#[cfg(not(feature = "embeddings"))]
+impl icm_core::Embedder for DisabledEmbedder {
+    fn embed(&self, _text: &str) -> icm_core::IcmResult<Vec<f32>> {
+        Err(icm_core::IcmError::Embedding(
+            "this build was compiled without the `embeddings` feature".into(),
+        ))
+    }
+    fn embed_batch(&self, _texts: &[&str]) -> icm_core::IcmResult<Vec<Vec<f32>>> {
+        Err(icm_core::IcmError::Embedding(
+            "this build was compiled without the `embeddings` feature".into(),
+        ))
+    }
+    fn dimensions(&self) -> usize {
+        icm_core::DEFAULT_EMBEDDING_DIMS
+    }
+}
+
+#[cfg(not(feature = "embeddings"))]
+fn init_embedder(_model: &str) -> Option<DisabledEmbedder> {
     None
 }
 
@@ -1084,13 +1471,11 @@ fn main() -> Result<()> {
     } else {
         None
     };
-    let embedding_dims = embedder
-        .as_ref()
-        .map(|e| {
-            use icm_core::Embedder;
-            e.dimensions()
-        })
-        .unwrap_or(icm_core::DEFAULT_EMBEDDING_DIMS);
+    let embedding_dims = resolve_embedding_dims(
+        embedder.as_ref().map(|e| e as &dyn icm_core::Embedder),
+        cli.db.first(),
+        &cfg,
+    );
     // Audit #185 medium: reject `--db A ... --db B` (or with `=`)
     // instead of silently letting the last occurrence win. Clap
     // alone doesn't catch the parent+subcommand split case (the
@@ -1112,6 +1497,9 @@ fn main() -> Result<()> {
         }
     }
     let cli_db: Option<PathBuf> = cli.db.into_iter().next();
+    // `db_path` is consumed only by some feature-gated commands (e.g. the
+    // embeddings-only `embed`), so it can be unused in lean builds.
+    #[allow(unused_variables)]
     let db_path = cli_db.clone().unwrap_or_else(default_db_path);
 
     // `icm uninstall` must NOT open the SQLite store: a default
@@ -1125,7 +1513,11 @@ fn main() -> Result<()> {
         std::process::exit(code);
     }
 
-    let store = open_store(cli_db, embedding_dims)?;
+    let store = if read_only_requested(cli.read_only) {
+        open_store_readonly(cli_db)?
+    } else {
+        open_store(cli_db, embedding_dims)?
+    };
 
     match command {
         Commands::Store {
@@ -1148,6 +1540,26 @@ fn main() -> Result<()> {
                 importance.into(),
                 keywords,
                 raw,
+            )
+        }
+        Commands::Remember {
+            content,
+            topic,
+            importance,
+            keywords,
+        } => {
+            #[cfg(feature = "embeddings")]
+            let emb_ref = embedder.as_ref().map(|e| e as &dyn icm_core::Embedder);
+            #[cfg(not(feature = "embeddings"))]
+            let emb_ref: Option<&dyn icm_core::Embedder> = None;
+            cmd_remember(
+                &store,
+                emb_ref,
+                &cfg.memory,
+                content,
+                topic,
+                importance.into(),
+                keywords,
             )
         }
         Commands::Recall {
@@ -1173,7 +1585,13 @@ fn main() -> Result<()> {
                 format,
             )
         }
-        Commands::List { topic, all, sort } => cmd_list(&store, topic.as_deref(), all, sort),
+        Commands::List {
+            topic,
+            all,
+            sort,
+            format,
+            limit,
+        } => cmd_list(&store, topic.as_deref(), all, sort, format, limit),
         Commands::Forget { id, topic } => cmd_forget(&store, id.as_deref(), topic.as_deref()),
         Commands::Update {
             id,
@@ -1188,6 +1606,21 @@ fn main() -> Result<()> {
             cmd_update(&store, emb_ref, &id, content, importance, keywords)
         }
         Commands::Health { topic } => cmd_health(&store, topic.as_deref()),
+        Commands::Facts { command } => match command {
+            FactsCommands::Set {
+                entity,
+                key,
+                value,
+                source,
+            } => cmd_facts_set(&store, &entity, &key, &value, &source),
+            FactsCommands::Get { entity, key } => cmd_facts_get(&store, &entity, &key),
+            FactsCommands::List { entity, prefix } => {
+                cmd_facts_list(&store, &entity, prefix.as_deref())
+            }
+            FactsCommands::History { entity, key } => cmd_facts_history(&store, &entity, &key),
+            FactsCommands::Forget { entity, key } => cmd_facts_forget(&store, &entity, &key),
+            FactsCommands::Stats => cmd_facts_stats(&store),
+        },
         Commands::Feedback { command } => match command {
             FeedbackCommands::Record {
                 topic,
@@ -1254,6 +1687,28 @@ fn main() -> Result<()> {
             }
             TranscriptCommands::Stats => cmd_transcript_stats(&store),
             TranscriptCommands::Forget { session } => cmd_transcript_forget(&store, &session),
+        },
+        Commands::Sessions { command } => match command {
+            SessionsCommands::Search {
+                query,
+                session,
+                project,
+                limit,
+            } => cmd_transcript_search(
+                &store,
+                &query,
+                session.as_deref(),
+                project.as_deref(),
+                limit,
+            ),
+            SessionsCommands::List { project, limit } => {
+                cmd_transcript_list_sessions(&store, project.as_deref(), limit)
+            }
+            SessionsCommands::Show { session, limit } => {
+                cmd_transcript_show(&store, &session, limit)
+            }
+            SessionsCommands::Stats => cmd_transcript_stats(&store),
+            SessionsCommands::Forget { session } => cmd_transcript_forget(&store, &session),
         },
         Commands::ExtractPatterns {
             topic,
@@ -1364,9 +1819,24 @@ fn main() -> Result<()> {
             mode,
             force,
             per_project,
-        } => cmd_init(mode, force, per_project),
+            with_codex_post_hook,
+        } => cmd_init(mode, force, per_project, with_codex_post_hook),
         Commands::Doctor => cmd_doctor(),
         Commands::Uninstall(_) => unreachable!("dispatched before open_store"),
+        Commands::CodeAreas {
+            in_file,
+            project,
+            since,
+            limit,
+            format,
+        } => cmd_code_areas(
+            &store,
+            in_file.as_deref(),
+            project.as_deref(),
+            since.as_deref(),
+            limit,
+            format,
+        ),
         Commands::Extract {
             project,
             text,
@@ -1405,6 +1875,11 @@ fn main() -> Result<()> {
             format,
             no_preferences,
         } => cmd_wake_up(&store, project, max_tokens, format, no_preferences),
+        Commands::Context {
+            project,
+            max_tokens,
+            format,
+        } => cmd_context(&store, project, max_tokens, format),
         Commands::SaveProject {
             content,
             importance,
@@ -1452,6 +1927,10 @@ fn main() -> Result<()> {
             compact,
             #[cfg(feature = "web")]
             expose,
+            #[cfg(feature = "http-api")]
+            http,
+            #[cfg(feature = "http-api")]
+            token,
         } => {
             #[cfg(feature = "web")]
             if expose {
@@ -1463,6 +1942,15 @@ fn main() -> Result<()> {
                     cfg.web.username.clone(),
                     password,
                 );
+            }
+            // HTTP API path (issue #290): warm store + embedder behind
+            // an axum server. Routes to a different transport from
+            // stdio, so it's an `if let`, not an `else if expose`.
+            #[cfg(feature = "http-api")]
+            if let Some(addr) = http {
+                let boxed_emb: Option<Box<dyn icm_core::Embedder + Send + Sync>> =
+                    embedder.map(|e| Box::new(e) as Box<dyn icm_core::Embedder + Send + Sync>);
+                return http_api::run_http_server(store, boxed_emb, addr, token);
             }
             #[cfg(feature = "embeddings")]
             let emb_ref = embedder.as_ref().map(|e| e as &dyn icm_core::Embedder);
@@ -1510,6 +1998,7 @@ fn main() -> Result<()> {
                         extract_every,
                         cfg.extraction.store_raw,
                         &cfg.extraction.summarizer,
+                        &cfg.archive,
                     )
                 }
                 HookCommands::Compact => {
@@ -1519,7 +2008,7 @@ fn main() -> Result<()> {
                     let emb_ref: Option<&dyn icm_core::Embedder> = None;
                     cmd_hook_compact(&store, emb_ref, &cfg.memory)
                 }
-                HookCommands::Prompt => cmd_hook_prompt(&store),
+                HookCommands::Prompt => cmd_hook_prompt(&store, &cfg.archive),
                 HookCommands::Start { max_tokens } => {
                     let tokens = if max_tokens > 0 {
                         max_tokens
@@ -1540,11 +2029,7 @@ fn main() -> Result<()> {
             let exit_code = if result.is_ok() { 0 } else { 1 };
             let note = result.as_ref().err().map(|e| {
                 let s = e.to_string();
-                if s.len() > 200 {
-                    s[..200].to_string()
-                } else {
-                    s
-                }
+                truncate_at_char_boundary(&s, 200).to_string()
             });
             let _ = store.record_hook_event(&icm_store::HookEventInsert {
                 event: event_name.to_string(),
@@ -1585,7 +2070,7 @@ fn main() -> Result<()> {
 /// every write path stays consistent. Errors are logged and swallowed
 /// — consolidation is a maintenance op, not on the critical path.
 fn maybe_auto_consolidate(
-    store: &SqliteStore,
+    store: &Store,
     embedder: Option<&dyn icm_core::Embedder>,
     topic: &str,
     cfg: &crate::config::MemoryConfig,
@@ -1605,7 +2090,7 @@ fn maybe_auto_consolidate(
 
 #[allow(clippy::too_many_arguments)]
 fn cmd_store(
-    store: &SqliteStore,
+    store: &Store,
     embedder: Option<&dyn icm_core::Embedder>,
     memory_cfg: &crate::config::MemoryConfig,
     topic: String,
@@ -1625,6 +2110,46 @@ fn cmd_store(
         match emb.embed(&memory.embed_text()) {
             Ok(vec) => memory.embedding = Some(vec),
             Err(e) => eprintln!("warning: embedding failed: {e}"),
+        }
+    }
+
+    // Dedup: if a very similar memory already exists in the same topic, update it instead
+    if let Some(ref emb) = memory.embedding {
+        if let Ok(Some((existing, score))) = find_similar_memory(
+            store,
+            &memory.embed_text(),
+            emb,
+            &topic,
+            DEDUP_SIMILARITY_THRESHOLD,
+        ) {
+            let updated = Memory {
+                id: existing.id.clone(),
+                created_at: existing.created_at,
+                updated_at: chrono::Utc::now(),
+                last_accessed: existing.last_accessed,
+                access_count: existing.access_count,
+                weight: 1.0,
+                topic: existing.topic.clone(),
+                summary: memory.summary.clone(),
+                raw_excerpt: memory.raw_excerpt.clone().or(existing.raw_excerpt),
+                keywords: if memory.keywords.is_empty() {
+                    existing.keywords
+                } else {
+                    memory.keywords.clone()
+                },
+                embedding: memory.embedding.clone(),
+                importance,
+                source: existing.source,
+                related_ids: existing.related_ids,
+                scope: existing.scope,
+            };
+            store.update(&updated)?;
+            println!(
+                "Updated existing memory (similarity {score:.2}): {}",
+                updated.id
+            );
+            maybe_auto_consolidate(store, embedder, &topic, memory_cfg);
+            return Ok(());
         }
     }
 
@@ -1665,9 +2190,41 @@ fn cmd_store(
     Ok(())
 }
 
+/// `remember` is `store` with a positional content arg and an auto-detected
+/// topic when `--topic` is omitted.
+#[allow(clippy::too_many_arguments)]
+fn cmd_remember(
+    store: &Store,
+    embedder: Option<&dyn icm_core::Embedder>,
+    memory_cfg: &crate::config::MemoryConfig,
+    content: String,
+    topic: Option<String>,
+    importance: Importance,
+    keywords: Option<String>,
+) -> Result<()> {
+    if content.trim().is_empty() {
+        anyhow::bail!("content cannot be empty - provide something to remember");
+    }
+    let resolved_topic = topic.unwrap_or_else(|| {
+        let project = detect_project();
+        eprintln!("Project: {project}");
+        project
+    });
+    cmd_store(
+        store,
+        embedder,
+        memory_cfg,
+        resolved_topic,
+        content,
+        importance,
+        keywords,
+        None,
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn cmd_recall(
-    store: &SqliteStore,
+    store: &Store,
     embedder: Option<&dyn icm_core::Embedder>,
     query: &str,
     topic: Option<&str>,
@@ -1692,7 +2249,7 @@ fn cmd_recall(
 
     // Try hybrid search if embedder is available; fall back to FTS / keywords.
     let scored: Option<Vec<(Memory, f32)>> = embedder
-        .and_then(|emb| emb.embed(query).ok())
+        .and_then(|emb| emb.embed_query(query).ok())
         .and_then(|query_emb| store.search_hybrid(query, &query_emb, limit).ok());
 
     let (mut results, has_score): (Vec<(Memory, Option<f32>)>, bool) = match scored {
@@ -1776,7 +2333,14 @@ fn cmd_recall(
     Ok(())
 }
 
-fn cmd_list(store: &SqliteStore, topic: Option<&str>, all: bool, sort: SortField) -> Result<()> {
+fn cmd_list(
+    store: &Store,
+    topic: Option<&str>,
+    all: bool,
+    sort: SortField,
+    format: ListFormat,
+    limit: Option<usize>,
+) -> Result<()> {
     let mut memories = if let Some(t) = topic {
         store.get_by_topic(t)?
     } else if all {
@@ -1798,19 +2362,45 @@ fn cmd_list(store: &SqliteStore, topic: Option<&str>, all: bool, sort: SortField
         SortField::Accessed => memories.sort_by_key(|b| std::cmp::Reverse(b.last_accessed)),
     }
 
+    if let Some(n) = limit {
+        memories.truncate(n);
+    }
+
     if memories.is_empty() {
-        println!("{MSG_NO_MEMORIES}");
+        // Empty: keep the structured formats valid (`[]`, empty TOON
+        // header, empty TOML) so scripts can pipe straight in.
+        match format.as_recall_format() {
+            Some(f) => {
+                let rendered = recall_format::render(&[], f)?;
+                if !rendered.is_empty() {
+                    print!("{rendered}");
+                }
+            }
+            None => println!("{MSG_NO_MEMORIES}"),
+        }
         return Ok(());
     }
 
-    for mem in &memories {
-        print_memory_detail(mem, None);
+    match format.as_recall_format() {
+        Some(f) => {
+            // Reuse `recall`'s serializers. `score` is None for the
+            // list path since enumeration has no relevance score.
+            let pairs: Vec<(icm_core::Memory, Option<f32>)> =
+                memories.into_iter().map(|m| (m, None)).collect();
+            let rendered = recall_format::render(&pairs, f)?;
+            print!("{rendered}");
+        }
+        None => {
+            for mem in &memories {
+                print_memory_detail(mem, None);
+            }
+        }
     }
 
     Ok(())
 }
 
-fn cmd_forget(store: &SqliteStore, id: Option<&str>, topic: Option<&str>) -> Result<()> {
+fn cmd_forget(store: &Store, id: Option<&str>, topic: Option<&str>) -> Result<()> {
     match (id, topic) {
         (Some(_), Some(_)) => {
             // Audit #185 medium: previously the topic path silently
@@ -1848,7 +2438,7 @@ fn cmd_forget(store: &SqliteStore, id: Option<&str>, topic: Option<&str>) -> Res
 }
 
 fn cmd_update(
-    store: &SqliteStore,
+    store: &Store,
     embedder: Option<&dyn icm_core::Embedder>,
     id: &str,
     content: String,
@@ -1884,7 +2474,7 @@ fn cmd_update(
     Ok(())
 }
 
-fn cmd_health(store: &SqliteStore, topic_filter: Option<&str>) -> Result<()> {
+fn cmd_health(store: &Store, topic_filter: Option<&str>) -> Result<()> {
     let topics = if let Some(t) = topic_filter {
         vec![(t.to_string(), 0usize)]
     } else {
@@ -1944,7 +2534,7 @@ fn cmd_health(store: &SqliteStore, topic_filter: Option<&str>) -> Result<()> {
 }
 
 fn cmd_feedback_record(
-    store: &SqliteStore,
+    store: &Store,
     topic: String,
     context: String,
     predicted: String,
@@ -1969,7 +2559,7 @@ fn cmd_feedback_record(
 }
 
 fn cmd_feedback_search(
-    store: &SqliteStore,
+    store: &Store,
     query: &str,
     topic: Option<&str>,
     limit: usize,
@@ -1998,7 +2588,7 @@ fn cmd_feedback_search(
     Ok(())
 }
 
-fn cmd_feedback_list(store: &SqliteStore, topic: Option<&str>, limit: usize) -> Result<()> {
+fn cmd_feedback_list(store: &Store, topic: Option<&str>, limit: usize) -> Result<()> {
     let results = store.list_feedback(topic, limit)?;
     if results.is_empty() {
         match topic {
@@ -2026,7 +2616,7 @@ fn cmd_feedback_list(store: &SqliteStore, topic: Option<&str>, limit: usize) -> 
     Ok(())
 }
 
-fn cmd_feedback_stats(store: &SqliteStore) -> Result<()> {
+fn cmd_feedback_stats(store: &Store) -> Result<()> {
     let stats = store.feedback_stats()?;
     println!("Feedback total: {}", stats.total);
 
@@ -2051,7 +2641,7 @@ fn cmd_feedback_stats(store: &SqliteStore) -> Result<()> {
 // ---------------------------------------------------------------------------
 
 fn cmd_transcript_start_session(
-    store: &SqliteStore,
+    store: &Store,
     agent: &str,
     project: Option<&str>,
     metadata: Option<&str>,
@@ -2063,7 +2653,7 @@ fn cmd_transcript_start_session(
 }
 
 fn cmd_transcript_record(
-    store: &SqliteStore,
+    store: &Store,
     session: &str,
     role: &str,
     content: &str,
@@ -2080,7 +2670,7 @@ fn cmd_transcript_record(
 }
 
 fn cmd_transcript_search(
-    store: &SqliteStore,
+    store: &Store,
     query: &str,
     session: Option<&str>,
     project: Option<&str>,
@@ -2119,11 +2709,7 @@ fn cmd_transcript_search(
     Ok(())
 }
 
-fn cmd_transcript_list_sessions(
-    store: &SqliteStore,
-    project: Option<&str>,
-    limit: usize,
-) -> Result<()> {
+fn cmd_transcript_list_sessions(store: &Store, project: Option<&str>, limit: usize) -> Result<()> {
     use icm_core::TranscriptStore;
     let sessions = store.list_sessions(project, limit)?;
     if sessions.is_empty() {
@@ -2150,7 +2736,7 @@ fn cmd_transcript_list_sessions(
     Ok(())
 }
 
-fn cmd_transcript_show(store: &SqliteStore, session: &str, limit: usize) -> Result<()> {
+fn cmd_transcript_show(store: &Store, session: &str, limit: usize) -> Result<()> {
     use icm_core::TranscriptStore;
     let meta = store.get_session(session)?;
     let meta = match meta {
@@ -2188,7 +2774,7 @@ fn cmd_transcript_show(store: &SqliteStore, session: &str, limit: usize) -> Resu
     Ok(())
 }
 
-fn cmd_transcript_stats(store: &SqliteStore) -> Result<()> {
+fn cmd_transcript_stats(store: &Store) -> Result<()> {
     use icm_core::TranscriptStore;
     let s = store.transcript_stats()?;
     println!("Sessions:      {}", s.total_sessions);
@@ -2232,7 +2818,7 @@ fn cmd_transcript_stats(store: &SqliteStore) -> Result<()> {
     Ok(())
 }
 
-fn cmd_transcript_forget(store: &SqliteStore, session: &str) -> Result<()> {
+fn cmd_transcript_forget(store: &Store, session: &str) -> Result<()> {
     use icm_core::TranscriptStore;
     store.forget_session(session)?;
     println!("Deleted session {session}");
@@ -2279,18 +2865,19 @@ fn cmd_hook_pre() -> Result<()> {
         return Ok(());
     }
 
-    // Auto-allow: output hook response JSON
-    let tool_input = json
-        .get("tool_input")
-        .cloned()
-        .unwrap_or_else(|| serde_json::json!({}));
-
+    // Auto-allow: output hook response JSON.
+    //
+    // `updatedInput` is intentionally omitted — we are not rewriting the
+    // tool input, only granting permission. Including it as a passthrough
+    // worked on early Claude Code builds but codex-cli 0.130.0 rejects
+    // the response with "PreToolUse hook returned unsupported
+    // updatedInput" (issue #237), and the Claude Code spec lists the
+    // field as optional. Omitting it is forward-compatible.
     let response = serde_json::json!({
         "hookSpecificOutput": {
             "hookEventName": "PreToolUse",
             "permissionDecision": "allow",
-            "permissionDecisionReason": "ICM auto-allow",
-            "updatedInput": tool_input
+            "permissionDecisionReason": "ICM auto-allow"
         }
     });
 
@@ -2487,6 +3074,42 @@ fn extract_tool_output(json: &Value) -> Option<&str> {
     None
 }
 
+/// Extract `tool_input.file_path` from a PostToolUse JSON payload, in
+/// the shapes ICM has observed across Claude Code 1.x / 2.x, Codex,
+/// and Gemini. Returns `None` when the field is absent, empty, or the
+/// payload is structured differently. Used by the code-areas
+/// auto-capture (issue #196) — never call from a path where the
+/// absence of the field should be an error.
+fn extract_tool_input_file_path(json: &Value) -> Option<String> {
+    fn nonempty(v: &Value) -> Option<String> {
+        v.as_str().filter(|s| !s.is_empty()).map(|s| s.to_string())
+    }
+
+    // Claude Code 2.x: `tool_input.file_path`.
+    if let Some(s) = json.get("tool_input").and_then(|t| t.get("file_path")) {
+        if let Some(s) = nonempty(s) {
+            return Some(s);
+        }
+    }
+    // Claude Code 1.x legacy and some Codex variants: top-level.
+    if let Some(s) = json.get("file_path") {
+        if let Some(s) = nonempty(s) {
+            return Some(s);
+        }
+    }
+    // Some MCP servers nest the input under `arguments`.
+    if let Some(s) = json
+        .get("tool_input")
+        .and_then(|t| t.get("arguments"))
+        .and_then(|a| a.get("file_path"))
+    {
+        if let Some(s) = nonempty(s) {
+            return Some(s);
+        }
+    }
+    None
+}
+
 /// PostToolUse hook: auto-extract context every N tool calls.
 /// Reads JSON from stdin. Runs extraction asynchronously.
 ///
@@ -2502,12 +3125,13 @@ fn extract_tool_output(json: &Value) -> Option<&str> {
 ///    fastembed semantic-scoring extractor — multilingual, but pays
 ///    a ~3.7s model-load cost per process.
 fn cmd_hook_post(
-    store: &SqliteStore,
+    store: &Store,
     embedder: Option<&dyn icm_core::Embedder>,
     memory_cfg: &crate::config::MemoryConfig,
     extract_every: usize,
     store_raw: bool,
     extraction_summarizer: &crate::config::SummarizerConfig,
+    archive_cfg: &crate::config::ArchiveConfig,
 ) -> Result<()> {
     let Some(input) = read_stdin_utf8_lossy() else {
         return Ok(());
@@ -2523,6 +3147,42 @@ fn cmd_hook_post(
     // Skip ICM's own tools (avoid infinite loop)
     if tool_name.starts_with("icm_") || tool_name.starts_with("mcp__icm__") {
         return Ok(());
+    }
+
+    // Session archive (issue #272): tee every tool fire into the
+    // verbatim store BEFORE the extraction counter, so the searchable
+    // archive is independent of `extract_every`. No-op when
+    // `[archive].enabled = false`.
+    if archive_cfg.enabled {
+        let tool_output_for_archive = extract_tool_output(&json).unwrap_or("");
+        if !tool_output_for_archive.is_empty() {
+            archive::record_event(
+                store,
+                archive_cfg,
+                &json,
+                icm_core::transcript::Role::Tool,
+                tool_output_for_archive,
+                Some(tool_name).filter(|s| !s.is_empty()),
+            );
+        }
+    }
+
+    // ── Code areas auto-capture (issue #196) ─────────────────────────
+    // Independent of the extract counter: every Edit/Write tool call
+    // gets one row in `code_areas` (touch_count++ on re-touch).
+    // Failure is non-fatal — never block the hook on stats inserts.
+    if matches!(tool_name, "Edit" | "Write" | "MultiEdit" | "NotebookEdit") {
+        if let Some(file_path) = extract_tool_input_file_path(&json) {
+            let project = project_from_cwd_json(&json).unwrap_or_else(|| "project".to_string());
+            let session_id = json.get("session_id").and_then(|v| v.as_str());
+            let _ = store.upsert_code_area(
+                &project,
+                &file_path,
+                None, // description left empty in MVP; #165 will wire LLM summaries later
+                session_id,
+                Some(tool_name),
+            );
+        }
     }
 
     // Track tool calls in SQLite (atomic, persists across reboots)
@@ -2549,11 +3209,7 @@ fn cmd_hook_post(
         return Ok(());
     }
 
-    // Get project name from cwd
-    let project = std::env::current_dir()
-        .ok()
-        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
-        .unwrap_or_else(|| "project".to_string());
+    let project = project_from_cwd_json(&json).unwrap_or_else(|| "project".to_string());
 
     // Async path: enqueue raw output and return without loading the
     // embedder. The worker (`icm extract-pending` / SessionEnd fork) will
@@ -2563,11 +3219,7 @@ fn cmd_hook_post(
         // Cap to 8 KB to keep the queue reasonable. LLM extraction works
         // fine on the most recent slice; very long outputs are rare and
         // their tail is what matters most for auto-context anyway.
-        let capped = if tool_output.len() > 8192 {
-            &tool_output[tool_output.len() - 8192..]
-        } else {
-            tool_output
-        };
+        let capped = truncate_tail_at_char_boundary(tool_output, 8192);
         match store.enqueue_pending_extraction(&project, tool_name, capped) {
             Ok(_) => {
                 eprintln!(
@@ -2612,7 +3264,7 @@ fn cmd_hook_post(
 
 /// PreCompact hook (Layer 1): extract memories from transcript before context compression.
 fn cmd_hook_compact(
-    store: &SqliteStore,
+    store: &Store,
     embedder: Option<&dyn icm_core::Embedder>,
     memory_cfg: &crate::config::MemoryConfig,
 ) -> Result<()> {
@@ -2626,7 +3278,7 @@ fn cmd_hook_compact(
 /// (Claude Code does not log SessionEnd attachments in its session
 /// JSONL, so this DB-side log is the source of truth).
 fn cmd_hook_log(
-    store: &SqliteStore,
+    store: &Store,
     limit: usize,
     event: Option<&str>,
     prune_older_than: Option<&str>,
@@ -2666,7 +3318,7 @@ fn cmd_hook_log(
 /// `icm hook-stats` — aggregate `hook_events` over a lookback window.
 /// Reports per-event count, error rate, and latency p50/p99 so users can
 /// confirm the async path stays under its budget.
-fn cmd_hook_stats(store: &SqliteStore, since_hours: u64) -> Result<()> {
+fn cmd_hook_stats(store: &Store, since_hours: u64) -> Result<()> {
     let cutoff = chrono::Utc::now() - chrono::Duration::hours(since_hours as i64);
     let rows = store.hook_stats(&cutoff.to_rfc3339())?;
     if rows.is_empty() {
@@ -2697,10 +3349,10 @@ fn cmd_hook_stats(store: &SqliteStore, since_hours: u64) -> Result<()> {
 /// that PreCompact misses (compaction does not fire on `/clear`).
 ///
 /// Same transcript-parsing logic as PreCompact — the only difference is the
-/// log prefix. SqliteStore handles its own dedup so a session that triggers
+/// log prefix. Store handles its own dedup so a session that triggers
 /// both PreCompact and SessionEnd back-to-back will not double-store facts.
 fn cmd_hook_end(
-    store: &SqliteStore,
+    store: &Store,
     embedder: Option<&dyn icm_core::Embedder>,
     memory_cfg: &crate::config::MemoryConfig,
     extraction_summarizer: &crate::config::SummarizerConfig,
@@ -2765,7 +3417,7 @@ fn cmd_hook_end(
 /// Reads JSON from stdin with `transcript_path`, reads the JSONL transcript,
 /// and extracts facts from assistant messages.
 fn extract_from_hook_transcript(
-    store: &SqliteStore,
+    store: &Store,
     embedder: Option<&dyn icm_core::Embedder>,
     memory_cfg: &crate::config::MemoryConfig,
     source: &str,
@@ -2864,23 +3516,10 @@ fn extract_from_hook_transcript(
         return Ok(());
     }
 
-    // Truncate to last 4000 bytes to keep extraction reasonable.
-    //
-    // The original raw byte slice `&assistant_text[len-4000..]` panics
-    // when the cut-point lands inside a multibyte UTF-8 char (Cyrillic
-    // 2B, CJK 3B, emoji 4B). Find the nearest UTF-8 char boundary at or
-    // after `len-4000` instead. Result is at most 4000 bytes long; we
-    // accept losing a few leading bytes to char-align rather than
-    // panicking on multilingual transcripts.
-    let truncated: &str = if assistant_text.len() > 4000 {
-        let mut start = assistant_text.len() - 4000;
-        while start < assistant_text.len() && !assistant_text.is_char_boundary(start) {
-            start += 1;
-        }
-        &assistant_text[start..]
-    } else {
-        &assistant_text
-    };
+    // Truncate to last 4000 bytes to keep extraction reasonable. The bare
+    // tail slice `&assistant_text[len-4000..]` panics when the cut lands
+    // inside a multibyte UTF-8 char; the helper char-aligns instead.
+    let truncated: &str = truncate_tail_at_char_boundary(&assistant_text, 4000);
 
     // Audit R7: if the byte truncation cut the transcript mid-fence
     // (the opening ```lang line lives in the dropped prefix), the
@@ -2900,12 +3539,7 @@ fn extract_from_hook_transcript(
         truncated
     };
 
-    let project = json
-        .get("cwd")
-        .and_then(|v| v.as_str())
-        .and_then(|p| std::path::Path::new(p).file_name())
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| "project".to_string());
+    let project = project_from_cwd_json(&json).unwrap_or_else(|| "project".to_string());
 
     // Hook path is the prompt-injection surface: any assistant message in
     // the transcript can be crafted to trigger decision/error keywords and
@@ -2951,10 +3585,28 @@ pub(crate) fn truncate_at_char_boundary(s: &str, max_bytes: usize) -> &str {
     &s[..end]
 }
 
+/// Keep the last `max_bytes` bytes of `s`, advancing the start to the nearest
+/// following UTF-8 char boundary so the slice never splits a multi-byte char.
+/// Result length is always `<= max_bytes`. Never panics — bare
+/// `&s[s.len() - max_bytes..]` does when the cut lands inside a multi-byte char
+/// (Cyrillic=2B, CJK=3B, emoji=4B). See issue #110.
+pub(crate) fn truncate_tail_at_char_boundary(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    // Walk forwards from `len - max_bytes` until we land on a char boundary.
+    // `is_char_boundary(len)` is always true, so this terminates.
+    let mut start = s.len() - max_bytes;
+    while !s.is_char_boundary(start) {
+        start += 1;
+    }
+    &s[start..]
+}
+
 /// UserPromptSubmit hook (Layer 2): inject recalled context at the start of each prompt.
 /// Reads JSON from stdin with `user_message`, recalls relevant memories,
 /// and prints context to stdout (Claude Code appends it as system-reminder).
-fn cmd_hook_prompt(store: &SqliteStore) -> Result<()> {
+fn cmd_hook_prompt(store: &Store, archive_cfg: &crate::config::ArchiveConfig) -> Result<()> {
     let Some(input) = read_stdin_utf8_lossy() else {
         return Ok(());
     };
@@ -2979,20 +3631,24 @@ fn cmd_hook_prompt(store: &SqliteStore) -> Result<()> {
         return Ok(());
     }
 
+    // Issue #272: archive the user turn verbatim before recall runs,
+    // so a subsequent `icm sessions search` can find it regardless of
+    // whether semantic recall matched anything.
+    if archive_cfg.enabled {
+        archive::record_event(
+            store,
+            archive_cfg,
+            &json,
+            icm_core::transcript::Role::User,
+            message,
+            None,
+        );
+    }
+
     // Project name (from hook cwd) is used as a hard filter on recalled
     // memories — not as a soft hint embedded in the FTS query, which used
     // to let high-FTS-score memories from other projects bleed in.
-    // Canonicalize cwd so symlinks resolve to the same project key. Two
-    // paths pointing at the same dir (one via symlink, one direct) used
-    // to be treated as different projects, splitting memories in half.
-    let project = json
-        .get("cwd")
-        .and_then(|v| v.as_str())
-        .map(|p| std::fs::canonicalize(p).unwrap_or_else(|_| std::path::PathBuf::from(p)))
-        .as_ref()
-        .and_then(|p| p.file_name())
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_default();
+    let project = project_from_cwd_json(&json).unwrap_or_default();
 
     // Truncate query to at most 200 bytes at a safe UTF-8 char boundary.
     // See issue #110 — bare `&query[..200]` panics when the cut lands inside
@@ -3089,7 +3745,7 @@ fn format_hook_context(ctx: &str, fmt: HookOutputFormat) -> String {
 ///
 /// Set `ICM_HOOK_DEBUG=1` in the environment to get stderr diagnostics when
 /// the hook decides to suppress output (empty store, no matching memories).
-fn cmd_hook_start(store: &SqliteStore, max_tokens: usize) -> Result<()> {
+fn cmd_hook_start(store: &Store, max_tokens: usize) -> Result<()> {
     let input = read_stdin_utf8_lossy().unwrap_or_default();
 
     let pack = build_hook_start_pack(store, &input, max_tokens)?;
@@ -3108,11 +3764,7 @@ fn cmd_hook_start(store: &SqliteStore, max_tokens: usize) -> Result<()> {
 ///
 /// Returns the pack as a String, or an empty string if there is nothing
 /// meaningful to inject (empty store, or placeholder output).
-fn build_hook_start_pack(
-    store: &SqliteStore,
-    stdin_json: &str,
-    max_tokens: usize,
-) -> Result<String> {
+fn build_hook_start_pack(store: &Store, stdin_json: &str, max_tokens: usize) -> Result<String> {
     // Tolerate missing/malformed stdin — fall back to PWD-based detection.
     let cwd: Option<String> = serde_json::from_str::<Value>(stdin_json)
         .ok()
@@ -3130,9 +3782,31 @@ fn build_hook_start_pack(
         }
     };
 
+    // Issue #271: prepend a deterministic identity/preferences snapshot
+    // before the semantic wake-up pack. The snapshot is always-on
+    // (independent of the user's first prompt) so the agent has its
+    // baseline identity even when the prompt doesn't trigger any
+    // semantic match. The two blocks share the same hook output but
+    // are conceptually distinct — see the issue for rationale.
+    //
+    // Budget split: ~40% to the snapshot (baseline), ~60% to the wake-up
+    // (project context + decisions). With the default max_tokens
+    // (passed in from `hook.start_max_tokens`), the snapshot lands at
+    // ~480 chars × 4 = ~120 tokens worst-case at the default 300-token
+    // budget, leaving ~180 tokens for the semantic pack.
+    let snapshot_budget = max_tokens.saturating_mul(2) / 5;
+    let wake_up_budget = max_tokens.saturating_sub(snapshot_budget).max(50);
+
+    let snap_opts = icm_core::ContextSnapshotOptions {
+        project: project_name.as_deref(),
+        max_tokens: snapshot_budget.max(80),
+        format: icm_core::SnapshotFormat::Markdown,
+    };
+    let snapshot = icm_core::build_context_snapshot(store, &snap_opts)?;
+
     let opts = icm_core::WakeUpOptions {
         project: project_name.as_deref(),
-        max_tokens,
+        max_tokens: wake_up_budget,
         format: icm_core::WakeUpFormat::Markdown,
         include_preferences: true,
     };
@@ -3143,23 +3817,173 @@ fn build_hook_start_pack(
     // session — let the user start clean. We detect the empty case via the
     // exported header constant, not substring matching the body, to stay
     // decoupled from the exact wording in `icm_core::wake_up::render()`.
-    if pack.trim().is_empty() || pack.starts_with(icm_core::EMPTY_PACK_HEADER) {
+    let wake_up_empty = pack.trim().is_empty() || pack.starts_with(icm_core::EMPTY_PACK_HEADER);
+
+    if wake_up_empty && snapshot.is_empty() {
         return Ok(String::new());
     }
 
-    Ok(pack)
+    let mut out = String::new();
+    if !snapshot.is_empty() {
+        out.push_str(&snapshot.render(icm_core::SnapshotFormat::Markdown));
+        if !out.ends_with("\n\n") {
+            out.push('\n');
+        }
+    }
+    if !wake_up_empty {
+        out.push_str(&pack);
+    }
+
+    Ok(out)
+}
+
+/// Extract a project name from a git remote URL.
+/// Handles HTTPS ("https://github.com/user/repo.git"),
+/// slash-SSH ("git@github.com:user/repo.git"), and
+/// colon-only SSH ("git@host:repo.git") formats.
+fn repo_name_from_url(url: &str) -> Option<String> {
+    // rsplit('/') always yields ≥1 element; split on ':' afterwards to
+    // handle SCP-style SSH URLs that have no slash before the repo name.
+    let after_slash = url.rsplit('/').next().unwrap_or(url);
+    let name = after_slash
+        .rsplit(':')
+        .next()
+        .unwrap_or(after_slash)
+        .trim_end_matches(".git");
+    if name.is_empty() {
+        None
+    } else {
+        Some(name.to_string())
+    }
 }
 
 /// Extract a project name from a filesystem path (basename), treating empty
 /// or root paths as "no project".
 fn project_from_path(path: &str) -> Option<String> {
+    if path.is_empty() {
+        return None;
+    }
     let p = std::path::Path::new(path);
-    p.file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .filter(|s| !s.is_empty() && s != "/")
+
+    // Try git remote get-url origin (most unique identifier)
+    if let Ok(out) = std::process::Command::new("git")
+        .args(["remote", "get-url", "origin"])
+        .current_dir(p)
+        .output()
+    {
+        if out.status.success() {
+            let url = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if let Some(name) = repo_name_from_url(&url) {
+                return Some(name);
+            }
+        }
+    }
+
+    // For worktrees without a remote: git-common-dir returns the main repo's
+    // .git as an absolute path, so its parent basename is the real project name.
+    if let Ok(out) = std::process::Command::new("git")
+        .args(["rev-parse", "--git-common-dir"])
+        .current_dir(p)
+        .output()
+    {
+        if out.status.success() {
+            let raw = out.stdout;
+            let common = std::str::from_utf8(&raw).unwrap_or("").trim();
+            let common_path = std::path::Path::new(common);
+            if common_path.is_absolute() {
+                if let Some(name) = common_path.parent().and_then(|r| r.file_name()) {
+                    return Some(name.to_string_lossy().to_string());
+                }
+            }
+        }
+    }
+
+    // Fallback: basename of the path itself
+    p.file_name().map(|n| n.to_string_lossy().to_string())
 }
 
-fn cmd_topics(store: &SqliteStore) -> Result<()> {
+/// Extract the project name from the `cwd` field of a hook JSON payload.
+/// Returns `None` if the field is absent or yields no project name.
+fn project_from_cwd_json(json: &Value) -> Option<String> {
+    json.get("cwd")
+        .and_then(|v| v.as_str())
+        .and_then(project_from_path)
+}
+
+/// `icm code-areas`: list files auto-recorded by the PostToolUse hook
+/// when the agent edited them. See issue #196 for the design discussion.
+fn cmd_code_areas(
+    store: &Store,
+    in_file: Option<&str>,
+    project: Option<&str>,
+    since: Option<&str>,
+    limit: usize,
+    format: CodeAreasFormat,
+) -> Result<()> {
+    let since_dt = match since {
+        Some(s) => Some(
+            chrono::DateTime::parse_from_rfc3339(s)
+                .with_context(|| format!("--since must be ISO-8601 (got `{s}`)"))?
+                .with_timezone(&chrono::Utc),
+        ),
+        None => None,
+    };
+    let rows = store.list_code_areas(project, in_file, since_dt, limit)?;
+    if rows.is_empty() {
+        match format {
+            CodeAreasFormat::Json => println!("[]"),
+            CodeAreasFormat::Table => println!("No code areas captured yet."),
+        }
+        return Ok(());
+    }
+    match format {
+        CodeAreasFormat::Json => {
+            let json = serde_json::to_string_pretty(
+                &rows
+                    .iter()
+                    .map(|c| {
+                        serde_json::json!({
+                            "id": c.id,
+                            "project": c.project,
+                            "file_path": c.file_path,
+                            "description": c.description,
+                            "session_id": c.session_id,
+                            "tool_name": c.tool_name,
+                            "touch_count": c.touch_count,
+                            "first_touched_at": c.first_touched_at.to_rfc3339(),
+                            "last_touched_at": c.last_touched_at.to_rfc3339(),
+                        })
+                    })
+                    .collect::<Vec<_>>(),
+            )?;
+            println!("{json}");
+        }
+        CodeAreasFormat::Table => {
+            println!(
+                "{:<20} {:<6} {:<20} Path",
+                "Project", "Hits", "Last touched"
+            );
+            println!("{}", "-".repeat(80));
+            for r in &rows {
+                let proj = if r.project.len() > 20 {
+                    format!("{}…", &r.project[..19])
+                } else {
+                    r.project.clone()
+                };
+                println!(
+                    "{:<20} {:<6} {:<20} {}",
+                    proj,
+                    r.touch_count,
+                    r.last_touched_at.format("%Y-%m-%d %H:%M:%S"),
+                    r.file_path,
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn cmd_topics(store: &Store) -> Result<()> {
     let topics = store.list_topics()?;
     if topics.is_empty() {
         println!("No topics yet.");
@@ -3174,7 +3998,7 @@ fn cmd_topics(store: &SqliteStore) -> Result<()> {
     Ok(())
 }
 
-fn cmd_stats(store: &SqliteStore) -> Result<()> {
+fn cmd_stats(store: &Store) -> Result<()> {
     let stats = store.stats()?;
     println!("Memories:  {}", stats.total_memories);
     println!("Topics:    {}", stats.total_topics);
@@ -3188,7 +4012,112 @@ fn cmd_stats(store: &SqliteStore) -> Result<()> {
     Ok(())
 }
 
-fn cmd_decay(store: &SqliteStore, factor: f32) -> Result<()> {
+fn cmd_facts_set(store: &Store, entity: &str, key: &str, value: &str, source: &str) -> Result<()> {
+    use icm_core::FactsStore;
+    let prev = store.get_fact(entity, key)?;
+    let id = store.set_fact(entity, key, value, source)?;
+    match prev {
+        Some(p) if p.value == value => {
+            println!("unchanged: {entity}.{key} = {value} (id={id})");
+        }
+        Some(p) => {
+            println!(
+                "superseded: {entity}.{key}: \"{old}\" -> \"{new}\" (id={id})",
+                old = p.value,
+                new = value,
+            );
+        }
+        None => {
+            println!("set: {entity}.{key} = {value} (id={id})");
+        }
+    }
+    Ok(())
+}
+
+fn cmd_facts_get(store: &Store, entity: &str, key: &str) -> Result<()> {
+    use icm_core::FactsStore;
+    match store.get_fact(entity, key)? {
+        Some(f) => {
+            println!("{}", f.value);
+            eprintln!(
+                "  source: {} | created: {} | id: {}",
+                f.source,
+                format_local(&f.created_at, "%Y-%m-%d %H:%M"),
+                f.id,
+            );
+            Ok(())
+        }
+        None => {
+            eprintln!("no active fact for {entity}.{key}");
+            std::process::exit(1);
+        }
+    }
+}
+
+fn cmd_facts_list(store: &Store, entity: &str, prefix: Option<&str>) -> Result<()> {
+    use icm_core::FactsStore;
+    let facts = store.list_facts(entity, prefix)?;
+    if facts.is_empty() {
+        println!("no facts for {entity}");
+        return Ok(());
+    }
+    println!("{:<32} value", "key");
+    println!("{}", "-".repeat(60));
+    for f in &facts {
+        println!("{:<32} {}", f.key, f.value);
+    }
+    Ok(())
+}
+
+fn cmd_facts_history(store: &Store, entity: &str, key: &str) -> Result<()> {
+    use icm_core::FactsStore;
+    let rows = store.history(entity, key)?;
+    if rows.is_empty() {
+        println!("no history for {entity}.{key}");
+        return Ok(());
+    }
+    println!("history of {entity}.{key} (newest first):");
+    for f in &rows {
+        let status = match f.superseded_at {
+            None => "ACTIVE".to_string(),
+            Some(ts) => format!("superseded {}", format_local(&ts, "%Y-%m-%d %H:%M")),
+        };
+        println!(
+            "  {} | {} | {} | from {} | {}",
+            f.id,
+            format_local(&f.created_at, "%Y-%m-%d %H:%M"),
+            status,
+            f.source,
+            f.value,
+        );
+    }
+    Ok(())
+}
+
+fn cmd_facts_forget(store: &Store, entity: &str, key: &str) -> Result<()> {
+    use icm_core::FactsStore;
+    let n = store.forget_fact(entity, key)?;
+    println!("forgot {n} row(s) under {entity}.{key}");
+    Ok(())
+}
+
+fn cmd_facts_stats(store: &Store) -> Result<()> {
+    use icm_core::FactsStore;
+    let s = store.facts_stats()?;
+    println!("Active facts:    {}", s.active_count);
+    println!("Total rows:      {} (history kept)", s.total_count);
+    println!("Distinct entities: {}", s.distinct_entities);
+    if !s.top_entities.is_empty() {
+        println!();
+        println!("Top entities:");
+        for (entity, n) in &s.top_entities {
+            println!("  {entity:<30} {n}");
+        }
+    }
+    Ok(())
+}
+
+fn cmd_decay(store: &Store, factor: f32) -> Result<()> {
     // Audit #185 H9: `apply_decay` multiplies each memory's weight by
     // `factor`, so values >= 1 *amplify* weight instead of decaying it
     // — the opposite of the user's intent and an instant footgun.
@@ -3205,9 +4134,9 @@ fn cmd_decay(store: &SqliteStore, factor: f32) -> Result<()> {
     Ok(())
 }
 
-fn cmd_prune(store: &SqliteStore, threshold: f32, dry_run: bool) -> Result<()> {
+fn cmd_prune(store: &Store, threshold: f32, dry_run: bool) -> Result<()> {
     if dry_run {
-        // The dry-run filter MUST mirror what `SqliteStore::prune` actually
+        // The dry-run filter MUST mirror what `Store::prune` actually
         // does, otherwise `--dry-run` lies. Audit R16 caught this: the
         // store hard-protects both Critical AND High (see
         // `crates/icm-store/src/store.rs:700-718`), but the dry-run was
@@ -3237,7 +4166,7 @@ fn cmd_prune(store: &SqliteStore, threshold: f32, dry_run: bool) -> Result<()> {
 }
 
 fn cmd_extract_patterns(
-    store: &SqliteStore,
+    store: &Store,
     topic: &str,
     memoir: Option<&str>,
     min_cluster_size: usize,
@@ -3263,7 +4192,7 @@ fn cmd_extract_patterns(
         );
         println!(
             "    Summary: {}",
-            &cluster.representative_summary[..cluster.representative_summary.len().min(120)]
+            truncate_at_char_boundary(&cluster.representative_summary, 120)
         );
     }
 
@@ -3320,7 +4249,12 @@ pub(crate) fn cmd_matches_icm_pattern(cmd: &str, pattern: &str) -> bool {
     cmd.contains(&format!("{pattern}.exe"))
 }
 
-fn cmd_init(mode: InitMode, force: bool, per_project: bool) -> Result<()> {
+fn cmd_init(
+    mode: InitMode,
+    force: bool,
+    per_project: bool,
+    with_codex_post_hook: bool,
+) -> Result<()> {
     let icm_bin = std::env::current_exe().context("cannot determine icm binary path")?;
     let icm_bin_str = portable_command_path(&icm_bin);
     let home = home_dir_str()?;
@@ -3570,10 +4504,13 @@ You MUST call `icm store` when ANY of the following happens:\n\
 \n\
 Do this BEFORE responding to the user. Not after. Not later. Immediately.\n\
 \n\
-Do NOT store: trivial details, info already in CLAUDE.md, ephemeral state (build logs, git status).\n\
+Do NOT store: trivial details, info already in this file, ephemeral state (build logs, git status).\n\
 \n\
 ### Other commands\n\
 ```bash\n\
+icm forget <id>                          # remove a memory by ID\n\
+icm list --all                           # list all memories\n\
+icm list --topic <name>                  # list memories in a topic\n\
 icm update <id> -c \"updated content\"     # edit memory in-place\n\
 icm health                                # topic hygiene audit\n\
 icm topics                                # list all topics\n\
@@ -3587,6 +4524,9 @@ icm topics                                # list all topics\n\
             ("Claude Code", "Claude Code", claude_dir.join("CLAUDE.md")),
             ("Codex", "Codex CLI", codex_dir.join("AGENTS.md")),
             ("Gemini", "Gemini", gemini_dir.join("GEMINI.md")),
+            // Pi reads AGENTS.md from ~/.pi/agent/ and parent dirs.
+            // Global instruction file follows the same shape as Codex.
+            ("Pi", "Pi", PathBuf::from(&home).join(".pi/agent/AGENTS.md")),
         ];
 
         // Project-only write targets (no global equivalent at the tool):
@@ -3623,7 +4563,14 @@ icm topics                                # list all topics\n\
             if per_project {
                 let cwd_path = match *label {
                     "Claude Code" => Some(cwd.join("CLAUDE.md")),
-                    "Codex" => Some(cwd.join("AGENTS.md")),
+                    // Codex AND Pi both read AGENTS.md by walking up
+                    // from cwd to $HOME, so a single per-project
+                    // `cwd/AGENTS.md` covers both. `inject_icm_block`
+                    // is idempotent on the icm:start marker so if
+                    // both tools are detected the second pass turns
+                    // into "already configured" without duplicating
+                    // the block.
+                    "Codex" | "Pi" => Some(cwd.join("AGENTS.md")),
                     _ => None,
                 };
                 if let Some(p) = cwd_path {
@@ -3668,7 +4615,11 @@ Search ICM memory for: $ARGUMENTS
 
 Run:
 ```bash
-icm recall \"$ARGUMENTS\"
+if [ -z \"$ARGUMENTS\" ]; then
+  icm wake-up --max-tokens 800
+else
+  icm recall \"$ARGUMENTS\" --limit 10
+fi
 ```
 ";
         let icm_remember_prompt = "\
@@ -3676,14 +4627,40 @@ Store the following in ICM memory: $ARGUMENTS
 
 Run:
 ```bash
-icm store -t \"note\" -c \"$ARGUMENTS\"
+icm remember \"$ARGUMENTS\"
 ```
 ";
+        let icm_remember_session_prompt = "\
+Checkpoint this session: store non-obvious, reusable lessons in ICM long-term memory.
 
+Target 3-10 pertinent stores total. Store the lesson, not the play-by-play. One fact per call, one sentence each, covering *what*, *why*, and *outcome*. Always pair a problem with its resolution if both happened this session; never store a gap alone. Anchor in VCS: prefer PR numbers and branch names. Feature-branch SHAs drift on amend; if you cite one, include the commit title so it stays grep-able.
+
+| Kind                         | Topic                  | Importance |
+| ---------------------------- | ---------------------- | ---------- |
+| Decision + reason            | `decisions-<project>`  | high       |
+| Error + root cause + fix     | `errors-resolved`      | high       |
+| User preference / correction | `preferences`          | critical   |
+| Pattern or invariant found   | `review-patterns`      | high       |
+| Significant work completed   | `context-<project>`    | high       |
+
+`<project>` = current project name (e.g. `decisions-icm`).
+
+Skip: facts derivable from code or `git log`, transient build state, anything already stored this session (on re-run, capture only the delta).
+
+Run:
+
+    icm remember \"<fact>\" --topic <topic> --importance <level> [--keywords \"k1,k2\"]
+
+Example:
+
+    icm remember \"Fixed flaky test by using fake timers; race condition only appeared under CI load\" --topic errors-resolved --importance high --keywords \"tests,flaky\"
+
+End with a one-line recap.
+";
         // Claude Code: ~/.claude/commands/ (or $CLAUDE_CONFIG_DIR/commands/)
         let claude_skills_dir = claude_dir.join("commands");
         if force || detect_tool("Claude Code", &home, &vscode_data) {
-            for fname in ["recall.md", "remember.md"] {
+            for fname in ["recall.md", "remember.md", "remember-session.md"] {
                 if let Ok(e) = install_manifest::InstallManifest::entry_from_disk(
                     &claude_skills_dir.join(fname),
                     "Claude Code skill",
@@ -3703,6 +4680,12 @@ icm store -t \"note\" -c \"$ARGUMENTS\"
                 "remember.md",
                 icm_remember_prompt,
                 "Claude Code /remember",
+            )?;
+            install_skill(
+                &claude_skills_dir,
+                "remember-session.md",
+                icm_remember_session_prompt,
+                "Claude Code /remember-session",
             )?;
         } else {
             println!("[skill] {:<16} skipped (not detected)", "Claude Code");
@@ -3764,7 +4747,11 @@ Do this BEFORE responding to the user. Not optional.
         // Amp: ~/.config/amp/skills/
         let amp_skills_dir = PathBuf::from(&home).join(".config/amp/skills");
         if force || detect_tool("Amp", &home, &vscode_data) {
-            for fname in ["icm-recall.md", "icm-remember.md"] {
+            for fname in [
+                "icm-recall.md",
+                "icm-remember.md",
+                "icm-remember-session.md",
+            ] {
                 if let Ok(e) = install_manifest::InstallManifest::entry_from_disk(
                     &amp_skills_dir.join(fname),
                     "Amp skill",
@@ -3785,8 +4772,42 @@ Do this BEFORE responding to the user. Not optional.
                 icm_remember_prompt,
                 "Amp /icm-remember",
             )?;
+            install_skill(
+                &amp_skills_dir,
+                "icm-remember-session.md",
+                icm_remember_session_prompt,
+                "Amp /icm-remember-session",
+            )?;
         } else {
             println!("[skill] {:<16} skipped (not detected)", "Amp");
+        }
+
+        // Pi: ~/.pi/agent/skills/ — same shape as Amp (see issue #259).
+        let pi_skills_dir = PathBuf::from(&home).join(".pi/agent/skills");
+        if force || detect_tool("Pi", &home, &vscode_data) {
+            for fname in ["icm-recall.md", "icm-remember.md"] {
+                if let Ok(e) = install_manifest::InstallManifest::entry_from_disk(
+                    &pi_skills_dir.join(fname),
+                    "Pi skill",
+                    install_manifest::EntryKind::OwnedFile,
+                ) {
+                    manifest.record(e);
+                }
+            }
+            install_skill(
+                &pi_skills_dir,
+                "icm-recall.md",
+                icm_recall_prompt,
+                "Pi /icm-recall",
+            )?;
+            install_skill(
+                &pi_skills_dir,
+                "icm-remember.md",
+                icm_remember_prompt,
+                "Pi /icm-remember",
+            )?;
+        } else {
+            println!("[skill] {:<16} skipped (not detected)", "Pi");
         }
     }
 
@@ -3998,14 +5019,28 @@ Do this BEFORE responding to the user. Not optional.
             )?;
             println!("[hook] Codex CLI PreToolUse (auto-allow): {status}");
 
-            let status = inject_codex_hook(
-                &codex_hooks_path,
-                "PostToolUse",
-                &format!("{} hook post", icm_bin_str),
-                None,
-                detect,
-            )?;
-            println!("[hook] Codex CLI PostToolUse (auto-extract): {status}");
+            // Codex CLI PostToolUse is opt-in (issue #288): Codex
+            // fires this on every shell command, so the default
+            // install used to flood the store with ~14k events/24h
+            // of tool-output bloat. MCP + AGENTS.md alone is enough
+            // for `icm_memory_store` to land curated facts via the
+            // model. Users who want the extraction-on-every-tool
+            // behavior can pass `--with-codex-post-hook`.
+            if with_codex_post_hook {
+                let status = inject_codex_hook(
+                    &codex_hooks_path,
+                    "PostToolUse",
+                    &format!("{} hook post", icm_bin_str),
+                    None,
+                    detect,
+                )?;
+                println!("[hook] Codex CLI PostToolUse (auto-extract): {status}");
+            } else {
+                println!(
+                    "[hook] Codex CLI PostToolUse: skipped (off by default; \
+                     pass --with-codex-post-hook to opt in — see issue #288)"
+                );
+            }
 
             let status = inject_codex_hook(
                 &codex_hooks_path,
@@ -4032,6 +5067,18 @@ Do this BEFORE responding to the user. Not optional.
             println!("[hook] Copilot CLI (all hooks): {copilot_status}");
         } else {
             println!("[hook] {:<16} skipped (not detected)", "Copilot CLI");
+        }
+
+        // --- Pi (pi.dev) hooks need a TypeScript extension against the
+        // `@earendil-works/pi-coding-agent` SDK, modeled on the OpenCode
+        // plugin in `plugins/opencode-icm.ts`. The CLI doesn't ship one
+        // yet — tracked under issue #259. We still print the notice so
+        // Pi users see that ICM is aware of them.
+        if detect_tool("Pi", &home, &vscode_data) {
+            println!(
+                "[hook] {:<16} skipped (TS extension TBD — see issue #259)",
+                "Pi"
+            );
         }
     }
 
@@ -4683,6 +5730,12 @@ fn detect_tool(name: &str, home: &str, vscode_data: &Path) -> bool {
         }
         // Aider is a Python CLI (pip-installable); check the binary.
         "Aider" => binary_in_path("aider"),
+        // Pi (pi.dev / earendil-works/pi). Installed globally via npm
+        // (`pi install npm:...`) — check the binary, and as a fallback
+        // the global config dir, since users often `npm link` into a
+        // path the binary alone can't always reach (e.g. Volta /
+        // pnpm-global env quirks). See issue #259.
+        "Pi" => binary_in_path("pi") || PathBuf::from(home).join(".pi/agent").exists(),
         _ => true,
     }
 }
@@ -5081,6 +6134,14 @@ fn cmd_config() -> Result<()> {
     println!("  default_importance = {}", cfg.memory.default_importance);
     println!("  decay_rate = {}", cfg.memory.decay_rate);
     println!("  prune_threshold = {}", cfg.memory.prune_threshold);
+    println!(
+        "  auto_consolidate_enabled = {}",
+        cfg.memory.auto_consolidate_enabled
+    );
+    println!(
+        "  auto_consolidate_threshold = {}",
+        cfg.memory.auto_consolidate_threshold
+    );
     println!();
     println!("[embeddings]");
     println!("  model = {}", cfg.embeddings.model);
@@ -5171,41 +6232,8 @@ fn cli_on_path(name: &str) -> bool {
 /// whether facts were extracted (so an output with no extractable
 /// content doesn't loop forever).
 #[allow(clippy::too_many_arguments)]
-/// Acquire a single-instance lock for the extraction drain.
-///
-/// CONTAINMENT (runaway-session fix, 2026-06-12): overlapping `extract-pending`
-/// runs amplified the cascade — each drain could spawn its own summarizer and
-/// re-fire hooks. A non-blocking `flock` caps concurrent drains at one. Returns
-/// the held lock file on success, `Ok(None)` if another drain holds it, and is
-/// best-effort (a lock-setup error degrades to "proceed without the guard").
-fn acquire_extract_lock() -> Result<Option<std::fs::File>> {
-    use std::os::unix::io::AsRawFd;
-    let dir = std::env::var_os("XDG_CACHE_HOME")
-        .map(std::path::PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".cache")))
-        .unwrap_or_else(std::env::temp_dir)
-        .join("icm");
-    std::fs::create_dir_all(&dir).ok();
-    let path = dir.join("extract-pending.lock");
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(false)
-        .open(&path)
-        .with_context(|| format!("opening extract-pending lock {}", path.display()))?;
-    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-    if rc == 0 {
-        return Ok(Some(file));
-    }
-    let err = std::io::Error::last_os_error();
-    match err.raw_os_error() {
-        Some(code) if code == libc::EWOULDBLOCK || code == libc::EAGAIN => Ok(None),
-        _ => bail!("flock on extract-pending lock failed: {err}"),
-    }
-}
-
 fn cmd_extract_pending(
-    store: &SqliteStore,
+    store: &Store,
     embedder: Option<&dyn icm_core::Embedder>,
     cfg: &config::SummarizerConfig,
     limit: usize,
@@ -5213,22 +6241,6 @@ fn cmd_extract_pending(
     cli_model: Option<&str>,
     dry_run: bool,
 ) -> Result<()> {
-    // Single-instance containment guard: only one drain may run at a time. Held
-    // for the lifetime of this call (released on drop / process exit).
-    let _drain_lock: Option<std::fs::File> = match acquire_extract_lock() {
-        Ok(Some(lock)) => Some(lock),
-        Ok(None) => {
-            eprintln!("[extract-pending] another drain already in progress — skipping");
-            return Ok(());
-        }
-        Err(e) => {
-            eprintln!(
-                "[extract-pending] single-instance lock unavailable ({e}) — proceeding best-effort"
-            );
-            None
-        }
-    };
-
     let pending = store.list_pending_extractions(limit)?;
     if pending.is_empty() {
         println!("No pending extractions.");
@@ -5436,7 +6448,7 @@ fn health_consolidate_tip() -> String {
 
 #[allow(clippy::too_many_arguments)]
 fn cmd_consolidate(
-    store: &SqliteStore,
+    store: &Store,
     topic: &str,
     keep_originals: bool,
     cfg: &config::SummarizerConfig,
@@ -5539,7 +6551,7 @@ fn cmd_consolidate(
 }
 
 fn cmd_extract(
-    store: &SqliteStore,
+    store: &Store,
     embedder: Option<&dyn icm_core::Embedder>,
     project: &str,
     text: Option<String>,
@@ -5598,7 +6610,7 @@ fn cmd_extract(
 /// CPU/RAM spikes reported in issue #239. Enqueuing instead costs ~50ms
 /// and never loads the model; `icm extract-pending` drains the queue
 /// later, loading the model once for the whole batch.
-fn cmd_extract_enqueue(store: &SqliteStore, project: &str, text: Option<String>) -> Result<()> {
+fn cmd_extract_enqueue(store: &Store, project: &str, text: Option<String>) -> Result<()> {
     let input = match text {
         Some(t) => t,
         None => {
@@ -5619,18 +6631,14 @@ fn cmd_extract_enqueue(store: &SqliteStore, project: &str, text: Option<String>)
     // Cap to 8 KB — same bound as the PostToolUse async path. Long tool
     // outputs are rare and their trailing slice carries the freshest
     // context.
-    let capped = if trimmed.len() > 8192 {
-        &trimmed[trimmed.len() - 8192..]
-    } else {
-        trimmed
-    };
+    let capped = truncate_tail_at_char_boundary(trimmed, 8192);
 
     let id = store.enqueue_pending_extraction(project, "extract", capped)?;
     eprintln!("[icm] enqueued raw text for deferred extraction (id={id})");
     Ok(())
 }
 
-fn cmd_recall_context(store: &SqliteStore, query: &str, limit: usize) -> Result<()> {
+fn cmd_recall_context(store: &Store, query: &str, limit: usize) -> Result<()> {
     // Explicit `recall-context` CLI invocation: no implicit project filter,
     // the user passed the query they want.
     let ctx = extract::recall_context(store, query, None, limit)?;
@@ -5645,38 +6653,15 @@ fn cmd_recall_context(store: &SqliteStore, query: &str, limit: usize) -> Result<
 /// Detect the current project name from PWD and git remote.
 /// Returns the best project identifier for topic matching.
 fn detect_project() -> String {
-    // Try git remote first (most unique identifier)
-    if let Ok(output) = std::process::Command::new("git")
-        .args(["remote", "get-url", "origin"])
-        .output()
-    {
-        let url = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        if !url.is_empty() {
-            // Extract repo name: "git@github.com:user/repo.git" -> "repo"
-            // or "https://github.com/user/repo.git" -> "repo"
-            let name = url
-                .rsplit('/')
-                .next()
-                .unwrap_or(&url)
-                .trim_end_matches(".git")
-                .to_string();
-            if !name.is_empty() {
-                return name;
-            }
-        }
-    }
-
-    // Fallback: basename of current directory
-    if let Ok(cwd) = std::env::current_dir() {
-        if let Some(name) = cwd.file_name() {
-            return name.to_string_lossy().to_string();
-        }
-    }
-
-    "unknown".to_string()
+    let cwd = match std::env::current_dir() {
+        Ok(p) => p,
+        Err(_) => return "unknown".to_string(),
+    };
+    let path_str = cwd.to_string_lossy();
+    project_from_path(&path_str).unwrap_or_else(|| "unknown".to_string())
 }
 
-fn cmd_recall_project(store: &SqliteStore, limit: usize) -> Result<()> {
+fn cmd_recall_project(store: &Store, limit: usize) -> Result<()> {
     let project = detect_project();
     eprintln!("Project: {project}");
 
@@ -5699,7 +6684,7 @@ fn cmd_recall_project(store: &SqliteStore, limit: usize) -> Result<()> {
 /// project, ranks by importance × recency × weight, and truncates to fit the
 /// token budget.
 fn cmd_wake_up(
-    store: &SqliteStore,
+    store: &Store,
     project: Option<String>,
     max_tokens: usize,
     format: CliWakeUpFormat,
@@ -5735,8 +6720,61 @@ fn cmd_wake_up(
     Ok(())
 }
 
+/// Print the deterministic identity/preferences snapshot (issue #271).
+///
+/// Returns the rendered snapshot in the requested format. For `Json`, the
+/// full `ContextSnapshot` struct is emitted so downstream tools can react
+/// to `over_budget` / `dropped` programmatically.
+fn cmd_context(
+    store: &Store,
+    project: Option<String>,
+    max_tokens: usize,
+    format: CliSnapshotFormat,
+) -> Result<()> {
+    let detected;
+    let project_ref: Option<&str> = match project.as_deref() {
+        Some("-") => None,
+        Some(p) => Some(p),
+        None => {
+            detected = detect_project();
+            if detected.is_empty() || detected == "unknown" {
+                None
+            } else {
+                eprintln!("Project: {detected} (auto-detected; use --project - to disable)");
+                Some(detected.as_str())
+            }
+        }
+    };
+
+    let opts = icm_core::ContextSnapshotOptions {
+        project: project_ref,
+        max_tokens,
+        format: match format {
+            CliSnapshotFormat::Markdown => icm_core::SnapshotFormat::Markdown,
+            CliSnapshotFormat::Plain => icm_core::SnapshotFormat::Plain,
+            // JSON mode renders the struct directly, so the inner format
+            // is irrelevant — pick Markdown for the in-Snapshot fallback.
+            CliSnapshotFormat::Json => icm_core::SnapshotFormat::Markdown,
+        },
+    };
+
+    let snap = icm_core::build_context_snapshot(store, &opts)?;
+
+    match format {
+        CliSnapshotFormat::Json => {
+            print!("{}", serde_json::to_string_pretty(&snap)?);
+            println!();
+        }
+        CliSnapshotFormat::Markdown => {
+            print!("{}", snap.render(icm_core::SnapshotFormat::Markdown))
+        }
+        CliSnapshotFormat::Plain => print!("{}", snap.render(icm_core::SnapshotFormat::Plain)),
+    }
+    Ok(())
+}
+
 fn cmd_save_project(
-    store: &SqliteStore,
+    store: &Store,
     embedder: Option<&dyn icm_core::Embedder>,
     memory_cfg: &crate::config::MemoryConfig,
     content: &str,
@@ -5762,7 +6800,7 @@ fn cmd_save_project(
 
 #[cfg(feature = "embeddings")]
 fn cmd_embed(
-    store: &SqliteStore,
+    store: &Store,
     embedder: &dyn icm_core::Embedder,
     topic: Option<&str>,
     force: bool,
@@ -5876,7 +6914,7 @@ fn cmd_bench(count: usize) -> Result<()> {
     ];
 
     // --- Seed without embeddings ---
-    let store_plain = SqliteStore::in_memory()?;
+    let store_plain = Store::in_memory()?;
     let t0 = Instant::now();
     for i in 0..count {
         let topic = topics[i % topics.len()].to_string();
@@ -5896,7 +6934,7 @@ fn cmd_bench(count: usize) -> Result<()> {
     let store_plain_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
     // --- Seed with embeddings ---
-    let store_vec = SqliteStore::in_memory()?;
+    let store_vec = Store::in_memory()?;
     let t0 = Instant::now();
     for i in 0..count {
         let topic = topics[i % topics.len()].to_string();
@@ -6061,7 +7099,7 @@ fn cmd_bench_recall(model: &str, runs: usize, verbose: bool) -> Result<()> {
         });
         std::fs::write(&mcp_config_path, serde_json::to_string_pretty(&mcp_config)?)?;
         {
-            let _ = SqliteStore::new(&icm_db)?;
+            let _ = Store::new(&icm_db)?;
         }
 
         // === WITHOUT ICM ===
@@ -6105,7 +7143,7 @@ fn cmd_bench_recall(model: &str, runs: usize, verbose: bool) -> Result<()> {
         eprintln!(" done ({:.1}s)", s1_icm.duration_ms as f64 / 1000.0);
 
         {
-            let store = SqliteStore::new(&icm_db)?;
+            let store = Store::new(&icm_db)?;
             let ext1 =
                 extract::extract_and_store(&store, bench_knowledge::SOURCE_DOCUMENT, "meridian")?;
             let ext2 = extract::extract_and_store(&store, &s1_icm.response, "meridian")?;
@@ -6123,7 +7161,7 @@ fn cmd_bench_recall(model: &str, runs: usize, verbose: bool) -> Result<()> {
         let mut scores_with: Vec<(usize, usize, f64)> = Vec::new();
         let mut responses_with: Vec<String> = Vec::new();
         for (i, q) in questions.iter().enumerate() {
-            let store = SqliteStore::new(&icm_db)?;
+            let store = Store::new(&icm_db)?;
             let ctx = extract::recall_context(&store, q.prompt, None, 15)?;
             if verbose && !ctx.is_empty() {
                 eprintln!("  [verbose] Context injected for Q{}:", i + 1);
@@ -6146,7 +7184,7 @@ fn cmd_bench_recall(model: &str, runs: usize, verbose: bool) -> Result<()> {
                         eprintln!("    Response: {}", truncate_words(&result.response, 200));
                     }
                     {
-                        let store = SqliteStore::new(&icm_db)?;
+                        let store = Store::new(&icm_db)?;
                         let _ = extract::extract_and_store(&store, &result.response, "meridian");
                     }
                     scores_with.push(score);
@@ -6341,13 +7379,13 @@ fn cmd_bench_agent(sessions: usize, model: &str, runs: usize, verbose: bool) -> 
         });
         std::fs::write(&mcp_config_path, serde_json::to_string_pretty(&mcp_config)?)?;
         {
-            let _ = SqliteStore::new(&icm_db)?;
+            let _ = Store::new(&icm_db)?;
         }
 
         let mut results_with: Vec<SessionResult> = Vec::new();
         for (i, prompt) in prompts.iter().enumerate() {
             let effective_prompt = if i > 0 {
-                let store = SqliteStore::new(&icm_db)?;
+                let store = Store::new(&icm_db)?;
                 let ctx = extract::recall_context(&store, prompt, None, 15)?;
                 if verbose && !ctx.is_empty() {
                     eprintln!("  [verbose] Context injected for session {}:", i + 1);
@@ -6369,7 +7407,7 @@ fn cmd_bench_agent(sessions: usize, model: &str, runs: usize, verbose: bool) -> 
                 Ok(result) => {
                     eprintln!(" done ({:.1}s)", result.duration_ms as f64 / 1000.0);
                     {
-                        let store = SqliteStore::new(&icm_db)?;
+                        let store = Store::new(&icm_db)?;
                         let extracted =
                             extract::extract_and_store(&store, &result.response, "mathlib")?;
                         if extracted > 0 {
@@ -6506,7 +7544,7 @@ fn run_claude_session(
     let json: Value = serde_json::from_str(stdout.trim()).with_context(|| {
         format!(
             "failed to parse claude JSON: {}",
-            &stdout[..stdout.len().min(200)]
+            truncate_at_char_boundary(&stdout, 200)
         )
     })?;
 
@@ -6904,20 +7942,20 @@ fn truncate_words(s: &str, max_chars: usize) -> String {
 // Memoir commands
 // ---------------------------------------------------------------------------
 
-fn resolve_memoir(store: &SqliteStore, name: &str) -> Result<Memoir> {
+fn resolve_memoir(store: &Store, name: &str) -> Result<Memoir> {
     store
         .get_memoir_by_name(name)?
         .ok_or_else(|| anyhow::anyhow!("memoir not found: {name}"))
 }
 
-fn cmd_memoir_create(store: &SqliteStore, name: String, description: String) -> Result<()> {
+fn cmd_memoir_create(store: &Store, name: String, description: String) -> Result<()> {
     let memoir = Memoir::new(name, description);
     let id = store.create_memoir(memoir)?;
     println!("Created memoir: {id}");
     Ok(())
 }
 
-fn cmd_memoir_list(store: &SqliteStore) -> Result<()> {
+fn cmd_memoir_list(store: &Store) -> Result<()> {
     let memoirs = store.list_memoirs()?;
     if memoirs.is_empty() {
         println!("No memoirs yet.");
@@ -6939,7 +7977,7 @@ fn cmd_memoir_list(store: &SqliteStore) -> Result<()> {
     Ok(())
 }
 
-fn cmd_memoir_show(store: &SqliteStore, name: &str) -> Result<()> {
+fn cmd_memoir_show(store: &Store, name: &str) -> Result<()> {
     let memoir = resolve_memoir(store, name)?;
     let stats = store.memoir_stats(&memoir.id)?;
 
@@ -6988,7 +8026,7 @@ fn cmd_memoir_show(store: &SqliteStore, name: &str) -> Result<()> {
     Ok(())
 }
 
-fn cmd_memoir_delete(store: &SqliteStore, name: &str) -> Result<()> {
+fn cmd_memoir_delete(store: &Store, name: &str) -> Result<()> {
     let memoir = resolve_memoir(store, name)?;
     store.delete_memoir(&memoir.id)?;
     println!("Deleted memoir: {name}");
@@ -6996,7 +8034,7 @@ fn cmd_memoir_delete(store: &SqliteStore, name: &str) -> Result<()> {
 }
 
 fn cmd_memoir_add_concept(
-    store: &SqliteStore,
+    store: &Store,
     memoir_name: &str,
     name: String,
     definition: String,
@@ -7019,7 +8057,7 @@ fn cmd_memoir_add_concept(
 }
 
 fn cmd_memoir_refine(
-    store: &SqliteStore,
+    store: &Store,
     memoir_name: &str,
     concept_name: &str,
     new_definition: &str,
@@ -7040,7 +8078,7 @@ fn cmd_memoir_refine(
 }
 
 fn cmd_memoir_search(
-    store: &SqliteStore,
+    store: &Store,
     memoir_name: &str,
     query: &str,
     label: Option<&str>,
@@ -7073,7 +8111,7 @@ fn cmd_memoir_search(
     Ok(())
 }
 
-fn cmd_memoir_search_all(store: &SqliteStore, query: &str, limit: usize) -> Result<()> {
+fn cmd_memoir_search_all(store: &Store, query: &str, limit: usize) -> Result<()> {
     let results = store.search_all_concepts_fts(query, limit)?;
 
     if results.is_empty() {
@@ -7104,7 +8142,7 @@ fn cmd_memoir_search_all(store: &SqliteStore, query: &str, limit: usize) -> Resu
 }
 
 fn cmd_memoir_link(
-    store: &SqliteStore,
+    store: &Store,
     memoir_name: &str,
     from_name: &str,
     to_name: &str,
@@ -7126,7 +8164,7 @@ fn cmd_memoir_link(
 }
 
 fn cmd_memoir_inspect(
-    store: &SqliteStore,
+    store: &Store,
     memoir_name: &str,
     concept_name: &str,
     depth: usize,
@@ -7165,7 +8203,7 @@ fn cmd_memoir_inspect(
 
 // confidence_color and confidence_bar are now methods on Concept in icm-core
 
-fn cmd_memoir_export(store: &SqliteStore, memoir_name: &str, format: &str) -> Result<()> {
+fn cmd_memoir_export(store: &Store, memoir_name: &str, format: &str) -> Result<()> {
     let memoir = resolve_memoir(store, memoir_name)?;
     let concepts = store.list_concepts(&memoir.id)?;
 
@@ -7341,7 +8379,7 @@ fn cmd_memoir_export(store: &SqliteStore, memoir_name: &str, format: &str) -> Re
     Ok(())
 }
 
-fn cmd_memoir_distill(store: &SqliteStore, from_topic: &str, into_name: &str) -> Result<()> {
+fn cmd_memoir_distill(store: &Store, from_topic: &str, into_name: &str) -> Result<()> {
     let memoir = resolve_memoir(store, into_name)?;
     let memories = store.get_by_topic(from_topic)?;
 
@@ -7419,7 +8457,7 @@ fn truncate(s: &str, max: usize) -> String {
     if s.len() <= max {
         s.to_string()
     } else {
-        format!("{}...", &s[..max.saturating_sub(3)])
+        format!("{}...", truncate_at_char_boundary(s, max.saturating_sub(3)))
     }
 }
 
@@ -7427,7 +8465,7 @@ fn truncate(s: &str, max: usize) -> String {
 // Cloud commands
 // ---------------------------------------------------------------------------
 
-fn cmd_cloud(command: CloudCommands, store: &SqliteStore) -> Result<()> {
+fn cmd_cloud(command: CloudCommands, store: &Store) -> Result<()> {
     use icm_core::Scope;
 
     match command {
@@ -7508,7 +8546,7 @@ fn cmd_cloud(command: CloudCommands, store: &SqliteStore) -> Result<()> {
 
 #[cfg(test)]
 mod truncate_tests {
-    use super::truncate_at_char_boundary;
+    use super::{truncate_at_char_boundary, truncate_tail_at_char_boundary};
 
     #[test]
     fn ascii_short_is_unchanged() {
@@ -7568,6 +8606,34 @@ mod truncate_tests {
         let out = truncate_at_char_boundary(s, 2);
         assert_eq!(out, "");
     }
+
+    #[test]
+    fn tail_ascii_short_is_unchanged() {
+        assert_eq!(truncate_tail_at_char_boundary("hello", 200), "hello");
+    }
+
+    /// Regression: the multibyte arrow '→' (3 bytes) crashed the hook
+    /// transcript fallback (`&text[len - 2000..]`) when the cut landed
+    /// inside it. Keeping the tail must drop a few leading bytes to
+    /// char-align rather than panic.
+    #[test]
+    fn tail_multibyte_never_panics_and_cuts_at_char_boundary() {
+        let s = "\u{2192}".repeat(800); // 800 × 3 bytes = 2400 bytes
+        let out = truncate_tail_at_char_boundary(&s, 2000);
+        assert!(out.len() <= 2000);
+        assert!(s.is_char_boundary(s.len() - out.len()));
+        assert!(out.chars().all(|c| c == '\u{2192}'));
+    }
+
+    /// Mixed ASCII + arrows, the realistic transcript shape that paniced.
+    #[test]
+    fn tail_mixed_ascii_arrows_never_panics() {
+        let s = "etape A \u{2192} etape B \u{2192} fin ".repeat(300);
+        let out = truncate_tail_at_char_boundary(&s, 2000);
+        assert!(out.len() <= 2000);
+        assert!(out.is_char_boundary(0));
+        assert!(out.is_char_boundary(out.len()));
+    }
 }
 
 #[cfg(test)]
@@ -7575,8 +8641,8 @@ mod hook_start_tests {
     use super::*;
     use icm_core::Importance;
 
-    fn seed_store() -> SqliteStore {
-        let store = SqliteStore::in_memory().unwrap();
+    fn seed_store() -> Store {
+        let store = Store::in_memory().unwrap();
         store
             .store(Memory::new(
                 "decisions-icm".into(),
@@ -7622,6 +8688,108 @@ mod hook_start_tests {
     }
 
     #[test]
+    fn project_from_path_uses_git_remote_over_basename() {
+        let dir = tempfile::tempdir().unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args([
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/user/myproject.git",
+            ])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        // tempdir basename is a random name, not "myproject" — remote must win
+        assert_eq!(
+            project_from_path(dir.path().to_str().unwrap()),
+            Some("myproject".into())
+        );
+    }
+
+    #[test]
+    fn project_from_path_handles_ssh_remote() {
+        let dir = tempfile::tempdir().unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args([
+                "remote",
+                "add",
+                "origin",
+                "git@github.com:user/sshproject.git",
+            ])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        assert_eq!(
+            project_from_path(dir.path().to_str().unwrap()),
+            Some("sshproject".into())
+        );
+    }
+
+    #[test]
+    fn repo_name_from_url_handles_scp_ssh_without_slash() {
+        // git@host:repo.git — no slash between host and repo name
+        assert_eq!(repo_name_from_url("git@host:repo.git"), Some("repo".into()));
+        assert_eq!(
+            repo_name_from_url("git@github.com:user/repo.git"),
+            Some("repo".into())
+        );
+        assert_eq!(
+            repo_name_from_url("https://github.com/user/repo.git"),
+            Some("repo".into())
+        );
+        assert_eq!(repo_name_from_url(""), None);
+    }
+
+    /// Creates a git repo named "mainproject" with a worktree at "w1".
+    /// Returns `(base_tempdir, worktree_path)` — keep `base` alive for the
+    /// lifetime of the test or git will clean up the underlying directory.
+    fn make_worktree() -> (tempfile::TempDir, std::path::PathBuf) {
+        let base = tempfile::tempdir().unwrap();
+        let main_repo = base.path().join("mainproject");
+        std::fs::create_dir(&main_repo).unwrap();
+        for args in [
+            vec!["init"],
+            vec!["config", "user.email", "test@test.com"],
+            vec!["config", "user.name", "Test"],
+            vec!["commit", "--allow-empty", "-m", "init"],
+        ] {
+            std::process::Command::new("git")
+                .args(&args)
+                .current_dir(&main_repo)
+                .output()
+                .unwrap();
+        }
+        let worktree = base.path().join("w1");
+        std::process::Command::new("git")
+            .args(["worktree", "add", "--detach", worktree.to_str().unwrap()])
+            .current_dir(&main_repo)
+            .output()
+            .unwrap();
+        (base, worktree)
+    }
+
+    #[test]
+    fn project_from_path_uses_main_repo_name_for_worktree() {
+        let (_base, worktree) = make_worktree();
+        // w1 basename would give "w1"; must resolve to "mainproject" instead
+        assert_eq!(
+            project_from_path(worktree.to_str().unwrap()),
+            Some("mainproject".into())
+        );
+    }
+
+    #[test]
     fn hook_start_pack_scopes_to_cwd_project() {
         let store = seed_store();
         let stdin_json = r#"{"cwd":"/Users/patrick/dev/rtk-ai/icm","session_id":"abc"}"#;
@@ -7637,12 +8805,23 @@ mod hook_start_tests {
 
     #[test]
     fn hook_start_pack_empty_on_empty_store() {
-        let store = SqliteStore::in_memory().unwrap();
+        let store = Store::in_memory().unwrap();
         let stdin_json = r#"{"cwd":"/Users/patrick/dev/rtk-ai/icm"}"#;
         let pack = build_hook_start_pack(&store, stdin_json, 200).unwrap();
         assert!(
             pack.is_empty(),
             "expected empty pack for empty store, got: {pack}"
+        );
+    }
+
+    /// The hook pack begins with EITHER the context-snapshot header (when
+    /// the seed has preferences/project-context memories) OR the wake-up
+    /// header (when only critical/high decisions exist). Both layers are
+    /// valid SessionStart prefixes — this helper centralizes the check.
+    fn assert_pack_prefix(pack: &str) {
+        assert!(
+            pack.starts_with(icm_core::SNAPSHOT_HEADER) || pack.starts_with("# ICM Wake-up"),
+            "expected snapshot or wake-up header, got: {pack}"
         );
     }
 
@@ -7654,7 +8833,7 @@ mod hook_start_tests {
         // Either it auto-detected nothing (then all memories pass) or auto-detected a
         // real repo name — either way, must not panic and must produce valid output.
         assert!(!pack.is_empty());
-        assert!(pack.starts_with("# ICM Wake-up"));
+        assert_pack_prefix(&pack);
     }
 
     #[test]
@@ -7665,12 +8844,12 @@ mod hook_start_tests {
         // No cwd → falls back to detect_project() which will use current test
         // process PWD. We don't assert on the specific project but we do verify
         // the call doesn't fail and we get some output.
-        assert!(pack.starts_with("# ICM Wake-up"));
+        assert_pack_prefix(&pack);
     }
 
     #[test]
     fn hook_start_pack_respects_token_budget() {
-        let store = SqliteStore::in_memory().unwrap();
+        let store = Store::in_memory().unwrap();
         for i in 0..50 {
             store
                 .store(Memory::new(
@@ -7694,7 +8873,7 @@ mod hook_start_tests {
 
     #[test]
     fn hook_start_pack_skips_placeholder_output() {
-        let store = SqliteStore::in_memory().unwrap();
+        let store = Store::in_memory().unwrap();
         // Only low-importance noise — wake-up would return the "(no critical
         // memories yet ...)" placeholder, which cmd_hook_start should suppress.
         store
@@ -7736,7 +8915,73 @@ mod hook_start_tests {
         // We don't assert on which project was picked; we just require the
         // call does not panic and returns a valid, non-empty pack.
         assert!(!pack.is_empty());
+        assert_pack_prefix(&pack);
+    }
+
+    /// Issue #271: with a `preferences` memory present, the SessionStart
+    /// pack must lead with the deterministic snapshot — independent of
+    /// whether the semantic wake-up block has anything to add.
+    #[test]
+    fn hook_start_pack_prepends_context_snapshot_when_preferences_exist() {
+        let store = seed_store();
+        let stdin_json = r#"{"cwd":"/Users/patrick/dev/rtk-ai/icm"}"#;
+        let pack = build_hook_start_pack(&store, stdin_json, 300).unwrap();
+        assert!(
+            pack.starts_with(icm_core::SNAPSHOT_HEADER),
+            "snapshot should land first, got: {pack}",
+        );
+        assert!(
+            pack.contains("French"),
+            "preference must survive in snapshot: {pack}",
+        );
+        // The wake-up block still follows because we have a Critical
+        // decision in `decisions-icm`.
+        assert!(
+            pack.contains("# ICM Wake-up"),
+            "wake-up section dropped from concatenated pack: {pack}",
+        );
+        assert!(pack.contains("SQLite"));
+    }
+
+    /// Snapshot must NOT appear when only decisions exist (no
+    /// preferences and no project-context memories) — wake-up alone is
+    /// emitted.
+    #[test]
+    fn hook_start_pack_skips_snapshot_when_only_decisions() {
+        let store = Store::in_memory().unwrap();
+        store
+            .store(Memory::new(
+                "decisions-icm".into(),
+                "Use SQLite with FTS5".into(),
+                Importance::Critical,
+            ))
+            .unwrap();
+        let stdin_json = r#"{"cwd":"/Users/patrick/dev/rtk-ai/icm"}"#;
+        let pack = build_hook_start_pack(&store, stdin_json, 200).unwrap();
+        assert!(
+            !pack.starts_with(icm_core::SNAPSHOT_HEADER),
+            "snapshot header should be absent: {pack}",
+        );
         assert!(pack.starts_with("# ICM Wake-up"));
+    }
+
+    #[test]
+    fn project_from_cwd_json_extracts_basename_from_plain_path() {
+        let json = serde_json::json!({"cwd": "/some/path/myrepo"});
+        assert_eq!(project_from_cwd_json(&json), Some("myrepo".into()));
+    }
+
+    #[test]
+    fn project_from_cwd_json_returns_none_for_missing_cwd() {
+        let json = serde_json::json!({"session_id": "abc"});
+        assert_eq!(project_from_cwd_json(&json), None);
+    }
+
+    #[test]
+    fn project_from_cwd_json_resolves_worktree_to_main_repo() {
+        let (_base, worktree) = make_worktree();
+        let json = serde_json::json!({"cwd": worktree.to_str().unwrap()});
+        assert_eq!(project_from_cwd_json(&json), Some("mainproject".into()));
     }
 }
 
@@ -7954,6 +9199,64 @@ mod inject_settings_hook_tests {
             cfg["hooks"]["PreToolUse"][0]["matcher"].as_str().unwrap(),
             "Bash"
         );
+    }
+}
+
+#[cfg(test)]
+mod read_only_requested_tests {
+    use super::read_only_requested;
+
+    /// Use a private mutex so the env-var manipulation in these tests
+    /// doesn't race with itself when cargo runs them in parallel.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn with_env<F: FnOnce()>(value: Option<&str>, body: F) {
+        let _g = ENV_LOCK.lock().unwrap();
+        let prev = std::env::var("ICM_READONLY").ok();
+        match value {
+            Some(v) => std::env::set_var("ICM_READONLY", v),
+            None => std::env::remove_var("ICM_READONLY"),
+        }
+        body();
+        match prev {
+            Some(v) => std::env::set_var("ICM_READONLY", v),
+            None => std::env::remove_var("ICM_READONLY"),
+        }
+    }
+
+    #[test]
+    fn cli_flag_true_wins_alone() {
+        with_env(None, || {
+            assert!(read_only_requested(true));
+        });
+    }
+
+    #[test]
+    fn env_var_set_to_one_enables() {
+        with_env(Some("1"), || {
+            assert!(read_only_requested(false));
+        });
+    }
+
+    #[test]
+    fn env_var_set_to_zero_disables() {
+        with_env(Some("0"), || {
+            assert!(!read_only_requested(false));
+        });
+    }
+
+    #[test]
+    fn env_var_empty_disables() {
+        with_env(Some(""), || {
+            assert!(!read_only_requested(false));
+        });
+    }
+
+    #[test]
+    fn no_flag_no_env_means_writable() {
+        with_env(None, || {
+            assert!(!read_only_requested(false));
+        });
     }
 }
 
@@ -8212,14 +9515,14 @@ mod is_icm_command_tests {
 mod cmd_forget_tests {
     use super::*;
     use icm_core::{Importance, Memory};
-    use icm_store::SqliteStore;
+    use icm_store::Store;
 
     /// Audit #185 medium: `forget <ID> -t TOPIC` used to silently nuke
     /// the whole topic and discard the id. Now we reject the
     /// ambiguous combo.
     #[test]
     fn rejects_id_and_topic_together() {
-        let store = SqliteStore::in_memory().unwrap();
+        let store = Store::in_memory().unwrap();
         let id = store
             .store(Memory::new(
                 "topic".into(),
@@ -8243,7 +9546,7 @@ mod cmd_forget_tests {
     /// with legacy empty topics can't be wiped by typo.
     #[test]
     fn rejects_empty_topic() {
-        let store = SqliteStore::in_memory().unwrap();
+        let store = Store::in_memory().unwrap();
         let err = cmd_forget(&store, None, Some("")).unwrap_err();
         assert!(
             err.to_string().contains("--topic cannot be empty"),
@@ -8253,7 +9556,7 @@ mod cmd_forget_tests {
 
     #[test]
     fn rejects_whitespace_only_topic() {
-        let store = SqliteStore::in_memory().unwrap();
+        let store = Store::in_memory().unwrap();
         let err = cmd_forget(&store, None, Some("   \t  ")).unwrap_err();
         assert!(
             err.to_string().contains("--topic cannot be empty"),
@@ -8263,7 +9566,7 @@ mod cmd_forget_tests {
 
     #[test]
     fn rejects_neither_id_nor_topic() {
-        let store = SqliteStore::in_memory().unwrap();
+        let store = Store::in_memory().unwrap();
         let err = cmd_forget(&store, None, None).unwrap_err();
         assert!(
             err.to_string().contains("required"),
@@ -8275,14 +9578,14 @@ mod cmd_forget_tests {
 #[cfg(test)]
 mod cli_contracts_tests {
     use super::*;
-    use icm_store::SqliteStore;
+    use icm_store::Store;
 
     /// Audit #185 H9: `apply_decay` multiplies weight by `factor`,
     /// so values >= 1 amplify instead of decaying. Reject at the CLI
     /// boundary so users can't shoot themselves in the foot.
     #[test]
     fn cmd_decay_rejects_factor_one_or_greater() {
-        let store = SqliteStore::in_memory().unwrap();
+        let store = Store::in_memory().unwrap();
         for &bad in &[1.0_f32, 1.5, 2.0, 100.0, f32::INFINITY] {
             let err = cmd_decay(&store, bad).unwrap_err();
             assert!(
@@ -8294,7 +9597,7 @@ mod cli_contracts_tests {
 
     #[test]
     fn cmd_decay_rejects_negative_or_nan_factor() {
-        let store = SqliteStore::in_memory().unwrap();
+        let store = Store::in_memory().unwrap();
         for &bad in &[-0.1_f32, -1.0, f32::NAN, f32::NEG_INFINITY] {
             let err = cmd_decay(&store, bad).unwrap_err();
             assert!(
@@ -8306,7 +9609,7 @@ mod cli_contracts_tests {
 
     #[test]
     fn cmd_decay_accepts_valid_factor() {
-        let store = SqliteStore::in_memory().unwrap();
+        let store = Store::in_memory().unwrap();
         for &good in &[0.0_f32, 0.5, 0.95, 0.999_999] {
             cmd_decay(&store, good).unwrap_or_else(|e| panic!("factor={good} rejected: {e}"));
         }
@@ -8864,6 +10167,577 @@ mod hook_payload_tests {
         assert!(
             !out.is_empty(),
             "expected non-empty Write content, got {out:?}",
+        );
+    }
+}
+
+#[cfg(test)]
+mod cmd_remember_tests {
+    //! Parse `icm remember ...` through clap so a broken variant
+    //! (wrong positional, swapped fields, dropped default) fails here
+    //! rather than only at runtime.
+    use super::*;
+
+    /// Positional content, default topic None, default importance medium.
+    #[test]
+    fn parses_positional_content_with_defaults() {
+        let cli = Cli::try_parse_from(["icm", "remember", "some fact"]).unwrap();
+        let Commands::Remember {
+            content,
+            topic,
+            importance,
+            keywords,
+        } = cli.command
+        else {
+            panic!("expected Commands::Remember");
+        };
+        assert_eq!(content, "some fact");
+        assert_eq!(topic, None);
+        assert!(matches!(importance, CliImportance::Medium));
+        assert_eq!(keywords, None);
+    }
+
+    /// `--topic` and `--importance` overrides land on the Remember variant.
+    #[test]
+    fn parses_topic_and_importance_overrides() {
+        let cli = Cli::try_parse_from([
+            "icm",
+            "remember",
+            "critical deployment constraint",
+            "--topic",
+            "preferences",
+            "--importance",
+            "high",
+        ])
+        .unwrap();
+        let Commands::Remember {
+            content,
+            topic,
+            importance,
+            ..
+        } = cli.command
+        else {
+            panic!("expected Commands::Remember");
+        };
+        assert_eq!(content, "critical deployment constraint");
+        assert_eq!(topic.as_deref(), Some("preferences"));
+        assert!(matches!(importance, CliImportance::High));
+    }
+
+    /// Missing positional content is a parse error.
+    #[test]
+    fn missing_content_is_a_parse_error() {
+        assert!(Cli::try_parse_from(["icm", "remember"]).is_err());
+    }
+
+    /// `remember` appends; prior memories under the same topic stay intact.
+    #[test]
+    fn remember_appends_status_update_to_existing_memories() {
+        use icm_core::{Importance, MemoryStore};
+        use icm_store::Store;
+        let store = Store::in_memory().unwrap();
+        let cfg = crate::config::MemoryConfig::default();
+
+        cmd_store(
+            &store,
+            None,
+            &cfg,
+            "icm".into(),
+            "TODO: wire FTS5 trigger for memory updates".into(),
+            Importance::Medium,
+            None,
+            None,
+        )
+        .unwrap();
+
+        cmd_remember(
+            &store,
+            None,
+            &cfg,
+            "FTS5 trigger now syncs on update; closes the recall gap".into(),
+            Some("icm".into()),
+            Importance::Medium,
+            None,
+        )
+        .unwrap();
+
+        let memories = store.get_by_topic("icm").unwrap();
+        assert_eq!(memories.len(), 2, "remember appends, never overwrites");
+        assert!(memories.iter().any(|m| m.summary.contains("TODO")));
+        assert!(memories
+            .iter()
+            .any(|m| m.summary.contains("closes the recall gap")));
+    }
+}
+
+#[cfg(test)]
+mod cmd_memoir_tests {
+    use super::*;
+    use icm_store::Store;
+
+    #[track_caller]
+    fn store() -> Store {
+        Store::in_memory().unwrap()
+    }
+
+    #[track_caller]
+    fn make_memoir(store: &Store, name: &str) {
+        cmd_memoir_create(store, name.into(), "test memoir".into()).unwrap();
+    }
+
+    #[track_caller]
+    fn add_concept(store: &Store, memoir: &str, name: &str, def: &str) {
+        cmd_memoir_add_concept(store, memoir, name.into(), def.into(), None).unwrap();
+    }
+
+    #[track_caller]
+    fn memoir_id(store: &Store, name: &str) -> String {
+        store.get_memoir_by_name(name).unwrap().unwrap().id
+    }
+
+    #[test]
+    fn create_memoir_stores_and_is_retrievable() {
+        let s = store();
+        cmd_memoir_create(&s, "my-memoir".into(), "a description".into()).unwrap();
+        let m = s.get_memoir_by_name("my-memoir").unwrap().unwrap();
+        assert_eq!(m.name, "my-memoir");
+        assert_eq!(m.description, "a description");
+    }
+
+    // Memoir names are unique; second create with the same name must error.
+    #[test]
+    fn create_duplicate_memoir_errors() {
+        let s = store();
+        make_memoir(&s, "dup");
+        let err = cmd_memoir_create(&s, "dup".into(), "test memoir".into()).unwrap_err();
+        assert!(
+            err.to_string().to_lowercase().contains("unique")
+                || err.to_string().to_lowercase().contains("already"),
+            "expected uniqueness error, got: {err}"
+        );
+    }
+
+    // Concepts cascade-delete with their parent memoir; no orphans left behind.
+    #[test]
+    fn delete_removes_memoir_and_cascades_concepts() {
+        let s = store();
+        make_memoir(&s, "to-delete");
+        add_concept(&s, "to-delete", "concept-a", "definition a");
+        let cid = s
+            .get_concept_by_name(&memoir_id(&s, "to-delete"), "concept-a")
+            .unwrap()
+            .unwrap()
+            .id;
+
+        cmd_memoir_delete(&s, "to-delete").unwrap();
+
+        assert!(s.get_memoir_by_name("to-delete").unwrap().is_none());
+        assert!(
+            s.get_concept(&cid).unwrap().is_none(),
+            "concept must be cascade-deleted with its memoir"
+        );
+    }
+
+    // Deleting a missing memoir surfaces a "not found" error, not silent Ok.
+    #[test]
+    fn delete_unknown_memoir_errors() {
+        let s = store();
+        let err = cmd_memoir_delete(&s, "no-such").unwrap_err();
+        assert!(err.to_string().contains("memoir not found"), "got: {err}");
+    }
+
+    #[test]
+    fn add_concept_is_retrievable_by_name() {
+        let s = store();
+        make_memoir(&s, "m");
+        add_concept(&s, "m", "alpha", "the alpha definition");
+        let c = s
+            .get_concept_by_name(&memoir_id(&s, "m"), "alpha")
+            .unwrap()
+            .unwrap();
+        assert_eq!(c.definition, "the alpha definition");
+    }
+
+    // CLI label string "ns:val,ns:val" parses into structured Label{namespace,value} pairs.
+    #[test]
+    fn add_concept_with_labels_parses_correctly() {
+        let s = store();
+        make_memoir(&s, "m");
+        cmd_memoir_add_concept(
+            &s,
+            "m",
+            "labelled".into(),
+            "def".into(),
+            Some("type:decision,domain:arch".into()),
+        )
+        .unwrap();
+        let c = s
+            .get_concept_by_name(&memoir_id(&s, "m"), "labelled")
+            .unwrap()
+            .unwrap();
+        let pairs: Vec<(&str, &str)> = c
+            .labels
+            .iter()
+            .map(|l| (l.namespace.as_str(), l.value.as_str()))
+            .collect();
+        assert!(
+            pairs.contains(&("type", "decision")),
+            "missing type:decision in {pairs:?}"
+        );
+        assert!(
+            pairs.contains(&("domain", "arch")),
+            "missing domain:arch in {pairs:?}"
+        );
+        assert_eq!(c.labels.len(), 2, "no extra labels");
+    }
+
+    // Concept names are unique per memoir; second add with the same name must error.
+    #[test]
+    fn add_concept_duplicate_name_errors() {
+        let s = store();
+        make_memoir(&s, "m");
+        add_concept(&s, "m", "beta", "first");
+        let err =
+            cmd_memoir_add_concept(&s, "m", "beta".into(), "second".into(), None).unwrap_err();
+        assert!(
+            err.to_string().to_lowercase().contains("unique")
+                || err.to_string().to_lowercase().contains("already"),
+            "expected duplicate concept error, got: {err}"
+        );
+    }
+
+    // Bare value with no colon is shorthand: parses as tag:<value>, the default namespace.
+    #[test]
+    fn add_concept_label_without_colon_defaults_to_tag_namespace() {
+        let s = store();
+        make_memoir(&s, "m");
+        cmd_memoir_add_concept(&s, "m", "c".into(), "def".into(), Some("bare-value".into()))
+            .unwrap();
+        let c = s
+            .get_concept_by_name(&memoir_id(&s, "m"), "c")
+            .unwrap()
+            .unwrap();
+        assert_eq!(c.labels.len(), 1);
+        assert_eq!(c.labels[0].namespace, "tag");
+        assert_eq!(c.labels[0].value, "bare-value");
+    }
+
+    // Refine writes the new definition AND bumps revision; both must happen.
+    #[test]
+    fn refine_updates_definition_and_increments_revision() {
+        let s = store();
+        make_memoir(&s, "m");
+        add_concept(&s, "m", "c", "original definition");
+        let mid = memoir_id(&s, "m");
+        let before = s.get_concept_by_name(&mid, "c").unwrap().unwrap();
+        assert_eq!(before.revision, 1);
+
+        cmd_memoir_refine(&s, "m", "c", "updated definition").unwrap();
+
+        let after = s.get_concept_by_name(&mid, "c").unwrap().unwrap();
+        assert_eq!(after.definition, "updated definition");
+        assert_eq!(after.revision, 2, "revision must increment on refine");
+    }
+
+    // Refining a missing concept errors, does not silently insert it.
+    #[test]
+    fn refine_unknown_concept_errors() {
+        let s = store();
+        make_memoir(&s, "m");
+        let err = cmd_memoir_refine(&s, "m", "no-such", "new def").unwrap_err();
+        assert!(err.to_string().contains("concept not found"), "got: {err}");
+    }
+
+    // Links are directed: source≠target ordering matters, and the relation kind survives.
+    #[test]
+    fn link_creates_directed_edge() {
+        let s = store();
+        make_memoir(&s, "m");
+        add_concept(&s, "m", "source", "src def");
+        add_concept(&s, "m", "target", "tgt def");
+        cmd_memoir_link(&s, "m", "source", "target", Relation::DependsOn).unwrap();
+
+        let mid = memoir_id(&s, "m");
+        let src = s.get_concept_by_name(&mid, "source").unwrap().unwrap();
+        let tgt = s.get_concept_by_name(&mid, "target").unwrap().unwrap();
+        let links = s.get_links_for_memoir(&mid).unwrap();
+        assert_eq!(links.len(), 1);
+        assert_eq!(
+            links[0].source_id, src.id,
+            "source must be 'source' concept"
+        );
+        assert_eq!(
+            links[0].target_id, tgt.id,
+            "target must be 'target' concept"
+        );
+        assert_eq!(links[0].relation, Relation::DependsOn, "relation preserved");
+    }
+
+    // Missing source concept halts the link with an error; no dangling edge.
+    #[test]
+    fn link_unknown_from_concept_errors() {
+        let s = store();
+        make_memoir(&s, "m");
+        add_concept(&s, "m", "target", "def");
+        let err = cmd_memoir_link(&s, "m", "no-such", "target", Relation::RelatedTo).unwrap_err();
+        assert!(err.to_string().contains("concept not found"), "got: {err}");
+    }
+
+    // Missing target concept halts the link with an error; no dangling edge.
+    #[test]
+    fn link_unknown_to_concept_errors() {
+        let s = store();
+        make_memoir(&s, "m");
+        add_concept(&s, "m", "source", "def");
+        let err = cmd_memoir_link(&s, "m", "source", "no-such", Relation::RelatedTo).unwrap_err();
+        assert!(err.to_string().contains("concept not found"), "got: {err}");
+    }
+
+    // Smoke: cmd handles the "has results" print branch without panicking.
+    #[test]
+    fn search_runs_without_error_when_results_found() {
+        let s = store();
+        make_memoir(&s, "m");
+        add_concept(&s, "m", "redis-cache", "use redis for caching hot data");
+        add_concept(&s, "m", "postgres-db", "primary relational database");
+        cmd_memoir_search(&s, "m", "redis", None, 10).unwrap();
+    }
+
+    // Smoke: cmd handles the "No concepts found." branch without panicking.
+    #[test]
+    fn search_runs_without_error_when_no_results() {
+        let s = store();
+        make_memoir(&s, "m");
+        add_concept(&s, "m", "redis-cache", "use redis for caching hot data");
+        cmd_memoir_search(&s, "m", "nonexistent-term", None, 10).unwrap();
+    }
+
+    // Smoke: cmd accepts a label filter string without panicking.
+    #[test]
+    fn search_with_label_filter_does_not_error() {
+        let s = store();
+        make_memoir(&s, "m");
+        add_concept(&s, "m", "fast-cache", "redis based hot path");
+        cmd_memoir_search(&s, "m", "redis", Some("domain:infra"), 10).unwrap();
+    }
+
+    // label+query intersection: a concept matching the label but not the query must be excluded;
+    // a concept matching the query but not the label must also be excluded.
+    #[test]
+    fn label_filter_intersects_with_query_excludes_cross_label_results() {
+        let s = store();
+        make_memoir(&s, "m");
+        cmd_memoir_add_concept(
+            &s,
+            "m",
+            "fast-cache".into(),
+            "redis based hot path".into(),
+            Some("domain:infra".into()),
+        )
+        .unwrap();
+        cmd_memoir_add_concept(
+            &s,
+            "m",
+            "slow-cache".into(),
+            "disk based cold path".into(),
+            Some("domain:infra".into()),
+        )
+        .unwrap();
+        cmd_memoir_add_concept(
+            &s,
+            "m",
+            "ui-redis".into(),
+            "redis but used by ui".into(),
+            Some("domain:ui".into()),
+        )
+        .unwrap();
+
+        let mid = memoir_id(&s, "m");
+        let label: Label = "domain:infra".parse().unwrap();
+        let mut by_label = s.search_concepts_by_label(&mid, &label, 10).unwrap();
+        let q = "redis";
+        by_label.retain(|c| {
+            c.name.to_lowercase().contains(q) || c.definition.to_lowercase().contains(q)
+        });
+        let names: Vec<&str> = by_label.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["fast-cache"],
+            "slow-cache must be dropped (label match, query miss); ui-redis must be dropped (query match, label miss)"
+        );
+    }
+
+    // Smoke: search-all walks every memoir without panicking.
+    #[test]
+    fn search_all_runs_across_memoirs() {
+        let s = store();
+        make_memoir(&s, "m1");
+        make_memoir(&s, "m2");
+        add_concept(&s, "m1", "ca", "shared keyword alpha");
+        add_concept(&s, "m2", "cb", "shared keyword alpha");
+        cmd_memoir_search_all(&s, "alpha", 10).unwrap();
+    }
+
+    // Smoke: JSON export of concepts + links serializes cleanly.
+    #[test]
+    fn export_json_does_not_error() {
+        let s = store();
+        make_memoir(&s, "m");
+        add_concept(&s, "m", "c", "some definition");
+        cmd_memoir_export(&s, "m", "json").unwrap();
+    }
+
+    // Smoke: DOT export emits a parseable digraph.
+    #[test]
+    fn export_dot_does_not_error() {
+        let s = store();
+        make_memoir(&s, "m");
+        add_concept(&s, "m", "c", "some definition");
+        cmd_memoir_export(&s, "m", "dot").unwrap();
+    }
+
+    // Unsupported format must surface the format name in the error.
+    #[test]
+    fn export_unknown_format_errors() {
+        let s = store();
+        make_memoir(&s, "m");
+        let err = cmd_memoir_export(&s, "m", "yaml").unwrap_err();
+        assert!(
+            err.to_string().to_lowercase().contains("unknown")
+                || err.to_string().to_lowercase().contains("unsupported"),
+            "got: {err}"
+        );
+    }
+
+    // Clap routes --memoir/--name/--definition to AddConcept; --labels defaults to None.
+    #[test]
+    fn parses_add_concept_subcommand() {
+        let cli = Cli::try_parse_from([
+            "icm",
+            "memoir",
+            "add-concept",
+            "--memoir",
+            "git-workflow",
+            "--name",
+            "deploy-order",
+            "--definition",
+            "the merge order for deploy branch",
+        ])
+        .unwrap();
+        let Commands::Memoir { command } = cli.command else {
+            panic!()
+        };
+        let MemoirCommands::AddConcept {
+            memoir,
+            name,
+            definition,
+            labels,
+        } = command
+        else {
+            panic!("expected AddConcept");
+        };
+        assert_eq!(memoir, "git-workflow");
+        assert_eq!(name, "deploy-order");
+        assert_eq!(definition, "the merge order for deploy branch");
+        assert!(labels.is_none());
+    }
+
+    // --labels is wired to the labels field, not silently dropped.
+    #[test]
+    fn parses_add_concept_with_labels() {
+        let cli = Cli::try_parse_from([
+            "icm",
+            "memoir",
+            "add-concept",
+            "--memoir",
+            "git-workflow",
+            "--name",
+            "deploy-order",
+            "--definition",
+            "the merge order for deploy branch",
+            "--labels",
+            "type:decision",
+        ])
+        .unwrap();
+        let Commands::Memoir { command } = cli.command else {
+            panic!()
+        };
+        let MemoirCommands::AddConcept { labels, .. } = command else {
+            panic!("expected AddConcept");
+        };
+        assert_eq!(
+            labels.as_deref(),
+            Some("type:decision"),
+            "--labels must be passed through as Some"
+        );
+    }
+
+    // Clap routes --memoir/--name/--definition to Refine; all three fields are required.
+    #[test]
+    fn parses_refine_subcommand() {
+        let cli = Cli::try_parse_from([
+            "icm",
+            "memoir",
+            "refine",
+            "--memoir",
+            "git-workflow",
+            "--name",
+            "deploy-order",
+            "--definition",
+            "updated definition",
+        ])
+        .unwrap();
+        let Commands::Memoir { command } = cli.command else {
+            panic!()
+        };
+        let MemoirCommands::Refine {
+            memoir,
+            name,
+            definition,
+        } = command
+        else {
+            panic!("expected Refine");
+        };
+        assert_eq!(memoir, "git-workflow");
+        assert_eq!(name, "deploy-order");
+        assert_eq!(definition, "updated definition");
+    }
+
+    // Clap routes --from/--to to source/target and --relation parses into CliRelation.
+    #[test]
+    fn parses_link_subcommand() {
+        let cli = Cli::try_parse_from([
+            "icm",
+            "memoir",
+            "link",
+            "--memoir",
+            "git-workflow",
+            "--from",
+            "concept-a",
+            "--to",
+            "concept-b",
+            "--relation",
+            "depends-on",
+        ])
+        .unwrap();
+        let Commands::Memoir { command } = cli.command else {
+            panic!()
+        };
+        let MemoirCommands::Link {
+            memoir,
+            from,
+            to,
+            relation,
+        } = command
+        else {
+            panic!("expected Link");
+        };
+        assert_eq!(memoir, "git-workflow");
+        assert_eq!(from, "concept-a");
+        assert_eq!(to, "concept-b");
+        assert!(
+            matches!(relation, CliRelation::DependsOn),
+            "relation must map to depends-on"
         );
     }
 }

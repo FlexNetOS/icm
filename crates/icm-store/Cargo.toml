@@ -3,17 +3,61 @@ name = "icm-store"
 version = "0.10.34"
 edition = "2021"
 
+[features]
+# The default build is byte-for-byte the same as before: the in-process
+# SQLite backend, bundled, zero external services. This preserves the
+# "single binary, zero dependencies" promise (issue #301).
+default = ["backend-sqlite"]
+
+# Storage backends are ADDITIVE (issue #301): any combination can be
+# compiled into one binary, and the active one is chosen at runtime via
+# `ICM_DB_BACKEND` (see the `Store` enum). SQLite is the lightweight
+# default; the remote backends are opt-in extra deps.
+backend-sqlite = ["dep:rusqlite", "dep:sqlite-vec", "dep:zerocopy"]
+
+# Opt-in network-accessible PostgreSQL backend (issue #301). Lets several
+# ICM processes / Kubernetes replicas share one memory store, which a
+# node-local SQLite file cannot do. Mutually exclusive with
+# `backend-sqlite` (see the `compile_error!` guard in `lib.rs`); build
+# with `--no-default-features --features postgres`.
+postgres = ["dep:postgres", "dep:pgvector"]
+
+# Opt-in network-accessible OpenSearch backend (issue #301). A
+# search-native shared store: BM25 full-text + `knn_vector` HNSW vector
+# search in one engine, so horizontally-scaled replicas share memory.
+# Talks to the OpenSearch REST API over the blocking `ureq` client, so —
+# like the PostgreSQL backend — there is no async runtime. Mutually
+# exclusive with the other backends; build with
+# `--no-default-features --features opensearch`.
+opensearch = ["dep:ureq", "dep:base64"]
+
 [dependencies]
 icm-core = { path = "../icm-core" }
-rusqlite = { workspace = true }
-sqlite-vec = { workspace = true }
-zerocopy = { workspace = true }
 serde_json = { workspace = true }
 chrono = { workspace = true }
 tracing = { workspace = true }
 lru = { workspace = true }
 sha2 = { workspace = true }
 ulid = { workspace = true }
+
+# SQLite backend (default). Optional so the `postgres` backend can be
+# built without pulling in rusqlite / sqlite-vec.
+rusqlite = { workspace = true, optional = true }
+sqlite-vec = { workspace = true, optional = true }
+zerocopy = { workspace = true, optional = true }
+
+# PostgreSQL backend (opt-in). The blocking `postgres` client matches the
+# store's synchronous trait surface exactly, so no async runtime or
+# sync-over-async bridge is needed. `pgvector` adds the `vector` column
+# type binding used for embedding KNN search.
+postgres = { version = "0.19", features = ["with-chrono-0_4"], optional = true }
+pgvector = { version = "0.4", features = ["postgres"], optional = true }
+
+# OpenSearch backend (opt-in). Blocking HTTP client + JSON bodies hit the
+# OpenSearch REST API directly — no async runtime, matching the store's
+# synchronous trait surface. `base64` encodes optional basic-auth creds.
+ureq = { version = "2", features = ["json", "tls"], optional = true }
+base64 = { version = "0.22", optional = true }
 
 [dev-dependencies]
 tempfile = "3"

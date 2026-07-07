@@ -109,6 +109,9 @@ impl FastEmbedder {
         }
         let (emb_model, _) = resolve_model(&self.model_name)?;
         let cache = cache_dir();
+        std::fs::create_dir_all(&cache)
+            .and_then(|()| cachedir::ensure_tag(&cache))
+            .unwrap_or_else(|e| tracing::warn!("could not tag cache dir: {e}"));
         let model = TextEmbedding::try_new(
             InitOptions::new(emb_model)
                 .with_show_download_progress(true)
@@ -117,6 +120,43 @@ impl FastEmbedder {
         .map_err(|e| IcmError::Embedding(format!("failed to init model: {e}")))?;
         let _ = self.model.set(model);
         Ok(self.model.get().unwrap())
+    }
+
+    /// e5-family instruction prefixes as `(query_prefix, passage_prefix)`.
+    ///
+    /// The multilingual-e5 models are trained to expect `"query: "` on search
+    /// queries and `"passage: "` on stored documents; omitting them degrades
+    /// retrieval quality (per the intfloat/multilingual-e5 model card). Every
+    /// other model family is left unprefixed so its behaviour is unchanged.
+    fn instruction_prefixes(&self) -> (&'static str, &'static str) {
+        match resolve_model(&self.model_name) {
+            Ok((
+                EmbeddingModel::MultilingualE5Small
+                | EmbeddingModel::MultilingualE5Base
+                | EmbeddingModel::MultilingualE5Large,
+                _,
+            )) => ("query: ", "passage: "),
+            _ => ("", ""),
+        }
+    }
+
+    /// Embed a single text, optionally prepending an instruction `prefix`.
+    fn embed_one(&self, prefix: &str, text: &str) -> IcmResult<Vec<f32>> {
+        let model = self.get_model()?;
+        let prefixed: String;
+        let input: &str = if prefix.is_empty() {
+            text
+        } else {
+            prefixed = format!("{prefix}{text}");
+            &prefixed
+        };
+        let results = model
+            .embed(vec![input], None)
+            .map_err(|e| IcmError::Embedding(e.to_string()))?;
+        results
+            .into_iter()
+            .next()
+            .ok_or_else(|| IcmError::Embedding("empty embedding result".into()))
     }
 }
 
@@ -127,15 +167,16 @@ impl Default for FastEmbedder {
 }
 
 impl Embedder for FastEmbedder {
+    /// Embed a document for storage, applying the model's passage prefix.
     fn embed(&self, text: &str) -> IcmResult<Vec<f32>> {
-        let model = self.get_model()?;
-        let results = model
-            .embed(vec![text], None)
-            .map_err(|e| IcmError::Embedding(e.to_string()))?;
-        results
-            .into_iter()
-            .next()
-            .ok_or_else(|| IcmError::Embedding("empty embedding result".into()))
+        let (_, passage) = self.instruction_prefixes();
+        self.embed_one(passage, text)
+    }
+
+    /// Embed a search query, applying the model's query prefix.
+    fn embed_query(&self, text: &str) -> IcmResult<Vec<f32>> {
+        let (query, _) = self.instruction_prefixes();
+        self.embed_one(query, text)
     }
 
     fn embed_batch(&self, texts: &[&str]) -> IcmResult<Vec<Vec<f32>>> {
@@ -143,12 +184,57 @@ impl Embedder for FastEmbedder {
             return Ok(Vec::new());
         }
         let model = self.get_model()?;
-        model
-            .embed(texts.to_vec(), None)
-            .map_err(|e| IcmError::Embedding(e.to_string()))
+        let (_, passage) = self.instruction_prefixes();
+        if passage.is_empty() {
+            model
+                .embed(texts.to_vec(), None)
+                .map_err(|e| IcmError::Embedding(e.to_string()))
+        } else {
+            let prefixed: Vec<String> = texts.iter().map(|t| format!("{passage}{t}")).collect();
+            model
+                .embed(prefixed, None)
+                .map_err(|e| IcmError::Embedding(e.to_string()))
+        }
     }
 
     fn dimensions(&self) -> usize {
         self.dims
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn e5_models_use_instruction_prefixes() {
+        for model in [
+            "Qdrant/multilingual-e5-large-onnx",
+            "intfloat/multilingual-e5-base",
+            "intfloat/multilingual-e5-small",
+        ] {
+            let embedder = FastEmbedder::with_model(model);
+            assert_eq!(
+                embedder.instruction_prefixes(),
+                ("query: ", "passage: "),
+                "expected e5 instruction prefixes for {model}"
+            );
+        }
+    }
+
+    #[test]
+    fn non_e5_models_are_left_unprefixed() {
+        for model in [
+            "Xenova/bge-small-en-v1.5",
+            "Qdrant/all-MiniLM-L6-v2-onnx",
+            "Alibaba-NLP/gte-large-en-v1.5",
+        ] {
+            let embedder = FastEmbedder::with_model(model);
+            assert_eq!(
+                embedder.instruction_prefixes(),
+                ("", ""),
+                "expected no instruction prefix for {model}"
+            );
+        }
     }
 }

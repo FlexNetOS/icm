@@ -1,5 +1,71 @@
 # Changelog
 
+## [0.10.54](https://github.com/rtk-ai/icm/compare/icm-v0.10.53...icm-v0.10.54) (2026-06-21)
+
+
+### Features
+
+* **init:** Add `icm forget` and `icm list` to `icm_block` ([#252](https://github.com/rtk-ai/icm/issues/252)) ([b698ee6](https://github.com/rtk-ai/icm/commit/b698ee6517c17fae51d2c88902bfe22596ac3958))
+
+
+### Bug Fixes
+
+* **project:** resolve worktree directory name as main repo project ([#235](https://github.com/rtk-ai/icm/issues/235)) ([01e0c91](https://github.com/rtk-ai/icm/commit/01e0c91ca23d94434f615944603c23f31eb2a740))
+
+## [0.10.53](https://github.com/rtk-ai/icm/compare/icm-v0.10.52...icm-v0.10.53) (2026-06-21)
+
+
+### Features
+
+* **serve:** persistent local HTTP API with warm model + TOON-first responses (closes [#290](https://github.com/rtk-ai/icm/issues/290)) ([#291](https://github.com/rtk-ai/icm/issues/291)) ([fd8acd6](https://github.com/rtk-ai/icm/commit/fd8acd60dfa5a166be65c4822ec0719976d80e1f))
+
+
+### Bug Fixes
+
+* **init:** Codex PostToolUse is opt-in to avoid 14k-event-per-day noise (closes [#288](https://github.com/rtk-ai/icm/issues/288)) ([#293](https://github.com/rtk-ai/icm/issues/293)) ([7224cdf](https://github.com/rtk-ai/icm/commit/7224cdf61419e261ba6b8a518f8f8ef228af2832))
+
+## [0.10.52](https://github.com/rtk-ai/icm/compare/icm-v0.10.51...icm-v0.10.52) (2026-06-14)
+
+
+### Features
+
+* **facts:** structured (entity, key, value) layer with supersession (closes [#273](https://github.com/rtk-ai/icm/issues/273)) ([#279](https://github.com/rtk-ai/icm/issues/279)) ([cc43fb5](https://github.com/rtk-ai/icm/commit/cc43fb58e60f11042cca8a6d11b1b8efaa2e42f1))
+* **hook:** always-on bounded context snapshot (closes [#271](https://github.com/rtk-ai/icm/issues/271)) ([#277](https://github.com/rtk-ai/icm/issues/277)) ([7fe90b1](https://github.com/rtk-ai/icm/commit/7fe90b14000bdad5d9c6898478fa3f0b5b917899))
+* **hook:** auto-archive sessions + icm sessions command (closes [#272](https://github.com/rtk-ai/icm/issues/272)) ([#278](https://github.com/rtk-ai/icm/issues/278)) ([1268476](https://github.com/rtk-ai/icm/commit/1268476c7a9c34cf8f9e6621d667c923251267b0))
+* **hook:** auto-capture code areas the agent edits (closes [#196](https://github.com/rtk-ai/icm/issues/196)) ([#261](https://github.com/rtk-ai/icm/issues/261)) ([2ed9547](https://github.com/rtk-ai/icm/commit/2ed954787737c35a0c1905f1f223bb793d536dfc))
+* **init:** add `/remember-session` skill for session checkpointing ([#251](https://github.com/rtk-ai/icm/issues/251)) ([d2edca3](https://github.com/rtk-ai/icm/commit/d2edca3488e45671f42202243025b09af6e1512f))
+* **init:** support Pi (pi.dev) harness out of the box ([#265](https://github.com/rtk-ai/icm/issues/265)) ([e2e4079](https://github.com/rtk-ai/icm/commit/e2e4079b52f3dcf5af6a16ec1d1d9d084603b43e))
+* **store:** --read-only mode for read-like commands in sandboxed environments (closes [#263](https://github.com/rtk-ai/icm/issues/263)) ([#282](https://github.com/rtk-ai/icm/issues/282)) ([4c73f40](https://github.com/rtk-ai/icm/commit/4c73f40332d0120999a6af08e653fa84546445f4))
+
+
+### Bug Fixes
+
+* **config:** display auto_consolidate_enabled and auto_consolidate_threshold ([#264](https://github.com/rtk-ai/icm/issues/264)) ([6f33604](https://github.com/rtk-ai/icm/commit/6f3360412ec0748e75ec89a441506f0a5bfee7cc))
+* **display:** render recall --format detail and tui timestamps in local timezone (closes [#254](https://github.com/rtk-ai/icm/issues/254)) ([#283](https://github.com/rtk-ai/icm/issues/283)) ([8c00775](https://github.com/rtk-ai/icm/commit/8c0077529daf86bc54af75e058d1fa3fceed7eca))
+* **embeddings:** apply e5 query/passage instruction prefixes ([#260](https://github.com/rtk-ai/icm/issues/260)) ([1903915](https://github.com/rtk-ai/icm/commit/1903915f0be3aab3f70a006963815ec5664e27b6))
+* **init:** /recall skill uses icm wake-up when called with no args ([#250](https://github.com/rtk-ai/icm/issues/250)) ([842b5d1](https://github.com/rtk-ai/icm/commit/842b5d1615bc8970a157d3a546c390720567b1ca))
+* **store:** preserve stored embedding dims when no embedder is loaded (closes [#267](https://github.com/rtk-ai/icm/issues/267)) ([#281](https://github.com/rtk-ai/icm/issues/281)) ([fbbc423](https://github.com/rtk-ai/icm/commit/fbbc4239d99cda6b440052fe05c3f27dcd2ba6cf))
+* **summarizer:** suppress thinking-mode reasoning on Ollama + clearer empty errors (closes [#253](https://github.com/rtk-ai/icm/issues/253)) ([#284](https://github.com/rtk-ai/icm/issues/284)) ([ae13e8e](https://github.com/rtk-ai/icm/commit/ae13e8e89f88b0b5d86cd3268c7000afaefd8818))
+
+## [0.10.51](https://github.com/rtk-ai/icm/compare/icm-v0.10.50...icm-v0.10.51) (2026-06-13)
+
+
+### Features
+
+* **cli:** add `remember` subcommand ([1f31222](https://github.com/rtk-ai/icm/commit/1f31222ab1bdf34ed1c71d9f056dccd489032697))
+* **list:** add --format human|toon|json|toml and --limit (closes [#269](https://github.com/rtk-ai/icm/issues/269)) ([9f054a2](https://github.com/rtk-ai/icm/commit/9f054a2c290f1cc7ae06fbd477342bbd052cbfb6))
+* **list:** add --format json|toon|toml and --limit (closes [#269](https://github.com/rtk-ai/icm/issues/269)) ([818cfa2](https://github.com/rtk-ai/icm/commit/818cfa240e247bc374c91312b6fe2e4edb9d3465))
+
+
+### Bug Fixes
+
+* **cli:** char-align all truncation slices to prevent multibyte panic ([81f5056](https://github.com/rtk-ai/icm/commit/81f5056422761509c9568238c0ed376da7f21c7c))
+* **cli:** char-align all truncation slices to prevent multibyte panic ([7e8b34e](https://github.com/rtk-ai/icm/commit/7e8b34e98b9216cac41000f28f53b62601f1adaa))
+* **cli:** remove audit note from --db help text ([5a945dc](https://github.com/rtk-ai/icm/commit/5a945dc5c79c107f6e5c34d7d774d3bb7f7a3e02))
+* **codex:** drop unsupported updatedInput + generalize instruction template ([3189398](https://github.com/rtk-ai/icm/commit/31893980b6704b475742fe6157d83eaf407fc70a))
+* **hook:** drop unsupported updatedInput from PreToolUse response ([d6fc2eb](https://github.com/rtk-ai/icm/commit/d6fc2eb5849ffeecddc4fad3d75c849a2197e6b9)), closes [#237](https://github.com/rtk-ai/icm/issues/237)
+* **install:** make the icm instruction block file-agnostic ([4f8f397](https://github.com/rtk-ai/icm/commit/4f8f397e26c276890f7f1a6701f262915b9d0c1f)), closes [#238](https://github.com/rtk-ai/icm/issues/238)
+
 ## [0.10.50](https://github.com/rtk-ai/icm/compare/icm-v0.10.49...icm-v0.10.50) (2026-05-23)
 
 

@@ -2,20 +2,18 @@ use chrono::Utc;
 use serde_json::{json, Value};
 
 use icm_core::{
-    add_backrefs, auto_link_memory, build_wake_up, format_local, is_preference_topic,
-    keyword_matches, project_matches, topic_matches, AutoLinkOptions, Concept, ConceptLink,
-    Embedder, Feedback, FeedbackStore, Label, Memoir, MemoirStore, Memory, MemoryStore, Relation,
-    WakeUpFormat, WakeUpOptions, MSG_NO_MEMORIES,
+    add_backrefs, auto_link_memory, build_wake_up, find_similar_memory, format_local,
+    is_preference_topic, keyword_matches, project_matches, topic_matches, AutoLinkOptions, Concept,
+    ConceptLink, Embedder, Feedback, FeedbackStore, Label, Memoir, MemoirStore, Memory,
+    MemoryStore, Relation, WakeUpFormat, WakeUpOptions, DEDUP_SIMILARITY_THRESHOLD,
+    MSG_NO_MEMORIES,
 };
-use icm_store::SqliteStore;
+use icm_store::Store;
 
 use crate::protocol::ToolResult;
 
 /// Default threshold for auto-consolidation (can be overridden by config).
 const AUTO_CONSOLIDATE_THRESHOLD: usize = 10;
-
-/// Similarity score above which a new memory is considered a duplicate of an existing one.
-const DEDUP_SIMILARITY_THRESHOLD: f32 = 0.85;
 
 /// Maximum allowed length for topic names. Must stay <= the store
 /// layer's `MAX_TOPIC_BYTES` so the MCP-level rejection happens
@@ -48,7 +46,7 @@ fn parse_keywords(args: &Value) -> Vec<String> {
 /// rolled-up memory had `embedding = None` and was invisible to hybrid
 /// recall until a manual `icm embed` rebuilt it).
 fn try_auto_consolidate(
-    store: &SqliteStore,
+    store: &Store,
     embedder: Option<&dyn Embedder>,
     topic: &str,
     threshold: usize,
@@ -715,7 +713,7 @@ pub fn tool_definitions(has_embedder: bool) -> Value {
 // ---------------------------------------------------------------------------
 
 pub fn call_tool(
-    store: &SqliteStore,
+    store: &Store,
     embedder: Option<&dyn Embedder>,
     name: &str,
     args: &Value,
@@ -767,7 +765,7 @@ pub fn call_tool(
 // Transcript tool handlers
 // ---------------------------------------------------------------------------
 
-fn tool_transcript_start_session(store: &SqliteStore, args: &Value) -> ToolResult {
+fn tool_transcript_start_session(store: &Store, args: &Value) -> ToolResult {
     use icm_core::TranscriptStore;
     let agent = args.get("agent").and_then(|v| v.as_str()).unwrap_or("mcp");
     let project = args.get("project").and_then(|v| v.as_str());
@@ -778,7 +776,7 @@ fn tool_transcript_start_session(store: &SqliteStore, args: &Value) -> ToolResul
     }
 }
 
-fn tool_transcript_record(store: &SqliteStore, args: &Value) -> ToolResult {
+fn tool_transcript_record(store: &Store, args: &Value) -> ToolResult {
     use icm_core::{Role, TranscriptStore};
     let session_id = match args.get("session_id").and_then(|v| v.as_str()) {
         Some(s) => s,
@@ -809,7 +807,7 @@ fn tool_transcript_record(store: &SqliteStore, args: &Value) -> ToolResult {
     }
 }
 
-fn tool_transcript_search(store: &SqliteStore, args: &Value) -> ToolResult {
+fn tool_transcript_search(store: &Store, args: &Value) -> ToolResult {
     use icm_core::TranscriptStore;
     let query = match args.get("query").and_then(|v| v.as_str()) {
         Some(s) => s,
@@ -831,7 +829,7 @@ fn tool_transcript_search(store: &SqliteStore, args: &Value) -> ToolResult {
     }
 }
 
-fn tool_transcript_show(store: &SqliteStore, args: &Value) -> ToolResult {
+fn tool_transcript_show(store: &Store, args: &Value) -> ToolResult {
     use icm_core::TranscriptStore;
     let session_id = match args.get("session_id").and_then(|v| v.as_str()) {
         Some(s) => s,
@@ -855,7 +853,7 @@ fn tool_transcript_show(store: &SqliteStore, args: &Value) -> ToolResult {
     ToolResult::text(body.to_string())
 }
 
-fn tool_transcript_stats(store: &SqliteStore) -> ToolResult {
+fn tool_transcript_stats(store: &Store) -> ToolResult {
     use icm_core::TranscriptStore;
     match store.transcript_stats() {
         Ok(s) => ToolResult::text(serde_json::to_string(&s).unwrap_or_else(|_| "{}".into())),
@@ -867,7 +865,7 @@ fn tool_transcript_stats(store: &SqliteStore) -> ToolResult {
 // Wake-up tool handler
 // ---------------------------------------------------------------------------
 
-fn tool_wake_up(store: &SqliteStore, args: &Value) -> ToolResult {
+fn tool_wake_up(store: &Store, args: &Value) -> ToolResult {
     // Normalize the project filter: empty string or "-" both mean "disabled",
     // mirroring the CLI convention.
     let project = match get_str(args, "project") {
@@ -910,7 +908,7 @@ fn get_i64(args: &Value, key: &str, default: i64) -> i64 {
     args.get(key).and_then(|v| v.as_i64()).unwrap_or(default)
 }
 
-fn resolve_memoir(store: &SqliteStore, name: &str) -> Result<Memoir, ToolResult> {
+fn resolve_memoir(store: &Store, name: &str) -> Result<Memoir, ToolResult> {
     store
         .get_memoir_by_name(name)
         .map_err(|e| ToolResult::error(format!("db error: {e}")))?
@@ -922,7 +920,7 @@ fn resolve_memoir(store: &SqliteStore, name: &str) -> Result<Memoir, ToolResult>
 // ---------------------------------------------------------------------------
 
 fn tool_store(
-    store: &SqliteStore,
+    store: &Store,
     embedder: Option<&dyn Embedder>,
     args: &Value,
     compact: bool,
@@ -998,49 +996,50 @@ fn tool_store(
 
     // Dedup check: if a very similar memory exists in the same topic, update it instead
     if let Some(ref query_emb) = embed_vec {
-        if let Ok(similar) = store.search_hybrid(&embed_text, query_emb, 1) {
-            if let Some((existing, score)) = similar.first() {
-                if *score > DEDUP_SIMILARITY_THRESHOLD && existing.topic == topic {
-                    // Very similar content in same topic — update instead of duplicate
-                    let updated = Memory {
-                        id: existing.id.clone(),
-                        created_at: existing.created_at,
-                        last_accessed: existing.last_accessed,
-                        access_count: existing.access_count,
-                        weight: 1.0, // Reset weight on update
-                        topic: existing.topic.clone(),
-                        summary: content.to_string(),
-                        raw_excerpt: get_str(args, "raw_excerpt")
-                            .map(|r| r.into())
-                            .or_else(|| existing.raw_excerpt.clone()),
-                        keywords: {
-                            let kw = parse_keywords(args);
-                            if kw.is_empty() {
-                                existing.keywords.clone()
-                            } else {
-                                kw
-                            }
-                        },
-                        embedding: Some(query_emb.clone()),
-                        importance,
-                        source: existing.source.clone(),
-                        related_ids: existing.related_ids.clone(),
-                        updated_at: Utc::now(),
-                        scope: existing.scope,
-                    };
-                    if let Err(e) = store.update(&updated) {
-                        return ToolResult::error(format!("failed to update: {e}"));
-                    }
-                    return if compact {
-                        ToolResult::text(format!("ok:{}", updated.id))
+        if let Ok(Some((existing, score))) = find_similar_memory(
+            store,
+            &embed_text,
+            query_emb,
+            topic,
+            DEDUP_SIMILARITY_THRESHOLD,
+        ) {
+            let updated = Memory {
+                id: existing.id.clone(),
+                created_at: existing.created_at,
+                last_accessed: existing.last_accessed,
+                access_count: existing.access_count,
+                weight: 1.0,
+                topic: existing.topic.clone(),
+                summary: content.to_string(),
+                raw_excerpt: get_str(args, "raw_excerpt")
+                    .map(|r| r.into())
+                    .or_else(|| existing.raw_excerpt.clone()),
+                keywords: {
+                    let kw = parse_keywords(args);
+                    if kw.is_empty() {
+                        existing.keywords.clone()
                     } else {
-                        ToolResult::text(format!(
-                            "Updated existing memory (similarity {score:.2}): {}",
-                            updated.id
-                        ))
-                    };
-                }
+                        kw
+                    }
+                },
+                embedding: Some(query_emb.clone()),
+                importance,
+                source: existing.source.clone(),
+                related_ids: existing.related_ids.clone(),
+                updated_at: Utc::now(),
+                scope: existing.scope,
+            };
+            if let Err(e) = store.update(&updated) {
+                return ToolResult::error(format!("failed to update: {e}"));
             }
+            return if compact {
+                ToolResult::text(format!("ok:{}", updated.id))
+            } else {
+                ToolResult::text(format!(
+                    "Updated existing memory (similarity {score:.2}): {}",
+                    updated.id
+                ))
+            };
         }
     }
 
@@ -1147,7 +1146,7 @@ fn format_memory_output(memories: &[(Memory, f32)], compact: bool) -> String {
 }
 
 fn tool_recall(
-    store: &SqliteStore,
+    store: &Store,
     embedder: Option<&dyn Embedder>,
     args: &Value,
     compact: bool,
@@ -1188,7 +1187,7 @@ fn tool_recall(
 
     // Try hybrid search if embedder is available
     if let Some(emb) = embedder {
-        if let Ok(query_emb) = emb.embed(query) {
+        if let Ok(query_emb) = emb.embed_query(query) {
             if let Ok(results) = store.search_hybrid(query, &query_emb, limit) {
                 let mut scored_results = results;
                 scored_results.retain(|(m, _)| project_filter(m));
@@ -1290,7 +1289,7 @@ fn tool_recall(
     ToolResult::text(format_memory_output(&for_display, compact))
 }
 
-fn tool_forget(store: &SqliteStore, args: &Value) -> ToolResult {
+fn tool_forget(store: &Store, args: &Value) -> ToolResult {
     let id = match get_str(args, "id") {
         Some(id) => id,
         None => return ToolResult::error("missing required field: id".into()),
@@ -1302,7 +1301,7 @@ fn tool_forget(store: &SqliteStore, args: &Value) -> ToolResult {
     }
 }
 
-fn tool_forget_topic(store: &SqliteStore, args: &Value) -> ToolResult {
+fn tool_forget_topic(store: &Store, args: &Value) -> ToolResult {
     let topic = match get_str(args, "topic") {
         Some(t) => t,
         None => return ToolResult::error("missing required field: topic".into()),
@@ -1323,7 +1322,7 @@ fn tool_forget_topic(store: &SqliteStore, args: &Value) -> ToolResult {
     ToolResult::text(format!("Deleted {count} memories from topic: {topic}"))
 }
 
-fn tool_learn(store: &SqliteStore, args: &Value) -> ToolResult {
+fn tool_learn(store: &Store, args: &Value) -> ToolResult {
     let dir_str = get_str(args, "directory").unwrap_or(".");
     let dir = std::path::PathBuf::from(dir_str);
 
@@ -1339,7 +1338,7 @@ fn tool_learn(store: &SqliteStore, args: &Value) -> ToolResult {
     }
 }
 
-fn tool_consolidate(store: &SqliteStore, args: &Value) -> ToolResult {
+fn tool_consolidate(store: &Store, args: &Value) -> ToolResult {
     let topic = match get_str(args, "topic") {
         Some(t) => t,
         None => return ToolResult::error("missing required field: topic".into()),
@@ -1357,7 +1356,7 @@ fn tool_consolidate(store: &SqliteStore, args: &Value) -> ToolResult {
     }
 }
 
-fn tool_list_topics(store: &SqliteStore) -> ToolResult {
+fn tool_list_topics(store: &Store) -> ToolResult {
     match store.list_topics() {
         Ok(topics) => {
             if topics.is_empty() {
@@ -1402,7 +1401,7 @@ fn tool_list_topics(store: &SqliteStore) -> ToolResult {
     }
 }
 
-fn tool_stats(store: &SqliteStore) -> ToolResult {
+fn tool_stats(store: &Store) -> ToolResult {
     match store.stats() {
         Ok(stats) => {
             let mut output = format!(
@@ -1427,7 +1426,7 @@ fn tool_stats(store: &SqliteStore) -> ToolResult {
     }
 }
 
-fn tool_update(store: &SqliteStore, embedder: Option<&dyn Embedder>, args: &Value) -> ToolResult {
+fn tool_update(store: &Store, embedder: Option<&dyn Embedder>, args: &Value) -> ToolResult {
     let id = match get_str(args, "id") {
         Some(id) => id,
         None => return ToolResult::error("missing required field: id".into()),
@@ -1471,7 +1470,7 @@ fn tool_update(store: &SqliteStore, embedder: Option<&dyn Embedder>, args: &Valu
     }
 }
 
-fn tool_health(store: &SqliteStore, args: &Value) -> ToolResult {
+fn tool_health(store: &Store, args: &Value) -> ToolResult {
     let specific_topic = get_str(args, "topic");
 
     let topics = if let Some(t) = specific_topic {
@@ -1522,7 +1521,7 @@ fn tool_health(store: &SqliteStore, args: &Value) -> ToolResult {
     ToolResult::text(output)
 }
 
-fn tool_extract_patterns(store: &SqliteStore, args: &Value) -> ToolResult {
+fn tool_extract_patterns(store: &Store, args: &Value) -> ToolResult {
     let topic = match get_str(args, "topic") {
         Some(t) => t,
         None => return ToolResult::error("missing required field: topic".into()),
@@ -1590,11 +1589,7 @@ fn tool_extract_patterns(store: &SqliteStore, args: &Value) -> ToolResult {
     ToolResult::text(output)
 }
 
-fn tool_embed_all(
-    store: &SqliteStore,
-    embedder: Option<&dyn Embedder>,
-    args: &Value,
-) -> ToolResult {
+fn tool_embed_all(store: &Store, embedder: Option<&dyn Embedder>, args: &Value) -> ToolResult {
     let embedder = match embedder {
         Some(e) => e,
         None => return ToolResult::error("embeddings not available".into()),
@@ -1655,7 +1650,7 @@ fn tool_embed_all(
 // Memoir tool handlers
 // ---------------------------------------------------------------------------
 
-fn tool_memoir_create(store: &SqliteStore, args: &Value) -> ToolResult {
+fn tool_memoir_create(store: &Store, args: &Value) -> ToolResult {
     let name = match get_str(args, "name") {
         Some(n) => n,
         None => return ToolResult::error("missing required field: name".into()),
@@ -1678,7 +1673,7 @@ fn tool_memoir_create(store: &SqliteStore, args: &Value) -> ToolResult {
     }
 }
 
-fn tool_memoir_list(store: &SqliteStore) -> ToolResult {
+fn tool_memoir_list(store: &Store) -> ToolResult {
     let memoirs = match store.list_memoirs() {
         Ok(m) => m,
         Err(e) => return ToolResult::error(format!("failed to list memoirs: {e}")),
@@ -1700,7 +1695,7 @@ fn tool_memoir_list(store: &SqliteStore) -> ToolResult {
     ToolResult::text(output)
 }
 
-fn tool_memoir_show(store: &SqliteStore, args: &Value) -> ToolResult {
+fn tool_memoir_show(store: &Store, args: &Value) -> ToolResult {
     let name = match get_str(args, "name") {
         Some(n) => n,
         None => return ToolResult::error("missing required field: name".into()),
@@ -1757,7 +1752,7 @@ fn tool_memoir_show(store: &SqliteStore, args: &Value) -> ToolResult {
     ToolResult::text(output)
 }
 
-fn tool_memoir_add_concept(store: &SqliteStore, args: &Value) -> ToolResult {
+fn tool_memoir_add_concept(store: &Store, args: &Value) -> ToolResult {
     let memoir_name = match get_str(args, "memoir") {
         Some(n) => n,
         None => return ToolResult::error("missing required field: memoir".into()),
@@ -1805,7 +1800,7 @@ fn tool_memoir_add_concept(store: &SqliteStore, args: &Value) -> ToolResult {
     }
 }
 
-fn tool_memoir_refine(store: &SqliteStore, args: &Value) -> ToolResult {
+fn tool_memoir_refine(store: &Store, args: &Value) -> ToolResult {
     let memoir_name = match get_str(args, "memoir") {
         Some(n) => n,
         None => return ToolResult::error("missing required field: memoir".into()),
@@ -1845,7 +1840,7 @@ fn tool_memoir_refine(store: &SqliteStore, args: &Value) -> ToolResult {
     ))
 }
 
-fn tool_memoir_search(store: &SqliteStore, args: &Value) -> ToolResult {
+fn tool_memoir_search(store: &Store, args: &Value) -> ToolResult {
     let memoir_name = match get_str(args, "memoir") {
         Some(n) => n,
         None => return ToolResult::error("missing required field: memoir".into()),
@@ -1905,7 +1900,7 @@ fn tool_memoir_search(store: &SqliteStore, args: &Value) -> ToolResult {
     ToolResult::text(output)
 }
 
-fn tool_memoir_search_all(store: &SqliteStore, args: &Value) -> ToolResult {
+fn tool_memoir_search_all(store: &Store, args: &Value) -> ToolResult {
     let query = match get_str(args, "query") {
         Some(q) => q,
         None => return ToolResult::error("missing required field: query".into()),
@@ -1946,7 +1941,7 @@ fn tool_memoir_search_all(store: &SqliteStore, args: &Value) -> ToolResult {
     ToolResult::text(output)
 }
 
-fn tool_memoir_link(store: &SqliteStore, args: &Value) -> ToolResult {
+fn tool_memoir_link(store: &Store, args: &Value) -> ToolResult {
     let memoir_name = match get_str(args, "memoir") {
         Some(n) => n,
         None => return ToolResult::error("missing required field: memoir".into()),
@@ -1994,7 +1989,7 @@ fn tool_memoir_link(store: &SqliteStore, args: &Value) -> ToolResult {
     }
 }
 
-fn tool_memoir_inspect(store: &SqliteStore, args: &Value) -> ToolResult {
+fn tool_memoir_inspect(store: &Store, args: &Value) -> ToolResult {
     let memoir_name = match get_str(args, "memoir") {
         Some(n) => n,
         None => return ToolResult::error("missing required field: memoir".into()),
@@ -2051,7 +2046,7 @@ fn tool_memoir_inspect(store: &SqliteStore, args: &Value) -> ToolResult {
 
 // confidence_color and confidence_bar are now methods on Concept in icm-core
 
-fn tool_memoir_export(store: &SqliteStore, args: &Value) -> ToolResult {
+fn tool_memoir_export(store: &Store, args: &Value) -> ToolResult {
     let memoir_name = match get_str(args, "name") {
         Some(n) => n,
         None => return ToolResult::error("missing required field: name".into()),
@@ -2251,7 +2246,7 @@ fn tool_memoir_export(store: &SqliteStore, args: &Value) -> ToolResult {
     }
 }
 
-fn tool_feedback_record(store: &SqliteStore, args: &Value, compact: bool) -> ToolResult {
+fn tool_feedback_record(store: &Store, args: &Value, compact: bool) -> ToolResult {
     let topic = match get_str(args, "topic") {
         Some(t) => t,
         None => return ToolResult::error("missing required field: topic".into()),
@@ -2293,7 +2288,7 @@ fn tool_feedback_record(store: &SqliteStore, args: &Value, compact: bool) -> Too
     }
 }
 
-fn tool_feedback_search(store: &SqliteStore, args: &Value) -> ToolResult {
+fn tool_feedback_search(store: &Store, args: &Value) -> ToolResult {
     let query = match get_str(args, "query") {
         Some(q) => q,
         None => return ToolResult::error("missing required field: query".into()),
@@ -2328,7 +2323,7 @@ fn tool_feedback_search(store: &SqliteStore, args: &Value) -> ToolResult {
     }
 }
 
-fn tool_feedback_stats(store: &SqliteStore) -> ToolResult {
+fn tool_feedback_stats(store: &Store) -> ToolResult {
     match store.feedback_stats() {
         Ok(stats) => {
             let mut output = format!("Feedback total: {}\n", stats.total);
@@ -2354,8 +2349,8 @@ fn tool_feedback_stats(store: &SqliteStore) -> ToolResult {
 mod tests {
     use super::*;
 
-    fn test_store() -> SqliteStore {
-        SqliteStore::in_memory().unwrap()
+    fn test_store() -> Store {
+        Store::in_memory().unwrap()
     }
 
     #[test]
