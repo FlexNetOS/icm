@@ -190,6 +190,18 @@ fn content_tokens(query: &str) -> Vec<String> {
         .collect()
 }
 
+/// How many `tokens` appear (case-insensitively) in `mem`'s topic, summary,
+/// or keywords. Used to rank `search_by_keywords` candidates by relevance
+/// instead of leaving them ordered by weight alone.
+fn matched_token_count(tokens: &[String], mem: &Memory) -> usize {
+    let haystack =
+        format!("{} {} {}", mem.topic, mem.summary, mem.keywords.join(" ")).to_lowercase();
+    tokens
+        .iter()
+        .filter(|t| haystack.contains(t.as_str()))
+        .count()
+}
+
 /// Recall relevant memories and format as context preamble for prompt injection.
 ///
 /// When `project` is `Some(name)`, results are restricted to memories whose
@@ -236,6 +248,12 @@ pub fn recall_context(
         if !tokens.is_empty() {
             let refs: Vec<&str> = tokens.iter().map(String::as_str).collect();
             fts_results = store.search_by_keywords(&refs, pool)?;
+            // search_by_keywords orders by weight alone, which can bury a
+            // memory matching most of the query behind an unrelated
+            // higher-weight one that only matched a single token. Re-rank
+            // by how many content tokens actually matched; ties keep their
+            // relative (weight) order since sort_by_key is stable.
+            fts_results.sort_by_key(|m| std::cmp::Reverse(matched_token_count(&tokens, m)));
         }
     }
     let project_filtered: Vec<Memory> = fts_results
@@ -1810,6 +1828,90 @@ mod tests {
             vec!["why", "workers", "crash", "right", "after", "deploy"],
         );
         assert!(content_tokens("do a").is_empty());
+    }
+
+    #[test]
+    fn test_recall_context_keyword_fallback_ranks_by_relevance_not_weight_alone() {
+        // search_by_keywords orders candidates by weight alone. A memory
+        // that only shares one token with the query but has high weight
+        // must not bury a memory that shares every content token.
+        let store = Store::in_memory().unwrap();
+        store
+            .store(Memory::new(
+                "notes".to_string(),
+                "Onboarding checklist mentions deploy day logistics.".to_string(),
+                Importance::Critical,
+            ))
+            .unwrap();
+        store
+            .store(Memory::new(
+                "notes".to_string(),
+                "The deploy script must run migrations before restarting workers, \
+                 otherwise workers boot against the old schema and crash on startup."
+                    .to_string(),
+                Importance::Medium,
+            ))
+            .unwrap();
+
+        let ctx =
+            recall_context(&store, "why do workers crash right after a deploy", None, 5).unwrap();
+        let deploy_script_pos = ctx
+            .find("deploy script")
+            .expect("must surface both matches");
+        let onboarding_pos = ctx.find("Onboarding").expect("must surface both matches");
+        assert!(
+            deploy_script_pos < onboarding_pos,
+            "the memory matching workers/crash/deploy must rank above the one matching only \
+             deploy, despite lower weight: {ctx}"
+        );
+    }
+
+    #[test]
+    fn test_recall_context_natural_language_question_surfaces_cross_project_on_larger_store() {
+        // Reproduces the shape of #323's second report: a project-scoped
+        // store with many topics (context-<project>, errors-resolved,
+        // preferences), where a natural-language query matches a
+        // cross-project errors-resolved memory that tier 1's project
+        // filter legitimately excludes. Tier 2 (global FTS/keyword
+        // fallback, #185 H5) must still surface it.
+        let store = Store::in_memory().unwrap();
+        for i in 0..20 {
+            store
+                .store(Memory::new(
+                    "context-projecta".to_string(),
+                    format!("Project A note number {i} about routine maintenance"),
+                    Importance::High,
+                ))
+                .unwrap();
+        }
+        store
+            .store(Memory::new(
+                "errors-resolved".to_string(),
+                "Fixed a bug where the worker pool crashed on deploy because migrations ran \
+                 after the workers restarted instead of before."
+                    .to_string(),
+                Importance::Critical,
+            ))
+            .unwrap();
+        store
+            .store(Memory::new(
+                "preferences".to_string(),
+                "User prefers tabs over spaces".to_string(),
+                Importance::Critical,
+            ))
+            .unwrap();
+
+        let ctx = recall_context(
+            &store,
+            "why do workers crash right after a deploy",
+            Some("projectb"),
+            5,
+        )
+        .unwrap();
+        assert!(
+            ctx.contains("worker pool crashed"),
+            "natural-language query must surface the cross-project errors-resolved memory: {ctx}"
+        );
     }
 
     #[test]
