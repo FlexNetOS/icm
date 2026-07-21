@@ -1487,46 +1487,98 @@ impl MemoryStore for SqliteStore {
         if self.readonly {
             return Err(IcmError::ReadOnly("apply_decay".into()));
         }
-        // Access-aware decay: frequently accessed memories decay slower.
-        // decay = base_rate * importance_multiplier / (1 + min(access_count, 5) * 0.1)
+        // Recency-aware (time-aware) decay. Forgetting scales with elapsed
+        // wall-clock time since `last_accessed` (Ebbinghaus): each pass
+        // multiplies weight by `decay_factor ^ k`, where
         //
-        // Audit #185 H7: the access-count term used to be uncapped
-        // (`1 + access_count * 0.1`). A memory with `access_count=100`
-        // got a 11x slowdown on its decay, which made it effectively
-        // immune to pruning even at low importance. Anyone (or any
-        // bench loop, or any benign hook-driven recall pattern) that
-        // touched a memory many times pinned it near the top of the
-        // ranking forever — the same gaming class as the M01 issue
-        // the maintainer flagged earlier.
+        //   k = (age_days / DECAY_TIME_UNIT_DAYS) * importance_mult / access_slowdown
         //
-        // Cap at 5 accesses → max 1.5x slowdown (33%). That preserves
-        // the original intent ("useful memories decay a bit slower")
-        // without giving any single memory infinite decay immunity.
-        // Critical-importance memories still skip decay entirely.
+        // - age_days = max(0, now - last_accessed). A memory accessed *now* has
+        //   k ≈ 0 and thus retention ≈ 1.0 (fresh memories barely decay); the
+        //   staler a memory, the larger k and the more weight it sheds in a
+        //   single pass. Decay is therefore monotonic in staleness — the flat
+        //   per-importance factor it replaces was entirely time-blind, so a
+        //   memory last touched a year ago and one touched a second ago decayed
+        //   identically.
+        // - importance_mult preserves the lifecycle: high decays at half speed,
+        //   low at double, medium at normal; critical never decays (filtered).
+        // - access_slowdown preserves the Audit #185 H7 cap: frequently-accessed
+        //   memories decay slightly slower, capped at 5 accesses (≤1.5x slowdown)
+        //   so no memory becomes decay-immune through access-count gaming.
         //
-        // Importance multipliers:
-        //   critical: never decays (filtered by WHERE clause)
-        //   high:     0.5x decay (half speed)
-        //   medium:   1.0x decay (normal)
-        //   low:      2.0x decay (double speed)
-        let changed = self
-            .conn
-            .execute(
-                "UPDATE memories SET weight = weight * (
-                    1.0 - (1.0 - ?1) *
-                    CASE importance
-                        WHEN 'high' THEN 0.5
-                        WHEN 'low' THEN 2.0
-                        ELSE 1.0
-                    END
-                    / (1.0 + MIN(access_count, 5) * 0.1)
+        // Computed row-by-row in Rust (not one SQL UPDATE) so elapsed time is
+        // derived with chrono from the RFC3339 timestamps, independent of the
+        // SQLite build's date/math-function support.
+        const DECAY_TIME_UNIT_DAYS: f64 = 30.0;
+        let now = Utc::now();
+
+        let rows: Vec<(String, String, i64, String, f64)> = {
+            let mut stmt = self
+                .conn
+                .prepare(
+                    "SELECT id, last_accessed, access_count, importance, weight \
+                     FROM memories WHERE importance != 'critical'",
                 )
-                WHERE importance != 'critical'",
-                params![decay_factor],
-            )
+                .map_err(db_err)?;
+            let mapped = stmt
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, f64>(4)?,
+                    ))
+                })
+                .map_err(db_err)?;
+            let mut v = Vec::new();
+            for r in mapped {
+                v.push(r.map_err(db_err)?);
+            }
+            v
+        };
+
+        self.conn
+            .execute_batch("BEGIN IMMEDIATE;")
             .map_err(db_err)?;
 
-        // Decay touches every non-critical row's weight; can't selectively
+        let result: IcmResult<usize> = (|| {
+            let mut update = self
+                .conn
+                .prepare("UPDATE memories SET weight = ?1 WHERE id = ?2")
+                .map_err(db_err)?;
+            let mut changed = 0usize;
+            for (id, last_accessed, access_count, importance, weight) in &rows {
+                let age_days = ((now - parse_dt(last_accessed)).num_milliseconds() as f64
+                    / 86_400_000.0)
+                    .max(0.0);
+                let importance_mult = match importance.as_str() {
+                    "high" => 0.5,
+                    "low" => 2.0,
+                    _ => 1.0,
+                };
+                let access_slowdown = 1.0 + (*access_count).min(5) as f64 * 0.1;
+                let k = (age_days / DECAY_TIME_UNIT_DAYS) * importance_mult / access_slowdown;
+                let retention = f64::from(decay_factor).powf(k);
+                let new_weight = (*weight * retention) as f32;
+                update.execute(params![new_weight, id]).map_err(db_err)?;
+                changed += 1;
+            }
+            Ok(changed)
+        })();
+
+        let changed = match result {
+            Ok(changed) => {
+                self.conn.execute_batch("COMMIT;").map_err(db_err)?;
+                changed
+            }
+            Err(e) => {
+                let _ = self.conn.execute_batch("ROLLBACK;");
+                return Err(e);
+            }
+        };
+
+        // Decay rewrote every non-critical row's weight; can't selectively
         // invalidate without re-reading rows, so just nuke the cache.
         self.cache_clear();
         Ok(changed)
@@ -4276,12 +4328,23 @@ mod tests {
         // rather than pinning specific weight numbers.
         let store = test_store();
 
+        // Recency-aware decay only sheds weight from aged memories, so stamp
+        // both the same age (20 days). Recency is held equal — the ONLY variable
+        // is access_count — so this still isolates the cap behavior.
+        let stale = chrono::Utc::now() - chrono::Duration::days(20);
+
         let mut real = make_memory("topic", "real high-importance fact");
         real.importance = Importance::Medium;
+        real.created_at = stale;
+        real.updated_at = stale;
+        real.last_accessed = stale;
         let real_id = store.store(real).unwrap();
 
         let mut junk = make_memory("topic", "junk fact accessed by gaming loop");
         junk.importance = Importance::Medium;
+        junk.created_at = stale;
+        junk.updated_at = stale;
+        junk.last_accessed = stale;
         let junk_id = store.store(junk).unwrap();
 
         // Inflate junk's access_count to 100 (the M01 reproduction).
@@ -6195,7 +6258,15 @@ mod tests {
     #[test]
     fn test_apply_decay_with_aggressive_factor() {
         let store = test_store();
-        store.store(make_memory("t", "decayable")).unwrap();
+        // Recency-aware decay only sheds meaningful weight from a memory that
+        // has actually aged (a fresh memory now barely decays). Stamp it 90
+        // days stale so the aggressive factor produces an observable drop.
+        let mut m = make_memory("t", "decayable");
+        let stale = chrono::Utc::now() - chrono::Duration::days(90);
+        m.created_at = stale;
+        m.updated_at = stale;
+        m.last_accessed = stale;
+        store.store(m).unwrap();
         let affected = store.apply_decay(0.5).unwrap();
         assert!(affected > 0);
         let mems = store.get_by_topic("t").unwrap();
@@ -6205,7 +6276,14 @@ mod tests {
     #[test]
     fn test_prune_low_weight() {
         let store = test_store();
-        store.store(make_memory("t", "will be pruned")).unwrap();
+        // Age the memory so recency-aware decay drives its weight below the
+        // prune threshold (a fresh memory now barely decays).
+        let mut m = make_memory("t", "will be pruned");
+        let stale = chrono::Utc::now() - chrono::Duration::days(120);
+        m.created_at = stale;
+        m.updated_at = stale;
+        m.last_accessed = stale;
+        store.store(m).unwrap();
         // Apply aggressive decay
         store.apply_decay(0.01).unwrap();
         let pruned = store.prune(0.5).unwrap();
@@ -6540,7 +6618,14 @@ mod tests {
     #[test]
     fn test_apply_decay_clears_cache() {
         let store = test_store();
-        let m1 = make_memory("t", "a");
+        // Stamp m1 stale so recency-aware decay produces an observable weight
+        // drop — this test asserts the drop is visible post-decay (cache wiped),
+        // which requires the weight to actually change.
+        let mut m1 = make_memory("t", "a");
+        let stale = chrono::Utc::now() - chrono::Duration::days(90);
+        m1.created_at = stale;
+        m1.updated_at = stale;
+        m1.last_accessed = stale;
         let m2 = make_memory("t", "b");
         let id1 = store.store(m1).unwrap();
         let id2 = store.store(m2).unwrap();
