@@ -2,6 +2,12 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
+/// Number of days over which a memory's recall recency halves: the recency
+/// multiplier is `1.0` at day 0, ~`0.5` at 30 days, ~`0.25` at 90 days. Shared
+/// by [`Memory::recency_factor`] and the wake-up scorer so "how stale is this
+/// memory" means one thing across ICM.
+pub const RECENCY_HALF_LIFE_DAYS: f32 = 30.0;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Memory {
     pub id: String,
@@ -54,6 +60,30 @@ impl Memory {
             embedding: None,
             scope: Scope::User,
         }
+    }
+
+    /// Reference timestamp for recency scoring: the more recent of creation and
+    /// last access, so a frequently-recalled memory stays "fresh".
+    pub fn recency_reference(&self) -> DateTime<Utc> {
+        self.created_at.max(self.last_accessed)
+    }
+
+    /// Query-time recency multiplier in `(0, 1]`: `1.0` for a just-touched
+    /// memory, ~`0.5` at [`RECENCY_HALF_LIFE_DAYS`], ~`0.25` at triple that.
+    /// Shared by recall ranking and the wake-up pack. Clamped at 0 elapsed days
+    /// so a future timestamp (clock skew) scores as fresh rather than boosting
+    /// the multiplier above 1.0.
+    pub fn recency_factor(&self, now: DateTime<Utc>) -> f32 {
+        let days = (now - self.recency_reference()).num_days().max(0) as f32;
+        1.0 / (1.0 + days / RECENCY_HALF_LIFE_DAYS)
+    }
+
+    /// Recall-ranking weight: stored [`weight`](Self::weight) scaled by
+    /// [`recency_factor`](Self::recency_factor). A fresh memory out-ranks an
+    /// equally- or higher-weighted staler one at query time, independent of
+    /// when `apply_decay` last ran.
+    pub fn effective_weight(&self, now: DateTime<Utc>) -> f32 {
+        self.weight * self.recency_factor(now)
     }
 }
 

@@ -801,6 +801,29 @@ const SELECT_COLS: &str = "id, created_at, updated_at, last_accessed, access_cou
                            topic, summary, raw_excerpt, keywords, \
                            importance, source_type, source_data, related_ids, embedding";
 
+/// Candidate pool size for recency-aware re-ranking of weight-ordered recall.
+/// The DB is queried by stored `weight DESC` up to this many rows, which are
+/// then re-ranked by recency-adjusted [`Memory::effective_weight`] and
+/// truncated to the caller's limit — so a fresh, lower-stored-weight memory can
+/// out-rank a staler high-weight one. Bounded to keep recall cheap; only the
+/// very-low-weight tail beyond the pool is not resurfaced (recall limits are
+/// small in practice, so the pool comfortably covers realistic result sets).
+const RECALL_RERANK_POOL: usize = 256;
+
+/// Re-rank recall candidates by recency-adjusted effective weight (fresh
+/// memories out-rank equally- or higher-weighted staler ones at query time,
+/// independent of when `apply_decay` last ran) and truncate to `limit`. The
+/// sort is stable, so equal effective weights keep the DB's `weight DESC` order.
+fn rerank_by_effective_weight(mems: Vec<Memory>, limit: usize) -> Vec<Memory> {
+    let now = Utc::now();
+    let mut scored: Vec<(f32, Memory)> = mems
+        .into_iter()
+        .map(|m| (m.effective_weight(now), m))
+        .collect();
+    scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    scored.into_iter().take(limit).map(|(_, m)| m).collect()
+}
+
 /// Sanitize a query string for FTS5 MATCH.
 ///
 /// FTS5 treats characters like `-`, `*`, `"`, `:`, `^`, `+`, `~` as operators.
@@ -1240,6 +1263,9 @@ impl MemoryStore for SqliteStore {
         // Cap keywords to avoid massive SQL generation
         let keywords = &keywords[..keywords.len().min(50)];
         let limit = limit.min(100);
+        // Over-fetch by stored weight, then re-rank by recency below so a fresh
+        // lower-weight memory can outrank a staler high-weight one.
+        let pool = limit.max(RECALL_RERANK_POOL);
 
         let where_parts: Vec<String> = (0..keywords.len())
             .map(|i| {
@@ -1260,7 +1286,7 @@ impl MemoryStore for SqliteStore {
             .iter()
             .map(|k| Box::new(format!("%{k}%")) as Box<dyn rusqlite::types::ToSql>)
             .collect();
-        param_values.push(Box::new(limit as i64));
+        param_values.push(Box::new(pool as i64));
 
         let params_ref: Vec<&dyn rusqlite::types::ToSql> =
             param_values.iter().map(|p| p.as_ref()).collect();
@@ -1269,11 +1295,13 @@ impl MemoryStore for SqliteStore {
             .query_map(params_ref.as_slice(), row_to_memory)
             .map_err(db_err)?;
 
-        collect_rows(rows)
+        Ok(rerank_by_effective_weight(collect_rows(rows)?, limit))
     }
 
     fn search_fts(&self, query: &str, limit: usize) -> IcmResult<Vec<Memory>> {
         let limit = limit.min(100);
+        // Over-fetch by stored weight, then re-rank by recency below.
+        let pool = limit.max(RECALL_RERANK_POOL);
         let sanitized = sanitize_fts_query(query);
         if sanitized.is_empty() {
             return Ok(Vec::new());
@@ -1291,10 +1319,10 @@ impl MemoryStore for SqliteStore {
         let mut stmt = self.conn.prepare(&sql).map_err(db_err)?;
 
         let rows = stmt
-            .query_map(params![sanitized, limit as i64], row_to_memory)
+            .query_map(params![sanitized, pool as i64], row_to_memory)
             .map_err(db_err)?;
 
-        collect_rows(rows)
+        Ok(rerank_by_effective_weight(collect_rows(rows)?, limit))
     }
 
     fn search_by_embedding(
@@ -1410,13 +1438,24 @@ impl MemoryStore for SqliteStore {
             all_memories.entry(memory.id.clone()).or_insert(memory);
         }
 
-        // 3. Combine scores: 30% FTS + 70% vector
+        // 3. Combine scores: 30% FTS + 70% vector, then apply a recency blend so
+        //    that among similarly-relevant hits the fresher one ranks higher,
+        //    without burying a highly-relevant but older memory. `recency` is in
+        //    (0, 1]; the multiplier stays within [RECENCY_FLOOR, 1.0] so an old
+        //    relevant memory keeps at least RECENCY_FLOOR of its semantic score.
+        const RECENCY_FLOOR: f32 = 0.5;
+        let now = Utc::now();
         let keys: Vec<String> = all_memories.keys().cloned().collect();
         let mut scored: Vec<(String, f32)> = Vec::with_capacity(keys.len());
         for id in keys {
             let fts_score = fts_scores.get(&id).copied().unwrap_or(0.0);
             let vec_score = vec_scores.get(&id).copied().unwrap_or(0.0);
             let combined = 0.3 * fts_score + 0.7 * vec_score;
+            let recency = all_memories
+                .get(&id)
+                .map(|m| m.recency_factor(now))
+                .unwrap_or(1.0);
+            let combined = combined * (RECENCY_FLOOR + (1.0 - RECENCY_FLOOR) * recency);
             scored.push((id, combined));
         }
 
@@ -1619,7 +1658,9 @@ impl MemoryStore for SqliteStore {
             .query_map(params![topic], row_to_memory)
             .map_err(db_err)?;
 
-        collect_rows(rows)
+        // Topic recall is ranked; re-rank the (weight-ordered) fetch by
+        // recency-adjusted effective weight so fresher memories surface first.
+        Ok(rerank_by_effective_weight(collect_rows(rows)?, 500))
     }
 
     fn list_all(&self) -> IcmResult<Vec<Memory>> {

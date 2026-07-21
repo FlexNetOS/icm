@@ -202,12 +202,10 @@ fn compute_score(m: &Memory, now: DateTime<Utc>) -> f32 {
         Importance::Medium => 2.0,
         Importance::Low => 0.5,
     };
-    // Recency is access-aware: use the more recent of created_at and
-    // last_accessed, so memories that are frequently recalled stay fresh.
-    let reference = m.created_at.max(m.last_accessed);
-    let days = (now - reference).num_days().max(0) as f32;
-    // Recency factor: 1.0 at day 0, ~0.5 at day 30, ~0.25 at day 90.
-    let recency = 1.0 / (1.0 + days / 30.0);
+    // Recency is access-aware (uses the more recent of created_at and
+    // last_accessed) and shared with the recall ranking so staleness means the
+    // same thing across ICM.
+    let recency = m.recency_factor(now);
     let stored_weight = m.weight.max(0.01);
     importance_weight * recency * stored_weight
 }
