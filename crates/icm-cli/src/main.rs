@@ -1410,8 +1410,14 @@ fn resolve_embedding_dims(
 }
 
 #[cfg(feature = "embeddings")]
-fn init_embedder(model: &str) -> Option<icm_core::FastEmbedder> {
-    Some(icm_core::FastEmbedder::with_model(model))
+fn init_embedder(model: &str, fast_model: Option<&str>) -> Option<icm_core::ConfiguredEmbedder> {
+    Some(match fast_model {
+        // Two-model cascade: `fast_model` runs first, `model` second.
+        Some(fast) => {
+            icm_core::ConfiguredEmbedder::Cascade(icm_core::CascadeEmbedder::new(fast, model))
+        }
+        None => icm_core::ConfiguredEmbedder::Single(icm_core::FastEmbedder::with_model(model)),
+    })
 }
 
 /// Placeholder embedder for builds without the `embeddings` feature.
@@ -1442,7 +1448,7 @@ impl icm_core::Embedder for DisabledEmbedder {
 }
 
 #[cfg(not(feature = "embeddings"))]
-fn init_embedder(_model: &str) -> Option<DisabledEmbedder> {
+fn init_embedder(_model: &str, _fast_model: Option<&str>) -> Option<DisabledEmbedder> {
     None
 }
 
@@ -1467,7 +1473,7 @@ fn main() -> Result<()> {
         cfg.embeddings.enabled && !cli.no_embeddings && std::env::var("ICM_NO_EMBEDDINGS").is_err();
     #[allow(unused_variables)]
     let embedder = if embeddings_enabled {
-        init_embedder(&cfg.embeddings.model)
+        init_embedder(&cfg.embeddings.model, cfg.embeddings.fast_model.as_deref())
     } else {
         None
     };
@@ -6145,6 +6151,10 @@ fn cmd_config() -> Result<()> {
     println!();
     println!("[embeddings]");
     println!("  model = {}", cfg.embeddings.model);
+    match &cfg.embeddings.fast_model {
+        Some(fast) => println!("  fast_model = {fast} (two-model cascade: fast_model then model)"),
+        None => println!("  fast_model = (unset — single-model)"),
+    }
     println!();
     println!("[extraction]");
     println!("  enabled = {}", cfg.extraction.enabled);

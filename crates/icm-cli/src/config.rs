@@ -56,6 +56,12 @@ pub struct EmbeddingsConfig {
     pub enabled: bool,
     /// Model identifier (fastembed model_code, e.g. "intfloat/multilingual-e5-small").
     pub model: String,
+    /// Optional second model forming a two-model cascade: texts are embedded
+    /// by `fast_model` followed by `model`, each part L2-normalized and
+    /// concatenated (dimensions add). Changing this changes vector
+    /// dimensionality — the store recreates its vector table; run `icm embed`
+    /// afterwards to re-embed the corpus.
+    pub fast_model: Option<String>,
 }
 
 impl Default for EmbeddingsConfig {
@@ -63,6 +69,7 @@ impl Default for EmbeddingsConfig {
         Self {
             enabled: true,
             model: "intfloat/multilingual-e5-base".into(),
+            fast_model: None,
         }
     }
 }

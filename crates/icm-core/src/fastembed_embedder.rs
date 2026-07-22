@@ -202,6 +202,119 @@ impl Embedder for FastEmbedder {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Two-model cascade
+// ---------------------------------------------------------------------------
+
+/// L2-normalize in place; zero vectors are left untouched.
+fn l2_normalize(v: &mut [f32]) {
+    let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if norm > 0.0 {
+        for x in v.iter_mut() {
+            *x /= norm;
+        }
+    }
+}
+
+/// Two-model ensemble embedder (`[embeddings] fast_model` + `model`).
+///
+/// Every text is embedded by `fast` followed by `primary`; each part is
+/// L2-normalized and the parts concatenated, so `dimensions()` is the sum of
+/// both models'. Because each part is unit-length, L2/cosine ranking over the
+/// concatenated vector is monotonic in the *average* of the two models'
+/// cosine similarities — a proper ensemble of both signals (e.g. an English
+/// semantic model plus a code-optimized model), not a fallback chain.
+///
+/// Changing to or from a cascade changes the vector dimensionality, which
+/// triggers the store's vector-table recreate; run `icm embed` afterwards to
+/// re-embed the corpus.
+pub struct CascadeEmbedder {
+    fast: FastEmbedder,
+    primary: FastEmbedder,
+}
+
+impl CascadeEmbedder {
+    /// `fast_model` runs first, `primary_model` second (vector layout matches
+    /// that order).
+    pub fn new(fast_model: &str, primary_model: &str) -> Self {
+        Self {
+            fast: FastEmbedder::with_model(fast_model),
+            primary: FastEmbedder::with_model(primary_model),
+        }
+    }
+
+    fn concat(mut a: Vec<f32>, mut b: Vec<f32>) -> Vec<f32> {
+        l2_normalize(&mut a);
+        l2_normalize(&mut b);
+        a.append(&mut b);
+        a
+    }
+}
+
+impl Embedder for CascadeEmbedder {
+    fn embed(&self, text: &str) -> IcmResult<Vec<f32>> {
+        Ok(Self::concat(self.fast.embed(text)?, self.primary.embed(text)?))
+    }
+
+    fn embed_query(&self, text: &str) -> IcmResult<Vec<f32>> {
+        Ok(Self::concat(
+            self.fast.embed_query(text)?,
+            self.primary.embed_query(text)?,
+        ))
+    }
+
+    fn embed_batch(&self, texts: &[&str]) -> IcmResult<Vec<Vec<f32>>> {
+        let fast = self.fast.embed_batch(texts)?;
+        let primary = self.primary.embed_batch(texts)?;
+        Ok(fast
+            .into_iter()
+            .zip(primary)
+            .map(|(a, b)| Self::concat(a, b))
+            .collect())
+    }
+
+    fn dimensions(&self) -> usize {
+        self.fast.dimensions() + self.primary.dimensions()
+    }
+}
+
+/// The embedder shape selected by config: a single model, or a two-model
+/// cascade when `[embeddings] fast_model` is set.
+pub enum ConfiguredEmbedder {
+    Single(FastEmbedder),
+    Cascade(CascadeEmbedder),
+}
+
+impl Embedder for ConfiguredEmbedder {
+    fn embed(&self, text: &str) -> IcmResult<Vec<f32>> {
+        match self {
+            Self::Single(e) => e.embed(text),
+            Self::Cascade(e) => e.embed(text),
+        }
+    }
+
+    fn embed_query(&self, text: &str) -> IcmResult<Vec<f32>> {
+        match self {
+            Self::Single(e) => e.embed_query(text),
+            Self::Cascade(e) => e.embed_query(text),
+        }
+    }
+
+    fn embed_batch(&self, texts: &[&str]) -> IcmResult<Vec<Vec<f32>>> {
+        match self {
+            Self::Single(e) => e.embed_batch(texts),
+            Self::Cascade(e) => e.embed_batch(texts),
+        }
+    }
+
+    fn dimensions(&self) -> usize {
+        match self {
+            Self::Single(e) => e.dimensions(),
+            Self::Cascade(e) => e.dimensions(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
