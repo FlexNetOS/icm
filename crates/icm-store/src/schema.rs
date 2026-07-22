@@ -68,7 +68,10 @@ pub fn init_db_with_dims(conn: &Connection, embedding_dims: usize) -> Result<(),
             -- SHA-256 over normalize(topic + '\\0' + summary). Used by
             -- INSERT OR IGNORE dedup. NULL on rows that predate the
             -- migration (existing duplicates intentionally untouched).
-            summary_hash TEXT
+            summary_hash TEXT,
+            -- Sync scope (user | project | org). Rows predating the
+            -- migration default to 'user'.
+            scope TEXT NOT NULL DEFAULT 'user'
         );
 
         CREATE INDEX IF NOT EXISTS idx_memories_topic ON memories(topic);
@@ -130,6 +133,17 @@ pub fn init_db_with_dims(conn: &Connection, embedding_dims: usize) -> Result<(),
     // the dedup feature. SQLite has no `ADD COLUMN IF NOT EXISTS`, so we
     // try the ALTER and ignore the "duplicate column name" error.
     if let Err(e) = conn.execute("ALTER TABLE memories ADD COLUMN summary_hash TEXT", []) {
+        let msg = e.to_string();
+        if !msg.contains("duplicate column name") {
+            return Err(db_err(e));
+        }
+    }
+    // Migration: add `scope` column to existing DBs that predate cloud sync
+    // scoping. Same idempotent ALTER idiom as summary_hash above.
+    if let Err(e) = conn.execute(
+        "ALTER TABLE memories ADD COLUMN scope TEXT NOT NULL DEFAULT 'user'",
+        [],
+    ) {
         let msg = e.to_string();
         if !msg.contains("duplicate column name") {
             return Err(db_err(e));

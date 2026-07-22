@@ -750,7 +750,7 @@ fn row_to_memory(row: &rusqlite::Row) -> rusqlite::Result<Memory> {
     // Column order: id(0), created_at(1), updated_at(2), last_accessed(3),
     //   access_count(4), weight(5), topic(6), summary(7), raw_excerpt(8),
     //   keywords(9), importance(10), source_type(11), source_data(12),
-    //   related_ids(13), embedding(14)
+    //   related_ids(13), embedding(14), scope(15)
     let keywords_json: String = row.get::<_, Option<String>>(9)?.unwrap_or_default();
     let keywords: Vec<String> = serde_json::from_str(&keywords_json).unwrap_or_default();
 
@@ -793,13 +793,16 @@ fn row_to_memory(row: &rusqlite::Row) -> rusqlite::Result<Memory> {
         source,
         related_ids,
         embedding,
-        scope: icm_core::Scope::User, // default for existing local memories
+        scope: row
+            .get::<_, Option<String>>(15)?
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(icm_core::Scope::User),
     })
 }
 
 const SELECT_COLS: &str = "id, created_at, updated_at, last_accessed, access_count, weight, \
                            topic, summary, raw_excerpt, keywords, \
-                           importance, source_type, source_data, related_ids, embedding";
+                           importance, source_type, source_data, related_ids, embedding, scope";
 
 /// Candidate pool size for recency-aware re-ranking of weight-ordered recall.
 /// The DB is queried by stored `weight DESC` up to this many rows, which are
@@ -1011,8 +1014,8 @@ impl SqliteStore {
             .execute(
                 "INSERT OR IGNORE INTO memories (id, created_at, updated_at, last_accessed, access_count, weight,
                  topic, summary, raw_excerpt, keywords,
-                 importance, source_type, source_data, related_ids, embedding, summary_hash)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+                 importance, source_type, source_data, related_ids, embedding, summary_hash, scope)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
                 params![
                     memory.id,
                     memory.created_at.to_rfc3339(),
@@ -1030,6 +1033,7 @@ impl SqliteStore {
                     related_json,
                     emb_blob,
                     hash,
+                    memory.scope.to_string(),
                 ],
             )
             .map_err(db_err)?;
@@ -1194,7 +1198,7 @@ impl MemoryStore for SqliteStore {
                  updated_at = ?2, last_accessed = ?3, access_count = ?4, weight = ?5,
                  topic = ?6, summary = ?7, raw_excerpt = ?8, keywords = ?9,
                  importance = ?10, source_type = ?11, source_data = ?12, related_ids = ?13,
-                 embedding = ?14, summary_hash = ?15
+                 embedding = ?14, summary_hash = ?15, scope = ?16
                  WHERE id = ?1",
                 params![
                     memory.id,
@@ -1212,6 +1216,7 @@ impl MemoryStore for SqliteStore {
                     related_json,
                     emb_blob,
                     hash,
+                    memory.scope.to_string(),
                 ],
             )
             .map_err(db_err)?;

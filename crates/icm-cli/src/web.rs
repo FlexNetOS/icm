@@ -5,17 +5,19 @@ use std::sync::{Arc, Mutex};
 use anyhow::Result;
 use axum::{
     body::Body,
-    extract::{Path, Query, State},
+    extract::{Form, Path, Query, State},
     http::{header, Request, StatusCode},
     middleware::{self, Next},
-    response::{Html, IntoResponse, Json, Response},
+    response::{Html, IntoResponse, Json, Redirect, Response},
     routing::{delete, get, post},
     Router,
 };
 use rust_embed::Embed;
 use serde::{Deserialize, Serialize};
 
-use icm_core::{FeedbackStore, MemoirStore, MemoryStore};
+use icm_core::{
+    FeedbackStore, Importance, MemoirStore, Memory, MemorySource, MemoryStore, Scope,
+};
 use icm_store::Store;
 
 use crate::config::WebConfig;
@@ -127,15 +129,27 @@ async fn auth_middleware(
     req: Request<Body>,
     next: Next,
 ) -> Response {
-    // /health is public
-    if req.uri().path() == "/health" {
+    // Public: health probe and the self-hosted cloud auth surface (the login
+    // endpoints must be reachable before any credential exists).
+    let path = req.uri().path();
+    if path == "/health" || path == "/api/auth/login" || path.starts_with("/api/auth/oauth/") {
         return next.run(req).await;
     }
 
-    let authorized = req
+    let auth_value = req
         .headers()
         .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.to_str().ok());
+
+    // Bearer token issued by the cloud login endpoints — used by `icm cloud
+    // push/pull` against this server.
+    if let Some(token) = auth_value.and_then(|v| v.strip_prefix("Bearer ")) {
+        if token == cloud_token(&state.password) {
+            return next.run(req).await;
+        }
+    }
+
+    let authorized = auth_value
         .and_then(|v| v.strip_prefix("Basic "))
         .and_then(|b64| {
             let decoded = base64_decode(b64)?;
@@ -206,6 +220,16 @@ fn api_router() -> Router<AppState> {
         // Memoirs
         .route("/api/memoirs", get(api_memoirs))
         .route("/api/memoirs/{id}", get(api_memoir_detail))
+        // Self-hosted cloud API — same contract `icm cloud` speaks to RTK
+        // Cloud (cloud.rs), so `icm cloud login/push/pull --endpoint <this>`
+        // works against this server.
+        .route("/api/auth/login", post(api_cloud_login))
+        .route("/api/auth/oauth/google", get(api_cloud_oauth_page))
+        .route("/api/auth/oauth/complete", post(api_cloud_oauth_complete))
+        .route(
+            "/api/icm/memories",
+            get(api_cloud_memories_pull).post(api_cloud_memory_push),
+        )
         // Public
         .route("/health", get(api_health_check))
 }
@@ -636,4 +660,250 @@ async fn api_memoir_detail(
         "links": links,
     }))
     .into_response()
+}
+
+// ---------------------------------------------------------------------------
+// Self-hosted cloud API (mirrors the RTK Cloud contract consumed by cloud.rs)
+// ---------------------------------------------------------------------------
+
+/// Single-tenant org id for a self-hosted server.
+const CLOUD_ORG_ID: &str = "local";
+
+/// Deterministic bearer token for the cloud API: sha256(admin password).
+/// Same trust boundary as the Basic auth the dashboard already uses (which
+/// carries the password base64 on every request), but keeps the raw password
+/// out of the CLI's persisted cloud credentials file, and survives server
+/// restarts without session state.
+fn cloud_token(password: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(password.as_bytes());
+    digest.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+#[derive(Deserialize)]
+struct CloudLoginReq {
+    email: String,
+    password: String,
+}
+
+/// POST /api/auth/login — email/password login (`icm cloud login --password`).
+async fn api_cloud_login(
+    State(state): State<AppState>,
+    Json(req): Json<CloudLoginReq>,
+) -> Response {
+    if req.password != state.password {
+        return (StatusCode::UNAUTHORIZED, "invalid credentials").into_response();
+    }
+    Json(serde_json::json!({
+        "token": cloud_token(&state.password),
+        "orgId": CLOUD_ORG_ID,
+        "user": { "id": "local-admin", "email": req.email, "name": "Local Admin" },
+    }))
+    .into_response()
+}
+
+/// GET /api/auth/oauth/google?cli_port=N — the URL the CLI's browser login
+/// opens. Self-hosted servers have no Google upstream; serve a password form
+/// that completes the same callback contract.
+async fn api_cloud_oauth_page(
+    Query(q): Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    let cli_port = q.get("cli_port").cloned().unwrap_or_default();
+    if cli_port.parse::<u16>().is_err() {
+        return (StatusCode::BAD_REQUEST, "missing or invalid cli_port").into_response();
+    }
+    Html(format!(
+        r#"<!doctype html><html><head><title>ICM self-hosted login</title></head>
+<body style="font-family:system-ui;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;background:#0f172a;color:white">
+<form method="post" action="/api/auth/oauth/complete" style="text-align:center">
+<h1>ICM self-hosted login</h1>
+<p>Enter the dashboard admin password to authenticate the CLI.</p>
+<input type="hidden" name="cli_port" value="{cli_port}">
+<input type="password" name="password" autofocus style="padding:8px;border-radius:6px;border:none">
+<button type="submit" style="padding:8px 16px;border-radius:6px;border:none;margin-left:8px">Login</button>
+</form></body></html>"#
+    ))
+    .into_response()
+}
+
+#[derive(Deserialize)]
+struct OauthCompleteReq {
+    cli_port: u16,
+    password: String,
+}
+
+/// POST /api/auth/oauth/complete — validates the password and redirects to the
+/// CLI's localhost callback listener, completing `icm cloud login`.
+async fn api_cloud_oauth_complete(
+    State(state): State<AppState>,
+    Form(req): Form<OauthCompleteReq>,
+) -> Response {
+    if req.password != state.password {
+        return (StatusCode::UNAUTHORIZED, "invalid credentials").into_response();
+    }
+    let url = format!(
+        "http://127.0.0.1:{}/callback?token={}&org_id={}&email=admin@localhost",
+        req.cli_port,
+        cloud_token(&state.password),
+        CLOUD_ORG_ID,
+    );
+    Redirect::to(&url).into_response()
+}
+
+/// Push payload — the camelCase shape `cloud::sync_memory` sends.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CloudPushMemory {
+    id: String,
+    topic: String,
+    summary: String,
+    #[serde(default)]
+    raw_excerpt: Option<String>,
+    #[serde(default)]
+    keywords: Vec<String>,
+    #[serde(default)]
+    importance: Option<String>,
+    #[serde(default)]
+    scope: Option<String>,
+    #[serde(default)]
+    source: Option<serde_json::Value>,
+    #[serde(default)]
+    created_at: Option<String>,
+    #[serde(default)]
+    updated_at: Option<String>,
+}
+
+/// POST /api/icm/memories — upsert a pushed memory (`icm cloud push`).
+async fn api_cloud_memory_push(
+    State(state): State<AppState>,
+    Json(m): Json<CloudPushMemory>,
+) -> Response {
+    let now = chrono::Utc::now();
+    let importance = m
+        .importance
+        .as_deref()
+        .unwrap_or("medium")
+        .parse::<Importance>()
+        .unwrap_or(Importance::Medium);
+    let scope = m
+        .scope
+        .as_deref()
+        .unwrap_or("project")
+        .parse::<Scope>()
+        .unwrap_or(Scope::Project);
+    let source = m
+        .source
+        .clone()
+        .and_then(|v| serde_json::from_value::<MemorySource>(v).ok())
+        .unwrap_or(MemorySource::Manual);
+    let parse_ts = |s: &Option<String>| {
+        s.as_deref()
+            .and_then(|v| v.parse::<chrono::DateTime<chrono::Utc>>().ok())
+            .unwrap_or(now)
+    };
+    let created_at = parse_ts(&m.created_at);
+    let updated_at = parse_ts(&m.updated_at);
+
+    let store = state.store.lock().unwrap();
+    match store.get(&m.id) {
+        Ok(Some(mut existing)) => {
+            existing.topic = m.topic;
+            existing.summary = m.summary;
+            existing.raw_excerpt = m.raw_excerpt;
+            existing.keywords = m.keywords;
+            existing.importance = importance;
+            existing.scope = scope;
+            existing.source = source;
+            existing.updated_at = updated_at;
+            match store.update(&existing) {
+                Ok(()) => (StatusCode::OK, "updated").into_response(),
+                Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+            }
+        }
+        Ok(None) => {
+            let mem = Memory {
+                id: m.id,
+                topic: m.topic,
+                summary: m.summary,
+                raw_excerpt: m.raw_excerpt,
+                keywords: m.keywords,
+                importance,
+                scope,
+                source,
+                weight: 1.0,
+                access_count: 0,
+                related_ids: Vec::new(),
+                embedding: None,
+                created_at,
+                updated_at,
+                last_accessed: updated_at,
+            };
+            match store.store(mem) {
+                Ok(_) => (StatusCode::CREATED, "created").into_response(),
+                Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+            }
+        }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+/// Pull item — the snake_case shape `cloud::pull_memories` expects, wrapped in
+/// `{"memories": [...]}`.
+#[derive(Serialize)]
+struct CloudPullMemory {
+    id: String,
+    topic: String,
+    summary: String,
+    raw_excerpt: Option<String>,
+    keywords: Vec<String>,
+    importance: String,
+    scope: String,
+    weight: f32,
+    access_count: u32,
+    related_ids: Vec<String>,
+    source: serde_json::Value,
+    created_at: String,
+    updated_at: String,
+    last_accessed: String,
+}
+
+/// GET /api/icm/memories?scope=&since= — serve memories (`icm cloud pull`).
+async fn api_cloud_memories_pull(
+    State(state): State<AppState>,
+    Query(q): Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    let scope_filter = q.get("scope").cloned().unwrap_or_else(|| "project".to_string());
+    let since = q
+        .get("since")
+        .and_then(|s| s.parse::<chrono::DateTime<chrono::Utc>>().ok());
+
+    let store = state.store.lock().unwrap();
+    let all = match store.list_all() {
+        Ok(v) => v,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
+
+    let memories: Vec<CloudPullMemory> = all
+        .into_iter()
+        .filter(|m| m.scope.to_string() == scope_filter)
+        .filter(|m| since.is_none_or(|ts| m.updated_at > ts))
+        .map(|m| CloudPullMemory {
+            id: m.id,
+            topic: m.topic,
+            summary: m.summary,
+            raw_excerpt: m.raw_excerpt,
+            keywords: m.keywords,
+            importance: m.importance.to_string(),
+            scope: m.scope.to_string(),
+            weight: m.weight,
+            access_count: m.access_count,
+            related_ids: m.related_ids,
+            source: serde_json::to_value(&m.source).unwrap_or(serde_json::Value::Null),
+            created_at: m.created_at.to_rfc3339(),
+            updated_at: m.updated_at.to_rfc3339(),
+            last_accessed: m.last_accessed.to_rfc3339(),
+        })
+        .collect();
+
+    Json(serde_json::json!({ "memories": memories })).into_response()
 }
