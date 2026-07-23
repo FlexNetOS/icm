@@ -1986,7 +1986,15 @@ fn main() -> Result<()> {
             let emb_ref: Option<&dyn icm_core::Embedder> = None;
             // --compact flag overrides, otherwise use config (default: true)
             let use_compact = compact || cfg.mcp.compact;
-            icm_mcp::run_server(&store, emb_ref, use_compact)
+            // Honor the auto-consolidation config on the MCP store path
+            // (issue #318): previously it was hardcoded always-on at 10,
+            // ignoring an explicit `auto_consolidate_enabled = false` and
+            // destructively rolling up topics. Default config disables it.
+            let auto_consolidate = icm_mcp::AutoConsolidate {
+                enabled: cfg.memory.auto_consolidate_enabled,
+                threshold: cfg.memory.auto_consolidate_threshold,
+            };
+            icm_mcp::run_server(&store, emb_ref, use_compact, auto_consolidate)
         }
         Commands::HookLog {
             limit,
