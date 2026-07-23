@@ -207,7 +207,12 @@ impl SqliteStore {
 
         // 2. Per-FTS-table consistency.
         for table in FTS_TABLES {
-            let sql = format!("INSERT INTO {table}({table}) VALUES('integrity-check');");
+            // `rank = 1` makes FTS5 verify the index against the *content*
+            // table, not just its own internal structure. Without it, an
+            // index that is stale or out of step with the base table (e.g.
+            // an interrupted write) is reported as healthy. Requires
+            // SQLite ≥ 3.37 (bundled rusqlite is well past that).
+            let sql = format!("INSERT INTO {table}({table}, rank) VALUES('integrity-check', 1);");
             match self.conn.execute_batch(&sql) {
                 Ok(()) => {}
                 Err(e) if is_missing_table(&e) => {} // legacy DB without this table
@@ -4012,6 +4017,14 @@ mod tests {
             .execute_batch("INSERT INTO memories_fts(memories_fts) VALUES('delete-all');")
             .unwrap();
         assert_eq!(fts_hits(&store), 0, "index wiped → no FTS hit");
+
+        // integrity_check (rank=1 content check) must flag the desync so that
+        // `icm repair` actually triggers on it rather than reporting healthy.
+        assert_ne!(
+            store.integrity_check().unwrap(),
+            vec!["ok".to_string()],
+            "index/content desync must be detected"
+        );
 
         store.rebuild_search_indexes().unwrap();
         assert_eq!(fts_hits(&store), 1, "rebuild must regenerate the FTS index");
