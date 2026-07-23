@@ -275,6 +275,11 @@ impl Default for ExtractionConfig {
             // fastembed load). `extract-pending` falls back to a batched
             // fastembed drain when no CLI is found. Shipping `none` here
             // left every default install on the heavy inline path (#239).
+            // The self-sustaining spawn loop this path used to enable (#322)
+            // is now blocked three ways: the summarizer's `claude -p` runs
+            // isolated (`--setting-sources "" --strict-mcp-config`), carries
+            // `ICM_WORKER=1` so any hook it fires no-ops, and the worker
+            // holds a `flock` singleton.
             summarizer: SummarizerConfig {
                 provider: "auto".into(),
                 ..SummarizerConfig::default()

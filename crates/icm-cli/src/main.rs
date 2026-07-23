@@ -1497,8 +1497,9 @@ fn main() -> Result<()> {
         }
     }
     let cli_db: Option<PathBuf> = cli.db.into_iter().next();
-    // `db_path` is consumed only by some feature-gated commands (e.g. the
-    // embeddings-only `embed`), so it can be unused in lean builds.
+    // `db_path` feeds the extract-pending worker lock (#322) and some
+    // feature-gated commands (e.g. the embeddings-only `embed`); it can be
+    // unused in the leanest builds.
     #[allow(unused_variables)]
     let db_path = cli_db.clone().unwrap_or_else(default_db_path);
 
@@ -1732,6 +1733,7 @@ fn main() -> Result<()> {
                 provider.as_deref(),
                 model.as_deref(),
                 dry_run,
+                &db_path,
             )
         }
         Commands::Decay { factor } => cmd_decay(&store, factor),
@@ -3357,6 +3359,17 @@ fn cmd_hook_end(
     memory_cfg: &crate::config::MemoryConfig,
     extraction_summarizer: &crate::config::SummarizerConfig,
 ) -> Result<()> {
+    // Reentrancy guard (#322): if this hook is firing inside an
+    // ICM-spawned worker subtree, do nothing. The summarizer's
+    // `claude -p` child sets `ICM_WORKER=1`, which every hook it triggers
+    // inherits. Without this guard, that child's own SessionEnd would fork
+    // another worker → another `claude -p` → an unbounded, self-sustaining
+    // spawn loop (thermal runaway). A worker session has no durable
+    // transcript worth extracting anyway.
+    if std::env::var_os("ICM_WORKER").is_some() {
+        return Ok(());
+    }
+
     // Async path: when a provider is configured, drain the
     // pending_extractions queue in a detached subprocess and return
     // immediately so Claude Code doesn't kill us with "Hook cancelled".
@@ -3369,6 +3382,9 @@ fn cmd_hook_end(
             // config so it picks up the same provider.
             let mut cmd = std::process::Command::new(&self_path);
             cmd.arg("extract-pending").arg("--limit").arg("20");
+            // Mark the worker subtree (#322) so any hook fired by an LLM
+            // CLI it spawns short-circuits instead of forking again.
+            cmd.env("ICM_WORKER", "1");
             cmd.stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null());
@@ -6213,6 +6229,53 @@ fn cli_on_path(name: &str) -> bool {
     })
 }
 
+/// Best-effort inter-process singleton lock for the extract-pending worker
+/// (#322). Held for the lifetime of the value; the OS releases the advisory
+/// `flock` when the file descriptor closes on drop.
+struct WorkerLock {
+    #[cfg(unix)]
+    _file: std::fs::File,
+}
+
+impl WorkerLock {
+    /// Try to take the lock next to the DB. `Ok(Some(_))` = acquired,
+    /// `Ok(None)` = another process already holds it, `Err` = the lockfile
+    /// itself could not be created (caller may proceed without the guard).
+    fn acquire(db_path: &std::path::Path) -> Result<Option<Self>> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            let lock_path = db_path.with_extension("extract.lock");
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                // We only need a valid fd to flock; never write to or
+                // truncate the lockfile (state lives in the advisory lock).
+                .truncate(false)
+                .open(&lock_path)
+                .with_context(|| format!("opening worker lockfile {}", lock_path.display()))?;
+            // SAFETY: valid fd from the File above; LOCK_NB makes it
+            // non-blocking so a busy lock returns immediately.
+            let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+            if rc == 0 {
+                Ok(Some(Self { _file: file }))
+            } else {
+                let err = std::io::Error::last_os_error();
+                if err.raw_os_error() == Some(libc::EWOULDBLOCK) {
+                    Ok(None)
+                } else {
+                    Err(anyhow::Error::new(err).context("flock on worker lockfile"))
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = db_path;
+            Ok(Some(Self {}))
+        }
+    }
+}
+
 /// Process the async extraction queue.
 ///
 /// Reads up to `limit` oldest pending rows from `pending_extractions`.
@@ -6240,7 +6303,32 @@ fn cmd_extract_pending(
     cli_provider: Option<&str>,
     cli_model: Option<&str>,
     dry_run: bool,
+    db_path: &std::path::Path,
 ) -> Result<()> {
+    // Singleton guard (#322): only one worker drains the queue at a time.
+    // On a default install every ending Claude Code / Codex / editor session
+    // forks a worker; uncapped they pile up (the incident ran 5+ at once,
+    // each booting an LLM CLI) and hammer the same non-WAL SQLite DB, which
+    // makes the concurrent-write corruption in #313 far likelier. A dry-run
+    // only previews, so it takes no lock.
+    let _lock = if dry_run {
+        None
+    } else {
+        match WorkerLock::acquire(db_path) {
+            Ok(Some(l)) => Some(l),
+            Ok(None) => {
+                println!("Another extract-pending worker is already running; skipping.");
+                return Ok(());
+            }
+            Err(e) => {
+                eprintln!(
+                    "[extract-pending] lock unavailable ({e}); proceeding without singleton guard"
+                );
+                None
+            }
+        }
+    };
+
     let pending = store.list_pending_extractions(limit)?;
     if pending.is_empty() {
         println!("No pending extractions.");
@@ -8710,6 +8798,30 @@ mod hook_start_tests {
             project_from_path(dir.path().to_str().unwrap()),
             Some("myproject".into())
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn worker_lock_is_exclusive_and_releases_on_drop() {
+        // #322: a second worker must not run while the first holds the lock,
+        // and the lock must free up once the first finishes.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("memories.db");
+
+        let first = WorkerLock::acquire(&db).unwrap();
+        assert!(first.is_some(), "first acquire should succeed");
+
+        // Held: a concurrent acquire is refused (Ok(None)), not an error.
+        let second = WorkerLock::acquire(&db).unwrap();
+        assert!(
+            second.is_none(),
+            "second acquire must be refused while held"
+        );
+
+        // Release, then the lock is available again.
+        drop(first);
+        let third = WorkerLock::acquire(&db).unwrap();
+        assert!(third.is_some(), "acquire should succeed after release");
     }
 
     #[test]
