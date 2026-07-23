@@ -123,6 +123,13 @@ pub fn make_summarizer(kind: ProviderKind) -> Result<Box<dyn Summarizer>> {
 fn run_cli(binary: &str, args: &[&str], stdin_payload: &str, timeout: Duration) -> Result<String> {
     let mut child = Command::new(binary)
         .args(args)
+        // Reentrancy marker (#322): mark the entire subprocess subtree as an
+        // ICM-spawned worker. If the spawned CLI is itself an agent harness
+        // (e.g. `claude -p` is a full Claude Code session), any ICM hook it
+        // fires inherits this var and no-ops instead of forking yet another
+        // worker — the backstop that breaks the self-sustaining spawn loop
+        // even if the isolation flags below are ever dropped or unsupported.
+        .env("ICM_WORKER", "1")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -168,13 +175,33 @@ fn run_cli(binary: &str, args: &[&str], stdin_payload: &str, timeout: Duration) 
 
 pub struct ClaudeCliSummarizer;
 
+/// Build the `claude` CLI argv for a summarization call.
+///
+/// Isolate the child session (#322). Without these flags a summarization
+/// `claude -p` boots a *full* Claude Code session: it loads the user's
+/// global settings — including ICM's own SessionEnd hook, which forks the
+/// next worker — and every configured MCP server. `--setting-sources ""`
+/// loads no user/project/local settings (so no hooks), and
+/// `--strict-mcp-config` with no `--mcp-config` means no MCP servers. The
+/// child does nothing but answer the summarization prompt.
+fn claude_cli_args(model: &str) -> Vec<&str> {
+    vec![
+        "-p",
+        "--model",
+        model,
+        "--setting-sources",
+        "",
+        "--strict-mcp-config",
+    ]
+}
+
 impl Summarizer for ClaudeCliSummarizer {
     fn name(&self) -> &'static str {
         "claude"
     }
     fn summarize(&self, req: &SummarizeRequest<'_>) -> Result<String> {
         let model = req.model.unwrap_or("claude-haiku-4-5");
-        let args = vec!["-p", "--model", model];
+        let args = claude_cli_args(model);
         run_cli("claude", &args, req.prompt, req.timeout).map(trim_response)
     }
 }
@@ -461,6 +488,24 @@ mod tests {
         }
 
         assert_eq!(result, ProviderKind::Claude);
+    }
+
+    #[test]
+    fn claude_cli_args_isolate_the_child_session() {
+        // #322: the summarization `claude -p` must run with no user/project
+        // settings (no ICM hooks) and no MCP servers, or it self-forks.
+        let args = claude_cli_args("claude-haiku-4-5");
+        assert_eq!(args[0], "-p");
+        assert!(args.contains(&"--model"));
+        assert!(args.contains(&"claude-haiku-4-5"));
+        assert!(args.contains(&"--strict-mcp-config"));
+        // `--setting-sources` must be present and immediately followed by an
+        // empty value (load nothing) — not omitted.
+        let idx = args
+            .iter()
+            .position(|a| *a == "--setting-sources")
+            .expect("--setting-sources must be passed");
+        assert_eq!(args[idx + 1], "", "--setting-sources value must be empty");
     }
 
     #[test]
