@@ -23,6 +23,20 @@ pub(crate) fn db_err(e: rusqlite::Error) -> IcmError {
     IcmError::Database(e.to_string())
 }
 
+/// True when a rusqlite error is a "no such table" (a legacy DB missing an
+/// FTS shadow table we optionally rebuild — issue #313).
+fn is_missing_table(e: &rusqlite::Error) -> bool {
+    e.to_string().contains("no such table")
+}
+
+/// FTS5 shadow tables maintained by ICM, checked/rebuilt during repair (#313).
+const FTS_TABLES: [&str; 4] = [
+    "memories_fts",
+    "concepts_fts",
+    "feedback_fts",
+    "messages_fts",
+];
+
 // Shared public row types live in `crate::common` so all backends can be
 // compiled into one binary without colliding definitions (issue #301).
 pub use crate::common::{CodeArea, HookEvent, HookEventInsert, HookStatsRow, PendingRow};
@@ -133,6 +147,128 @@ impl SqliteStore {
             cache: Mutex::new(new_cache()),
             readonly: true,
         })
+    }
+
+    /// Open an existing database for maintenance — integrity check and
+    /// repair (issue #313).
+    ///
+    /// Writable (so `REINDEX` and FTS `'rebuild'` can run) but, unlike
+    /// [`Self::with_dims`], it deliberately does NOT:
+    /// - run `init_db_with_dims` — schema migration would fail on, or mutate,
+    ///   a corrupt DB before it can even be inspected;
+    /// - switch `journal_mode` — a damaged file's on-disk format is left
+    ///   exactly as found so recovery reasons about the real state.
+    ///
+    /// Returns [`IcmError::NotFound`] when the file is absent.
+    pub fn open_maintenance(path: &Path) -> IcmResult<Self> {
+        ensure_sqlite_vec();
+        if !path.exists() {
+            return Err(IcmError::NotFound(format!(
+                "database not found at {}",
+                path.display()
+            )));
+        }
+        let conn = Connection::open(path)
+            .map_err(|e| IcmError::Database(format!("cannot open database: {e}")))?;
+        conn.execute_batch("PRAGMA busy_timeout=30000;")
+            .map_err(db_err)?;
+        Ok(Self {
+            conn,
+            cache: Mutex::new(new_cache()),
+            readonly: false,
+        })
+    }
+
+    /// Check database integrity (issue #313) and return a list of problems.
+    /// A healthy database yields exactly `["ok"]`; a damaged one yields one
+    /// entry per problem.
+    ///
+    /// Two complementary checks run:
+    /// 1. `PRAGMA integrity_check` — structural b-tree / page validation.
+    ///    This is what caught the shadow-table and index damage reported in
+    ///    the incident (`btreeInitPage`, `wrong # of entries in index …`).
+    /// 2. FTS5 `'integrity-check'` per shadow table — validates each FTS
+    ///    index's internal structure, complementing the structural pass for
+    ///    damage confined to the FTS shadow tables.
+    ///
+    /// This never returns `Err`: even a failure to *run* a check (e.g. an FTS
+    /// vtable too damaged to instantiate) is recorded as a problem, so the
+    /// caller — `icm doctor` / `icm repair` — always gets a usable verdict on
+    /// a badly corrupt database instead of a propagated error.
+    pub fn integrity_check(&self) -> IcmResult<Vec<String>> {
+        let mut problems = Vec::new();
+
+        // 1. Structural check. Record a run failure as a problem instead of
+        //    aborting the whole verdict.
+        match self.run_integrity_pragma() {
+            Ok(lines) => problems.extend(lines.into_iter().filter(|l| l != "ok")),
+            Err(e) => problems.push(format!("integrity_check pragma failed: {e}")),
+        }
+
+        // 2. Per-FTS-table consistency.
+        for table in FTS_TABLES {
+            // `rank = 1` makes FTS5 verify the index against the *content*
+            // table, not just its own internal structure. Without it, an
+            // index that is stale or out of step with the base table (e.g.
+            // an interrupted write) is reported as healthy. Requires
+            // SQLite ≥ 3.37 (bundled rusqlite is well past that).
+            let sql = format!("INSERT INTO {table}({table}, rank) VALUES('integrity-check', 1);");
+            match self.conn.execute_batch(&sql) {
+                Ok(()) => {}
+                Err(e) if is_missing_table(&e) => {} // legacy DB without this table
+                Err(e) => problems.push(format!("fts5 {table}: {e}")),
+            }
+        }
+
+        if problems.is_empty() {
+            Ok(vec!["ok".to_string()])
+        } else {
+            Ok(problems)
+        }
+    }
+
+    /// Run `PRAGMA integrity_check` and collect its result rows.
+    fn run_integrity_pragma(&self) -> IcmResult<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("PRAGMA integrity_check")
+            .map_err(db_err)?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(db_err)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(db_err)?);
+        }
+        Ok(out)
+    }
+
+    /// Rebuild the FTS5 shadow tables from their content tables and `REINDEX`
+    /// every b-tree index (issue #313). This repairs the most common
+    /// corruption class — damaged indexes / FTS shadow tables with intact
+    /// base tables — without touching row data.
+    ///
+    /// Best-effort by design: a shadow table too damaged for `'rebuild'` to
+    /// even instantiate is skipped rather than aborting the whole repair, and
+    /// `REINDEX` failure is tolerated too. The caller re-runs
+    /// [`Self::integrity_check`] afterwards and reports any damage that
+    /// survived, so nothing is silently claimed fixed. Returns the FTS tables
+    /// that were successfully rebuilt.
+    pub fn rebuild_search_indexes(&self) -> IcmResult<Vec<String>> {
+        let mut rebuilt = Vec::new();
+        for table in FTS_TABLES {
+            let sql = format!("INSERT INTO {table}({table}) VALUES('rebuild');");
+            // A missing (legacy DB) or too-corrupt-to-instantiate shadow table
+            // is skipped rather than aborting; the post-repair integrity check
+            // surfaces any table that could not be restored.
+            if self.conn.execute_batch(&sql).is_ok() {
+                rebuilt.push(table.to_string());
+            }
+        }
+        // May fail on a badly damaged b-tree; the post-repair integrity check
+        // reports whatever REINDEX could not fix.
+        let _ = self.conn.execute_batch("REINDEX;");
+        Ok(rebuilt)
     }
 
     /// True when the store was opened read-only (issue #263). Read-like
@@ -3828,6 +3964,92 @@ mod tests {
 
     fn make_concept(memoir_id: &str, name: &str, definition: &str) -> Concept {
         Concept::new(memoir_id.into(), name.into(), definition.into())
+    }
+
+    // === Integrity check / repair (issue #313) ===
+
+    #[test]
+    fn integrity_check_ok_on_healthy_db() {
+        let store = test_store();
+        store.store(make_memory("t", "healthy row")).unwrap();
+        assert_eq!(store.integrity_check().unwrap(), vec!["ok".to_string()]);
+    }
+
+    #[test]
+    fn rebuild_search_indexes_lists_fts_tables_and_keeps_integrity() {
+        let store = test_store();
+        store.store(make_memory("t", "a row to index")).unwrap();
+        let rebuilt = store.rebuild_search_indexes().unwrap();
+        // memories_fts always exists; the concepts/feedback/messages FTS
+        // tables are created by schema init too.
+        assert!(
+            rebuilt.contains(&"memories_fts".to_string()),
+            "got: {rebuilt:?}"
+        );
+        assert_eq!(store.integrity_check().unwrap(), vec!["ok".to_string()]);
+    }
+
+    #[test]
+    fn rebuild_search_indexes_regenerates_fts_from_content() {
+        // The core repair mechanism (#313): rebuilding must reconstruct the
+        // FTS index from the intact content table. Deterministically wipe the
+        // FTS index (the "index damaged, base table intact" class) and prove
+        // rebuild restores searchability.
+        let store = test_store();
+        store
+            .store(make_memory("t", "singulartoken repairable"))
+            .unwrap();
+
+        let fts_hits = |s: &SqliteStore| -> i64 {
+            s.conn
+                .query_row(
+                    "SELECT COUNT(*) FROM memories_fts WHERE memories_fts MATCH 'singulartoken'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        };
+        assert_eq!(fts_hits(&store), 1, "token should be indexed after store");
+
+        // Wipe the FTS index while leaving the content row in `memories`.
+        store
+            .conn
+            .execute_batch("INSERT INTO memories_fts(memories_fts) VALUES('delete-all');")
+            .unwrap();
+        assert_eq!(fts_hits(&store), 0, "index wiped → no FTS hit");
+
+        // integrity_check (rank=1 content check) must flag the desync so that
+        // `icm repair` actually triggers on it rather than reporting healthy.
+        assert_ne!(
+            store.integrity_check().unwrap(),
+            vec!["ok".to_string()],
+            "index/content desync must be detected"
+        );
+
+        store.rebuild_search_indexes().unwrap();
+        assert_eq!(fts_hits(&store), 1, "rebuild must regenerate the FTS index");
+        assert_eq!(store.integrity_check().unwrap(), vec!["ok".to_string()]);
+    }
+
+    #[test]
+    fn open_maintenance_errors_on_missing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("absent.db");
+        match SqliteStore::open_maintenance(&path) {
+            Ok(_) => panic!("open_maintenance on missing file must error"),
+            Err(IcmError::NotFound(_)) => {}
+            Err(other) => panic!("expected NotFound, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn open_maintenance_opens_existing_db_writable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("seeded.db");
+        let _ = seed_writable_db(&path);
+        let store = SqliteStore::open_maintenance(&path).unwrap();
+        assert!(!store.is_readonly());
+        assert_eq!(store.integrity_check().unwrap(), vec!["ok".to_string()]);
     }
 
     // === Read-only store (issue #263) ===

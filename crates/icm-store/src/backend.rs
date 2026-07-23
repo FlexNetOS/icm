@@ -183,6 +183,61 @@ impl Store {
         }
     }
 
+    /// Open the local SQLite database for maintenance — integrity check and
+    /// repair (issue #313). Only the SQLite backend has an on-disk file to
+    /// inspect; Postgres / OpenSearch have their own durability and return a
+    /// config error.
+    pub fn open_maintenance(path: &Path) -> IcmResult<Self> {
+        match BackendKind::from_env()? {
+            BackendKind::Sqlite => {
+                #[cfg(feature = "backend-sqlite")]
+                {
+                    Ok(Store::Sqlite(SqliteStore::open_maintenance(path)?))
+                }
+                #[cfg(not(feature = "backend-sqlite"))]
+                {
+                    let _ = path;
+                    Err(not_compiled("sqlite"))
+                }
+            }
+            other => {
+                let _ = path;
+                Err(IcmError::Config(format!(
+                    "`icm repair` / integrity check only applies to the SQLite \
+                     backend, but ICM_DB_BACKEND selects {other:?}"
+                )))
+            }
+        }
+    }
+
+    /// Run `PRAGMA integrity_check` on the SQLite backend (issue #313).
+    /// A healthy DB returns `["ok"]`. Only meaningful on a store opened via
+    /// [`Self::open_maintenance`]; other backends return a config error.
+    pub fn integrity_check(&self) -> IcmResult<Vec<String>> {
+        match self {
+            #[cfg(feature = "backend-sqlite")]
+            Store::Sqlite(s) => s.integrity_check(),
+            #[allow(unreachable_patterns)]
+            _ => Err(IcmError::Config(
+                "integrity_check is only supported on the SQLite backend".into(),
+            )),
+        }
+    }
+
+    /// Rebuild FTS shadow tables and `REINDEX` on the SQLite backend
+    /// (issue #313). Returns the FTS tables rebuilt. Other backends return a
+    /// config error.
+    pub fn rebuild_search_indexes(&self) -> IcmResult<Vec<String>> {
+        match self {
+            #[cfg(feature = "backend-sqlite")]
+            Store::Sqlite(s) => s.rebuild_search_indexes(),
+            #[allow(unreachable_patterns)]
+            _ => Err(IcmError::Config(
+                "rebuild_search_indexes is only supported on the SQLite backend".into(),
+            )),
+        }
+    }
+
     /// In-memory store for the active backend (remote backends connect to
     /// their configured endpoint).
     pub fn in_memory() -> IcmResult<Self> {
