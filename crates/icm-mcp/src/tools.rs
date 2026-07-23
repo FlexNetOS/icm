@@ -12,8 +12,37 @@ use icm_store::Store;
 
 use crate::protocol::ToolResult;
 
-/// Default threshold for auto-consolidation (can be overridden by config).
+/// Historical default threshold for auto-consolidation. The live value comes
+/// from [`AutoConsolidate`] (issue #318); this constant is only the fallback
+/// for callers that don't pass a policy.
 const AUTO_CONSOLIDATE_THRESHOLD: usize = 10;
+
+/// Auto-consolidation policy for the MCP store path (issue #318).
+///
+/// Previously the MCP `icm_memory_store` handler consolidated a topic past a
+/// hardcoded 10 entries **unconditionally**, ignoring `[memory]
+/// auto_consolidate_enabled` / `auto_consolidate_threshold` — so an explicit
+/// `enabled = false` still destructively rolled up (and deleted) a topic's
+/// memories. `icm serve` now threads the loaded config through as one of
+/// these, and the handler honors it.
+#[derive(Clone, Copy, Debug)]
+pub struct AutoConsolidate {
+    pub enabled: bool,
+    pub threshold: usize,
+}
+
+impl Default for AutoConsolidate {
+    /// The historical always-on behavior (threshold 10). Used only by callers
+    /// that don't supply a policy — e.g. tests via [`call_tool`]. The
+    /// `icm serve` path passes the user's real config through
+    /// [`call_tool_with_config`] instead.
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            threshold: AUTO_CONSOLIDATE_THRESHOLD,
+        }
+    }
+}
 
 /// Maximum allowed length for topic names. Must stay <= the store
 /// layer's `MAX_TOPIC_BYTES` so the MCP-level rejection happens
@@ -38,8 +67,10 @@ fn parse_keywords(args: &Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// Try to auto-consolidate a topic if it exceeds the threshold.
-/// Returns a human-readable message if consolidation happened, or empty string.
+/// Try to auto-consolidate a topic if the policy is enabled and the topic
+/// exceeds the configured threshold (issue #318). Returns a human-readable
+/// message if consolidation happened, or an empty string (including when the
+/// policy is disabled — a no-op).
 ///
 /// Routes through `auto_consolidate_with_embedder` so the consolidated
 /// memory is embedded inline (closes audit M2/AC2: previously the
@@ -49,10 +80,16 @@ fn try_auto_consolidate(
     store: &Store,
     embedder: Option<&dyn Embedder>,
     topic: &str,
-    threshold: usize,
+    auto: AutoConsolidate,
 ) -> String {
-    match store.auto_consolidate_with_embedder(topic, threshold, embedder) {
-        Ok(true) => format!("Auto-consolidated topic '{topic}' (exceeded {threshold} entries)."),
+    if !auto.enabled {
+        return String::new();
+    }
+    match store.auto_consolidate_with_embedder(topic, auto.threshold, embedder) {
+        Ok(true) => format!(
+            "Auto-consolidated topic '{topic}' (exceeded {} entries).",
+            auto.threshold
+        ),
         Ok(false) => String::new(),
         Err(e) => {
             tracing::warn!("auto-consolidation failed for topic '{topic}': {e}");
@@ -719,9 +756,30 @@ pub fn call_tool(
     args: &Value,
     compact: bool,
 ) -> ToolResult {
+    call_tool_with_config(
+        store,
+        embedder,
+        name,
+        args,
+        compact,
+        AutoConsolidate::default(),
+    )
+}
+
+/// Like [`call_tool`] but with an explicit auto-consolidation policy
+/// (issue #318). `icm serve` calls this with the user's loaded config so an
+/// `auto_consolidate_enabled = false` is honored on the MCP store path.
+pub fn call_tool_with_config(
+    store: &Store,
+    embedder: Option<&dyn Embedder>,
+    name: &str,
+    args: &Value,
+    compact: bool,
+    auto_consolidate: AutoConsolidate,
+) -> ToolResult {
     match name {
         // Memory tools
-        "icm_memory_store" => tool_store(store, embedder, args, compact),
+        "icm_memory_store" => tool_store(store, embedder, args, compact, auto_consolidate),
         "icm_memory_recall" => tool_recall(store, embedder, args, compact),
         "icm_memory_forget" => tool_forget(store, args),
         "icm_memory_forget_topic" => tool_forget_topic(store, args),
@@ -924,6 +982,7 @@ fn tool_store(
     embedder: Option<&dyn Embedder>,
     args: &Value,
     compact: bool,
+    auto_consolidate: AutoConsolidate,
 ) -> ToolResult {
     let topic = match get_str(args, "topic") {
         Some(t) => t,
@@ -1080,7 +1139,7 @@ fn tool_store(
             if compact {
                 // Try auto-consolidation even in compact mode
                 let consolidation_msg =
-                    try_auto_consolidate(store, embedder, topic, AUTO_CONSOLIDATE_THRESHOLD);
+                    try_auto_consolidate(store, embedder, topic, auto_consolidate);
                 if consolidation_msg.is_empty() {
                     ToolResult::text(format!("ok:{id}{link_suffix}"))
                 } else {
@@ -1088,7 +1147,7 @@ fn tool_store(
                 }
             } else {
                 let consolidation_msg =
-                    try_auto_consolidate(store, embedder, topic, AUTO_CONSOLIDATE_THRESHOLD);
+                    try_auto_consolidate(store, embedder, topic, auto_consolidate);
                 if consolidation_msg.is_empty() {
                     // Still show a nudge if approaching threshold
                     let hint = if let Ok(count) = store.count_by_topic(topic) {
@@ -2716,6 +2775,94 @@ mod tests {
         assert!(!result.is_error);
         let stats = call_tool(&store, None, "icm_memory_stats", &json!({}), false);
         assert!(stats.content[0].text.contains("Memories: 1"));
+    }
+
+    // === Auto-consolidation config gating (issue #318) ===
+
+    fn store_via_mcp(store: &Store, topic: &str, i: usize, auto: AutoConsolidate) -> ToolResult {
+        call_tool_with_config(
+            store,
+            None,
+            "icm_memory_store",
+            &json!({"topic": topic, "content": format!("unique detail {i} xyzzy")}),
+            false,
+            auto,
+        )
+    }
+
+    #[test]
+    fn mcp_store_disabled_policy_never_consolidates() {
+        // #318: with auto_consolidate_enabled = false, pushing a topic well
+        // past the threshold must NOT destructively roll up the originals.
+        let store = test_store();
+        let off = AutoConsolidate {
+            enabled: false,
+            threshold: 10,
+        };
+        for i in 0..14 {
+            let r = store_via_mcp(&store, "t", i, off);
+            assert!(
+                !r.content[0].text.contains("Auto-consolidated"),
+                "disabled policy must not consolidate"
+            );
+        }
+        assert_eq!(
+            store.count_by_topic("t").unwrap(),
+            14,
+            "all 14 memories must remain when consolidation is disabled"
+        );
+    }
+
+    #[test]
+    fn mcp_store_enabled_policy_consolidates_at_configured_threshold() {
+        // #318: an enabled policy honors the configured threshold (here 3,
+        // not the hardcoded 10).
+        let store = test_store();
+        let on = AutoConsolidate {
+            enabled: true,
+            threshold: 3,
+        };
+        let mut consolidated = false;
+        for i in 0..6 {
+            if store_via_mcp(&store, "t", i, on).content[0]
+                .text
+                .contains("Auto-consolidated")
+            {
+                consolidated = true;
+            }
+        }
+        assert!(
+            consolidated,
+            "enabled policy at threshold 3 should have consolidated before 6 stores"
+        );
+        assert!(
+            store.count_by_topic("t").unwrap() < 6,
+            "consolidation should have collapsed the topic"
+        );
+    }
+
+    #[test]
+    fn call_tool_default_preserves_historical_auto_consolidation() {
+        // The bare `call_tool` (used by non-serve callers/tests) keeps the
+        // historical always-on-at-10 behavior via AutoConsolidate::default().
+        let store = test_store();
+        let mut consolidated = false;
+        for i in 0..12 {
+            let r = call_tool(
+                &store,
+                None,
+                "icm_memory_store",
+                &json!({"topic": "t", "content": format!("unique detail {i} xyzzy")}),
+                false,
+            );
+            if r.content[0].text.contains("Auto-consolidated") {
+                consolidated = true;
+            }
+        }
+        assert!(
+            consolidated,
+            "call_tool default should still consolidate past 10 entries"
+        );
     }
 
     // === Security tests ===
