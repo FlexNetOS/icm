@@ -94,6 +94,10 @@ jobs:
 
       - name: Build
         if: matrix.target != 'aarch64-unknown-linux-gnu'
+        # Target-specific, so a no-op for non-musl targets: sqlite-vec.c uses
+        # BSD type names (u_int8_t/…) that glibc provides but musl does not.
+        env:
+          CFLAGS_x86_64_unknown_linux_musl: "-Du_int8_t=uint8_t -Du_int16_t=uint16_t -Du_int32_t=uint32_t -Du_int64_t=uint64_t"
         run: cargo build --release --target ${{ matrix.target }} -p icm-cli ${{ matrix.flags }}
 
       - name: Package (Unix)

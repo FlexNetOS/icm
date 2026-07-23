@@ -69,6 +69,10 @@ jobs:
       - name: Install musl tools
         run: sudo apt-get update && sudo apt-get install -y musl-tools
       - name: Build static musl binary (no embeddings)
+        # sqlite-vec.c uses BSD type names (u_int8_t/u_int16_t/u_int64_t) that
+        # glibc provides but musl does not; map them to the standard names.
+        env:
+          CFLAGS_x86_64_unknown_linux_musl: "-Du_int8_t=uint8_t -Du_int16_t=uint16_t -Du_int32_t=uint32_t -Du_int64_t=uint64_t"
         run: >-
           cargo build --release --target x86_64-unknown-linux-musl -p icm-cli
           --no-default-features --features "backend-sqlite,tui,http-api"
