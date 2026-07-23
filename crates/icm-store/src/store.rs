@@ -59,22 +59,10 @@ fn ensure_sqlite_vec() {
     });
 }
 
-/// Open `path` strictly read-only **and** immutable.
-///
-/// `SQLITE_OPEN_READ_ONLY` alone is not enough on a `chmod -w` parent
-/// directory: SQLite still tries to create / refresh the `-shm` and
-/// `-wal` companion files for any WAL-mode database, which fails with
-/// "attempt to write a readonly database". The `immutable=1` URI flag
-/// tells SQLite the file will not change for the lifetime of the
-/// connection and disables that WAL bookkeeping path entirely. This
-/// is the standard recipe for read-only sandboxes and matches what
-/// every SQLite "read-only inspect" tool does.
-///
-/// URI-encodes the path so a backslash on Windows or a `?`/`#` in a
-/// pathological filename can't break the URI parser.
-fn open_readonly_immutable(path: &Path) -> IcmResult<Connection> {
-    let raw = path.to_string_lossy();
-    let encoded: String = raw
+/// URI-encode a filesystem path for a SQLite `file:` URI so a backslash on
+/// Windows or a `?`/`#`/`%` in a pathological filename can't break the parser.
+fn encode_sqlite_uri_path(path: &Path) -> String {
+    path.to_string_lossy()
         .chars()
         .map(|c| match c {
             '?' | '#' | '%' => format!("%{:02X}", c as u32),
@@ -82,8 +70,23 @@ fn open_readonly_immutable(path: &Path) -> IcmResult<Connection> {
             '\\' => "/".into(),
             other => other.to_string(),
         })
-        .collect();
-    let uri = format!("file:{encoded}?mode=ro&immutable=1");
+        .collect()
+}
+
+/// Open `path` strictly read-only. When `immutable` is set, add the
+/// `immutable=1` URI flag — SQLite then assumes the file never changes and
+/// touches no `-shm`/`-wal` sidecars, which is required on a `chmod -w`
+/// parent directory (issue #263) but serves a permanently stale snapshot and
+/// eventually reports spurious `SQLITE_CORRUPT` on a live DB (issue #319).
+/// Plain `mode=ro` (immutable = false) is WAL-aware and sees committed
+/// writes, at the cost of needing a writable directory for the sidecars.
+fn open_readonly_uri(path: &Path, immutable: bool) -> IcmResult<Connection> {
+    let encoded = encode_sqlite_uri_path(path);
+    let uri = if immutable {
+        format!("file:{encoded}?mode=ro&immutable=1")
+    } else {
+        format!("file:{encoded}?mode=ro")
+    };
     Connection::open_with_flags(
         uri,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
@@ -91,6 +94,33 @@ fn open_readonly_immutable(path: &Path) -> IcmResult<Connection> {
             | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
     .map_err(|e| IcmError::Database(format!("cannot open database read-only: {e}")))
+}
+
+/// Open a long-lived read-only connection (issue #319).
+///
+/// Prefer a normal WAL-aware `mode=ro` connection: it respects locking and
+/// sees writes committed after it opened — the actual deployment model for
+/// `icm --read-only serve`, where hooks keep writing the same DB. Fall back to
+/// `immutable=1` only when the live open can't even read the DB, e.g. a
+/// `chmod -w` sandbox where SQLite can't create the `-shm` sidecar for a
+/// WAL-mode file (issue #263). The read probe is essential: on such a
+/// directory the open may *succeed* yet the first real read fails, so opening
+/// alone is not a sufficient signal.
+fn open_readonly_connection(path: &Path) -> IcmResult<Connection> {
+    if let Ok(conn) = open_readonly_uri(path, false) {
+        // Give a momentarily-locked writer time to release before deciding
+        // the live open is unusable.
+        let _ = conn.execute_batch("PRAGMA busy_timeout=30000;");
+        // Exercise a real table read (touches the WAL/-shm path) — `SELECT 1`
+        // would not.
+        if conn
+            .query_row("SELECT count(*) FROM sqlite_master", [], |_| Ok(()))
+            .is_ok()
+        {
+            return Ok(conn);
+        }
+    }
+    open_readonly_uri(path, true)
 }
 
 /// In-process LRU cache size for hot memories. Each entry is one
@@ -137,7 +167,7 @@ impl SqliteStore {
                 path.display()
             )));
         }
-        let conn = open_readonly_immutable(path)?;
+        let conn = open_readonly_connection(path)?;
         // foreign_keys is a no-op for reads; busy_timeout is still useful
         // when another writer holds the file.
         conn.execute_batch("PRAGMA foreign_keys=ON; PRAGMA busy_timeout=30000;")
@@ -300,8 +330,10 @@ impl SqliteStore {
         // which fails when the parent directory is non-writable.
         // The `immutable=1` URI flag tells SQLite the file will not
         // change during the connection's lifetime and stops it from
-        // touching WAL infrastructure entirely.
-        let conn = open_readonly_immutable(path)?;
+        // touching WAL infrastructure entirely. This is a one-shot probe
+        // (not a long-lived connection), so the staleness that #319 fixes
+        // for `open_readonly` does not apply here.
+        let conn = open_readonly_uri(path, true)?;
         // Probe for the metadata table — legacy DBs predate it.
         let has_table: bool = conn
             .query_row(
@@ -4088,6 +4120,71 @@ mod tests {
         let got = ro.get(&seeded.id).unwrap().expect("memory must be present");
         assert_eq!(got.topic, "project:icm");
         assert_eq!(got.summary, "read-only fixture summary");
+    }
+
+    #[test]
+    fn read_only_connection_sees_writes_committed_after_open() {
+        // #319: a long-lived `--read-only serve` connection must observe
+        // writes that hooks/CLI commit to the same DB *after* the server
+        // opened. The old `immutable=1` open served a permanently stale
+        // snapshot (and eventually spurious "database disk image is malformed"
+        // on a healthy DB).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("live.db");
+        let _ = seed_writable_db(&path); // 1 memory, WAL mode
+
+        let ro = SqliteStore::open_readonly(&path).unwrap();
+        assert_eq!(ro.count().unwrap(), 1);
+
+        // A separate writer commits a new memory to the same file.
+        {
+            let rw = SqliteStore::new(&path).unwrap();
+            let mut m = make_memory("project:icm", "written after the reader opened");
+            m.embedding = Some(vec![0.2_f32; icm_core::DEFAULT_EMBEDDING_DIMS]);
+            rw.store(m).unwrap();
+        }
+
+        // The already-open read-only connection must now see it.
+        assert_eq!(
+            ro.count().unwrap(),
+            2,
+            "read-only connection must see writes committed after it opened"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_readonly_falls_back_to_immutable_on_unwritable_dir() {
+        // #263 must keep working after #319: on a `chmod -w` parent directory
+        // the live `mode=ro` open can't create the `-shm` sidecar, so
+        // open_readonly must fall back to `immutable=1` and still read.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sandboxed.db");
+        let seeded = seed_writable_db(&path);
+        // Checkpoint + drop WAL so the DB is a single self-contained file the
+        // immutable open can read without touching sidecars.
+        {
+            let rw = SqliteStore::new(&path).unwrap();
+            rw.conn
+                .execute_batch("PRAGMA wal_checkpoint(TRUNCATE); PRAGMA journal_mode=DELETE;")
+                .unwrap();
+        }
+
+        let original = std::fs::metadata(dir.path()).unwrap().permissions();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let opened = SqliteStore::open_readonly(&path);
+
+        // Restore permissions before asserting so tempdir cleanup succeeds.
+        std::fs::set_permissions(dir.path(), original).unwrap();
+
+        let ro = opened.expect("read-only open must fall back to immutable on a chmod -w dir");
+        let got = ro
+            .get(&seeded.id)
+            .unwrap()
+            .expect("memory must be readable");
+        assert_eq!(got.topic, "project:icm");
     }
 
     #[test]
