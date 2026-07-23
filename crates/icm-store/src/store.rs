@@ -120,6 +120,14 @@ fn open_readonly_connection(path: &Path) -> IcmResult<Connection> {
             return Ok(conn);
         }
     }
+    // Live open unusable (e.g. a read-only sandbox dir, #263). Fall back to an
+    // immutable snapshot — but warn, because a long-lived reader on this
+    // connection will NOT see subsequent writes (the #319 staleness tradeoff).
+    tracing::warn!(
+        path = %path.display(),
+        "read-only DB opened immutable (sandbox fallback): writes committed after \
+         this point will not be visible until the connection is reopened"
+    );
     open_readonly_uri(path, true)
 }
 
@@ -4156,29 +4164,50 @@ mod tests {
     #[test]
     fn open_readonly_falls_back_to_immutable_on_unwritable_dir() {
         // #263 must keep working after #319: on a `chmod -w` parent directory
-        // the live `mode=ro` open can't create the `-shm` sidecar, so
-        // open_readonly must fall back to `immutable=1` and still read.
+        // the live `mode=ro` open can't create the `-shm` sidecar for a WAL
+        // DB, so open_readonly must fall back to `immutable=1` and still read.
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("sandboxed.db");
         let seeded = seed_writable_db(&path);
-        // Checkpoint + drop WAL so the DB is a single self-contained file the
-        // immutable open can read without touching sidecars.
+        // Keep the DB in WAL mode (that's what forces the -shm requirement)
+        // but fold all rows into the main file and drop the sidecars, so a
+        // fresh read-only open must recreate -shm — which fails in a
+        // read-only dir. (A DELETE-mode DB would open fine via plain mode=ro
+        // and never exercise the fallback.)
         {
             let rw = SqliteStore::new(&path).unwrap();
             rw.conn
-                .execute_batch("PRAGMA wal_checkpoint(TRUNCATE); PRAGMA journal_mode=DELETE;")
+                .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
                 .unwrap();
+        }
+        for ext in ["-wal", "-shm"] {
+            let mut side = path.as_os_str().to_os_string();
+            side.push(ext);
+            let _ = std::fs::remove_file(std::path::PathBuf::from(side));
         }
 
         let original = std::fs::metadata(dir.path()).unwrap().permissions();
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
 
+        // Guard: confirm the live `mode=ro` path is genuinely unusable here,
+        // otherwise this test would pass without ever exercising the fallback.
+        let live_reads = match open_readonly_uri(&path, false) {
+            Ok(conn) => conn
+                .query_row("SELECT count(*) FROM sqlite_master", [], |_| Ok(()))
+                .is_ok(),
+            Err(_) => false,
+        };
+        // The public open_readonly must still succeed via the immutable fallback.
         let opened = SqliteStore::open_readonly(&path);
 
         // Restore permissions before asserting so tempdir cleanup succeeds.
         std::fs::set_permissions(dir.path(), original).unwrap();
 
+        assert!(
+            !live_reads,
+            "sandbox setup must make the live mode=ro path unusable, else the fallback isn't tested"
+        );
         let ro = opened.expect("read-only open must fall back to immutable on a chmod -w dir");
         let got = ro
             .get(&seeded.id)
