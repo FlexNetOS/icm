@@ -391,8 +391,20 @@ enum Commands {
         with_codex_post_hook: bool,
     },
 
-    /// Diagnose ICM integration: check hook binary paths in Claude Code settings
+    /// Diagnose ICM integration: hook binary paths + SQLite database integrity
     Doctor,
+
+    /// Repair a corrupt SQLite memory database (issue #313).
+    ///
+    /// Backs the DB up first, then rebuilds FTS shadow tables and REINDEXes —
+    /// the common corruption class (damaged indexes/FTS, intact base tables).
+    /// Re-runs `integrity_check` and reports honestly whether the DB is now
+    /// healthy or base-table damage remains.
+    Repair {
+        /// Report what would happen (integrity status) without modifying the DB.
+        #[arg(long)]
+        dry_run: bool,
+    },
 
     /// Reverse `icm init`: remove ICM config from every detected AI tool.
     ///
@@ -1514,6 +1526,17 @@ fn main() -> Result<()> {
         std::process::exit(code);
     }
 
+    // `icm doctor` and `icm repair` must run BEFORE the normal store open:
+    // a corrupt DB (#313) makes `open_store` fail ("database disk image is
+    // malformed") before dispatch is ever reached, which is exactly when the
+    // user needs these commands. They open their own maintenance connection.
+    if let Commands::Doctor = command {
+        return cmd_doctor(&db_path);
+    }
+    if let Commands::Repair { dry_run } = command {
+        return cmd_repair(&db_path, dry_run);
+    }
+
     let store = if read_only_requested(cli.read_only) {
         open_store_readonly(cli_db)?
     } else {
@@ -1823,7 +1846,10 @@ fn main() -> Result<()> {
             per_project,
             with_codex_post_hook,
         } => cmd_init(mode, force, per_project, with_codex_post_hook),
-        Commands::Doctor => cmd_doctor(),
+        // Doctor and Repair are dispatched before `open_store` above; these
+        // arms exist only for match exhaustiveness and are unreachable.
+        Commands::Doctor => cmd_doctor(&db_path),
+        Commands::Repair { dry_run } => cmd_repair(&db_path, dry_run),
         Commands::Uninstall(_) => unreachable!("dispatched before open_store"),
         Commands::CodeAreas {
             in_file,
@@ -5274,7 +5300,7 @@ fn check_opencode_plugin(home: &str) -> usize {
     }
 }
 
-fn cmd_doctor() -> Result<()> {
+fn cmd_doctor(db_path: &std::path::Path) -> Result<()> {
     let home = home_dir_str()?;
     let current_bin = std::env::current_exe().ok();
 
@@ -5358,7 +5384,173 @@ fn cmd_doctor() -> Result<()> {
         }
     }
 
+    // Database integrity (#313). Uses a maintenance connection so a corrupt
+    // DB is still diagnosable (the normal store open would fail first).
+    println!();
+    report_db_integrity(db_path);
+
     Ok(())
+}
+
+/// Print a one-block SQLite integrity verdict for `icm doctor` (#313).
+/// Tolerant of every failure mode: a missing DB, a non-SQLite backend, or an
+/// unreadable file are all reported rather than propagated.
+fn report_db_integrity(db_path: &std::path::Path) {
+    if !db_path.exists() {
+        println!(
+            "Database: none yet at {} (nothing to check).",
+            db_path.display()
+        );
+        return;
+    }
+    let store = match Store::open_maintenance(db_path) {
+        Ok(s) => s,
+        Err(e) => {
+            println!(
+                "Database integrity: could not open {}: {e}",
+                db_path.display()
+            );
+            return;
+        }
+    };
+    match store.integrity_check() {
+        Ok(rows) if rows.len() == 1 && rows[0] == "ok" => {
+            println!("Database integrity: ok ({}).", db_path.display());
+        }
+        Ok(rows) => {
+            println!(
+                "Database integrity: DEGRADED — {} problem(s) at {}:",
+                rows.len(),
+                db_path.display()
+            );
+            for line in rows.iter().take(8) {
+                println!("  - {line}");
+            }
+            if rows.len() > 8 {
+                println!("  … and {} more", rows.len() - 8);
+            }
+            println!("To attempt recovery: icm repair");
+        }
+        Err(e) => {
+            println!("Database integrity: check failed: {e}");
+            println!("To attempt recovery: icm repair");
+        }
+    }
+}
+
+/// Copy the DB (and any `-wal` / `-shm` sidecars) to a timestamped sibling
+/// backup before repair mutates anything (#313). Returns the backup path.
+fn backup_db(db_path: &std::path::Path) -> Result<PathBuf> {
+    let ts = chrono::Utc::now().format("%Y%m%d-%H%M%S");
+    let stem = db_path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("memories.db");
+    let backup = db_path.with_file_name(format!("{stem}.backup-{ts}"));
+    std::fs::copy(db_path, &backup)
+        .with_context(|| format!("backing up {} to {}", db_path.display(), backup.display()))?;
+    // Best-effort: also preserve the WAL/SHM sidecars if present so the
+    // backup is a consistent snapshot.
+    for ext in ["-wal", "-shm"] {
+        let side = PathBuf::from(format!("{}{ext}", db_path.display()));
+        if side.exists() {
+            let side_backup = PathBuf::from(format!("{}{ext}", backup.display()));
+            let _ = std::fs::copy(&side, &side_backup);
+        }
+    }
+    Ok(backup)
+}
+
+/// `icm repair` — recover a corrupt SQLite memory DB (issue #313).
+fn cmd_repair(db_path: &std::path::Path, dry_run: bool) -> Result<()> {
+    if !db_path.exists() {
+        println!("No database at {} — nothing to repair.", db_path.display());
+        return Ok(());
+    }
+
+    let store = match Store::open_maintenance(db_path) {
+        Ok(s) => s,
+        Err(e) => {
+            // Too damaged to open at all (or a non-SQLite backend). Don't
+            // risk an in-place mutation — guide the user to file-level
+            // salvage instead.
+            println!("Could not open {} for repair: {e}", db_path.display());
+            println!("The database may be too damaged for in-place repair, or the");
+            println!("active backend is not SQLite. To salvage rows from the file:");
+            println!(
+                "  sqlite3 \"{}\" \".recover\" | sqlite3 recovered.db",
+                db_path.display()
+            );
+            println!("  then move recovered.db into place.");
+            std::process::exit(1);
+        }
+    };
+
+    let before = store.integrity_check()?;
+    let healthy = before.len() == 1 && before[0] == "ok";
+
+    if healthy {
+        println!(
+            "integrity_check: ok — {} is healthy, nothing to repair.",
+            db_path.display()
+        );
+        return Ok(());
+    }
+
+    println!(
+        "integrity_check reported {} problem(s) on {}:",
+        before.len(),
+        db_path.display()
+    );
+    for line in before.iter().take(8) {
+        println!("  - {line}");
+    }
+    if before.len() > 8 {
+        println!("  … and {} more", before.len() - 8);
+    }
+
+    if dry_run {
+        println!(
+            "\n(dry run) Would back up the DB, rebuild FTS shadow tables + REINDEX, then re-check."
+        );
+        return Ok(());
+    }
+
+    // Always back up before mutating a damaged DB.
+    let backup = backup_db(db_path)?;
+    println!("\nBacked up to {}", backup.display());
+
+    println!("Rebuilding FTS shadow tables + REINDEX…");
+    let rebuilt = store.rebuild_search_indexes()?;
+    println!(
+        "Rebuilt: {}",
+        if rebuilt.is_empty() {
+            "(no FTS tables)".to_string()
+        } else {
+            rebuilt.join(", ")
+        }
+    );
+
+    let after = store.integrity_check()?;
+    if after.len() == 1 && after[0] == "ok" {
+        println!("\n✔ Repair succeeded: integrity_check is now ok.");
+        Ok(())
+    } else {
+        println!(
+            "\n✗ Index/FTS rebuild did not fully repair the database — {} problem(s) remain,",
+            after.len()
+        );
+        println!("  which points at base-table (not just index) corruption.");
+        println!("  Your original is preserved at {}.", backup.display());
+        println!("  Deeper recovery (salvages intact rows from a damaged b-tree):");
+        println!(
+            "    sqlite3 \"{}\" \".recover\" | sqlite3 recovered.db",
+            backup.display()
+        );
+        println!("    then rebuild FTS and swap recovered.db into place.");
+        // Non-zero exit so scripts/automation can detect partial recovery.
+        std::process::exit(1);
+    }
 }
 
 /// Inject ICM hook into a settings.json file (Claude Code or Gemini CLI) for a given event name.
