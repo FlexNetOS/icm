@@ -178,6 +178,30 @@ fn cap_importance(value: Importance, cap: Importance) -> Importance {
     }
 }
 
+/// Query tokens worth matching against `search_by_keywords`: alphanumeric
+/// runs of 3+ chars, lowercased. Short tokens ("a", "do", "is") are dropped
+/// because `search_by_keywords` matches via `LIKE '%token%'` — keeping them
+/// would match almost every row and defeat the point of a relevance filter.
+fn content_tokens(query: &str) -> Vec<String> {
+    query
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| w.chars().count() >= 3)
+        .map(|w| w.to_lowercase())
+        .collect()
+}
+
+/// How many `tokens` appear (case-insensitively) in `mem`'s topic, summary,
+/// or keywords. Used to rank `search_by_keywords` candidates by relevance
+/// instead of leaving them ordered by weight alone.
+fn matched_token_count(tokens: &[String], mem: &Memory) -> usize {
+    let haystack =
+        format!("{} {} {}", mem.topic, mem.summary, mem.keywords.join(" ")).to_lowercase();
+    tokens
+        .iter()
+        .filter(|t| haystack.contains(t.as_str()))
+        .count()
+}
+
 /// Recall relevant memories and format as context preamble for prompt injection.
 ///
 /// When `project` is `Some(name)`, results are restricted to memories whose
@@ -204,8 +228,34 @@ pub fn recall_context(
         }
     };
 
-    // Oversample FTS results so that filtering still leaves enough candidates.
-    let fts_results = store.search_fts(query, limit.saturating_mul(4).max(limit))?;
+    // Oversample so that filtering still leaves enough candidates.
+    let pool = limit.saturating_mul(4).max(limit);
+
+    // #323: `search_fts` quotes every token, so FTS5 AND-joins them — a
+    // natural-language question ("why do workers crash right after a
+    // deploy") requires the memory to contain "why"/"do"/"a" too, and
+    // returns nothing even on an otherwise strong match. `recall` doesn't
+    // have this problem because it goes through `search_hybrid` (FTS +
+    // vector); `recall_context` stays FTS-only on purpose (no embedder load
+    // on the per-prompt hook path), so give it the same keyword-OR fallback
+    // `cmd_recall` already falls back to when it has no embedder either
+    // (see `search_by_keywords` call in `cmd_recall`). An off-topic query
+    // shares no content tokens with any memory, so this still yields
+    // nothing and tier 3 (preferences-by-weight, #185 H4) still applies.
+    let mut fts_results = store.search_fts(query, pool)?;
+    if fts_results.is_empty() {
+        let tokens = content_tokens(query);
+        if !tokens.is_empty() {
+            let refs: Vec<&str> = tokens.iter().map(String::as_str).collect();
+            fts_results = store.search_by_keywords(&refs, pool)?;
+            // search_by_keywords orders by weight alone, which can bury a
+            // memory matching most of the query behind an unrelated
+            // higher-weight one that only matched a single token. Re-rank
+            // by how many content tokens actually matched; ties keep their
+            // relative (weight) order since sort_by_key is stable.
+            fts_results.sort_by_key(|m| std::cmp::Reverse(matched_token_count(&tokens, m)));
+        }
+    }
     let project_filtered: Vec<Memory> = fts_results
         .iter()
         .filter(|m| project_filter(m))
@@ -1740,6 +1790,128 @@ mod tests {
         let ctx = recall_context(&store, "Token", None, 5).unwrap();
         assert!(ctx.contains("refresh"));
         assert!(ctx.contains("rotation"));
+    }
+
+    #[test]
+    fn test_recall_context_natural_language_question_surfaces_memory() {
+        // #323: a natural-language question carries function words
+        // ("why"/"do"/"a") the memory never contains. `search_fts`
+        // AND-joins every token, so it returns nothing even though the
+        // memory is a clear topical match. The keyword-OR fallback must
+        // recover it.
+        let store = Store::in_memory().unwrap();
+        store
+            .store(Memory::new(
+                "notes".to_string(),
+                "The deploy script must run migrations before restarting workers, \
+                 otherwise workers boot against the old schema and crash on startup."
+                    .to_string(),
+                Importance::Critical,
+            ))
+            .unwrap();
+
+        let ctx =
+            recall_context(&store, "why do workers crash right after a deploy", None, 5).unwrap();
+        assert!(
+            ctx.contains("deploy script"),
+            "natural-language question must surface the matching memory: {ctx}"
+        );
+    }
+
+    #[test]
+    fn test_content_tokens_drops_short_words() {
+        // Short tokens ("a", "do") would match almost every row via
+        // `search_by_keywords`'s LIKE '%token%' and defeat the fallback's
+        // purpose, so they must be dropped.
+        assert_eq!(
+            content_tokens("why do workers crash right after a deploy"),
+            vec!["why", "workers", "crash", "right", "after", "deploy"],
+        );
+        assert!(content_tokens("do a").is_empty());
+    }
+
+    #[test]
+    fn test_recall_context_keyword_fallback_ranks_by_relevance_not_weight_alone() {
+        // search_by_keywords orders candidates by weight alone. A memory
+        // that only shares one token with the query but has high weight
+        // must not bury a memory that shares every content token.
+        let store = Store::in_memory().unwrap();
+        store
+            .store(Memory::new(
+                "notes".to_string(),
+                "Onboarding checklist mentions deploy day logistics.".to_string(),
+                Importance::Critical,
+            ))
+            .unwrap();
+        store
+            .store(Memory::new(
+                "notes".to_string(),
+                "The deploy script must run migrations before restarting workers, \
+                 otherwise workers boot against the old schema and crash on startup."
+                    .to_string(),
+                Importance::Medium,
+            ))
+            .unwrap();
+
+        let ctx =
+            recall_context(&store, "why do workers crash right after a deploy", None, 5).unwrap();
+        let deploy_script_pos = ctx
+            .find("deploy script")
+            .expect("must surface both matches");
+        let onboarding_pos = ctx.find("Onboarding").expect("must surface both matches");
+        assert!(
+            deploy_script_pos < onboarding_pos,
+            "the memory matching workers/crash/deploy must rank above the one matching only \
+             deploy, despite lower weight: {ctx}"
+        );
+    }
+
+    #[test]
+    fn test_recall_context_natural_language_question_surfaces_cross_project_on_larger_store() {
+        // Reproduces the shape of #323's second report: a project-scoped
+        // store with many topics (context-<project>, errors-resolved,
+        // preferences), where a natural-language query matches a
+        // cross-project errors-resolved memory that tier 1's project
+        // filter legitimately excludes. Tier 2 (global FTS/keyword
+        // fallback, #185 H5) must still surface it.
+        let store = Store::in_memory().unwrap();
+        for i in 0..20 {
+            store
+                .store(Memory::new(
+                    "context-projecta".to_string(),
+                    format!("Project A note number {i} about routine maintenance"),
+                    Importance::High,
+                ))
+                .unwrap();
+        }
+        store
+            .store(Memory::new(
+                "errors-resolved".to_string(),
+                "Fixed a bug where the worker pool crashed on deploy because migrations ran \
+                 after the workers restarted instead of before."
+                    .to_string(),
+                Importance::Critical,
+            ))
+            .unwrap();
+        store
+            .store(Memory::new(
+                "preferences".to_string(),
+                "User prefers tabs over spaces".to_string(),
+                Importance::Critical,
+            ))
+            .unwrap();
+
+        let ctx = recall_context(
+            &store,
+            "why do workers crash right after a deploy",
+            Some("projectb"),
+            5,
+        )
+        .unwrap();
+        assert!(
+            ctx.contains("worker pool crashed"),
+            "natural-language query must surface the cross-project errors-resolved memory: {ctx}"
+        );
     }
 
     #[test]
