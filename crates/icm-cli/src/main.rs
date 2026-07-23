@@ -9015,7 +9015,13 @@ mod hook_start_tests {
         );
     }
 
-    #[cfg(unix)]
+    // Linux-only: advisory `flock` on the macOS CI runners' temp filesystem is
+    // unreliable in several ways — it has both failed to refuse a second
+    // holder AND failed to re-grant after release — so this test flaked there
+    // in more than one direction. The guard itself works on real installs
+    // (DB on local disk) and its cross-process behavior is covered by a manual
+    // e2e; Linux CI (where flock is reliable) gives the real unit coverage.
+    #[cfg(target_os = "linux")]
     #[test]
     fn worker_lock_is_exclusive_and_releases_on_drop() {
         // #322: a second worker must not run while the first holds the lock,
@@ -9028,16 +9034,6 @@ mod hook_start_tests {
 
         // Held: a concurrent acquire is refused (Ok(None)), not an error.
         let second = WorkerLock::acquire(&db).unwrap();
-        if second.is_some() {
-            // Some temp filesystems (observed on macOS CI runners) do not
-            // enforce advisory `flock` across two descriptors of the same
-            // file, so the guard can't be exercised here. Real installs keep
-            // the DB on a local disk where flock works — and the cross-process
-            // behaviour is covered separately — so skip rather than fail
-            // spuriously.
-            eprintln!("skipping worker-lock exclusivity: flock not enforced on this filesystem");
-            return;
-        }
         assert!(
             second.is_none(),
             "second acquire must be refused while held"
