@@ -7093,7 +7093,6 @@ fn cmd_consolidate(
 /// because a consolidated topic collapses to one memory (below the threshold)
 /// and is skipped next time. Never keeps originals — that would defeat the
 /// idempotency the cron use case relies on.
-#[allow(clippy::too_many_arguments)]
 fn cmd_consolidate_all(
     store: &Store,
     threshold: usize,
@@ -7103,6 +7102,31 @@ fn cmd_consolidate_all(
     cli_max_tokens: Option<usize>,
     dry_run: bool,
 ) -> Result<()> {
+    // `threshold = 0` would leave a just-consolidated single-memory topic still
+    // "over" the threshold (1 > 0), so every run re-consolidates everything —
+    // infinite churn on a cron timer. Require >= 1.
+    if threshold == 0 {
+        bail!("--threshold must be >= 1 (0 would re-consolidate every topic on every run)");
+    }
+
+    // Safety guard (see #186): a batch run with the summarizer resolving to
+    // `none` would replace EVERY over-threshold topic with a lexical ' | '
+    // join and delete the originals — a store-wide quality loss from a bare
+    // cron `consolidate-all`. Refuse unless the user explicitly opted into
+    // lexical with `--summarizer-provider none`.
+    let resolved = resolve_consolidate_provider(cfg, cli_provider)?;
+    let explicit_none = cli_provider
+        .map(|p| p.trim().eq_ignore_ascii_case("none"))
+        .unwrap_or(false);
+    if matches!(resolved, summarizer::ProviderKind::None) && !explicit_none {
+        bail!(
+            "consolidate-all would replace every over-threshold topic with a lexical \
+             ' | ' join and delete the originals (summarizer provider resolves to 'none'). \
+             Pass --summarizer-provider <claude|codex|gemini|ollama> for real consolidation, \
+             or --summarizer-provider none to explicitly accept lexical joins."
+        );
+    }
+
     // Snapshot topics up front so consolidating one doesn't perturb iteration.
     let mut candidates: Vec<(String, usize)> = store
         .list_topics_with_prefix(None)?
@@ -9336,6 +9360,28 @@ mod hook_start_tests {
             5,
             "dry-run must not consolidate"
         );
+    }
+
+    #[test]
+    fn consolidate_all_guards_lexical_and_zero_threshold() {
+        use icm_core::{Importance, Memory};
+        let store = icm_store::Store::in_memory().unwrap();
+        for i in 0..5 {
+            store
+                .store(Memory::new("t".into(), format!("m{i}"), Importance::Medium))
+                .unwrap();
+        }
+        let cfg = config::SummarizerConfig::default(); // provider defaults to "none"
+                                                       // Bare run (no explicit provider) resolves to none → refuse (a batch
+                                                       // lexical join + delete of originals across the whole store).
+        assert!(cmd_consolidate_all(&store, 3, &cfg, None, None, None, false).is_err());
+        // threshold 0 → refuse.
+        assert!(cmd_consolidate_all(&store, 0, &cfg, Some("none"), None, None, false).is_err());
+        // Neither refused call touched the data.
+        assert_eq!(store.count_by_topic("t").unwrap(), 5);
+        // Explicit `none` is an accepted opt-in and does consolidate.
+        assert!(cmd_consolidate_all(&store, 3, &cfg, Some("none"), None, None, false).is_ok());
+        assert_eq!(store.count_by_topic("t").unwrap(), 1);
     }
 
     #[test]
