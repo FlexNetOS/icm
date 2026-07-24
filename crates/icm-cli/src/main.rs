@@ -328,6 +328,33 @@ enum Commands {
         summarizer_max_tokens: Option<usize>,
     },
 
+    /// Consolidate every topic whose memory count exceeds a threshold
+    /// (issue #179). Idempotent — a consolidated topic drops to one memory
+    /// (below the threshold) and is skipped on the next run. Designed for
+    /// cron / systemd timers / launchd, not interactive use.
+    ConsolidateAll {
+        /// Consolidate topics with more than this many memories.
+        #[arg(long, default_value = "10", value_name = "N")]
+        threshold: usize,
+
+        /// Summarizer provider: auto | claude | codex | gemini | ollama | none
+        /// (overrides `[consolidate.summarizer] provider`).
+        #[arg(long, value_name = "PROVIDER")]
+        summarizer_provider: Option<String>,
+
+        /// Summarizer model (provider-specific). Empty = provider's cheap default.
+        #[arg(long, value_name = "MODEL")]
+        summarizer_model: Option<String>,
+
+        /// Approximate token budget for each consolidated summary.
+        #[arg(long, value_name = "N")]
+        summarizer_max_tokens: Option<usize>,
+
+        /// List the topics that would be consolidated without changing anything.
+        #[arg(long)]
+        dry_run: bool,
+    },
+
     /// Generate embeddings for memories that don't have one yet
     Embed {
         /// Only embed memories in this topic
@@ -1792,6 +1819,21 @@ fn main() -> Result<()> {
             summarizer_provider.as_deref(),
             summarizer_model.as_deref(),
             summarizer_max_tokens,
+        ),
+        Commands::ConsolidateAll {
+            threshold,
+            summarizer_provider,
+            summarizer_model,
+            summarizer_max_tokens,
+            dry_run,
+        } => cmd_consolidate_all(
+            &store,
+            threshold,
+            &cfg.consolidate.summarizer,
+            summarizer_provider.as_deref(),
+            summarizer_model.as_deref(),
+            summarizer_max_tokens,
+            dry_run,
         ),
         Commands::Embed {
             topic,
@@ -7046,6 +7088,75 @@ fn cmd_consolidate(
     Ok(())
 }
 
+/// `icm consolidate-all` — batch-consolidate every topic over `threshold`
+/// (issue #179). Reuses [`cmd_consolidate`] per topic; naturally idempotent
+/// because a consolidated topic collapses to one memory (below the threshold)
+/// and is skipped next time. Never keeps originals — that would defeat the
+/// idempotency the cron use case relies on.
+#[allow(clippy::too_many_arguments)]
+fn cmd_consolidate_all(
+    store: &Store,
+    threshold: usize,
+    cfg: &config::SummarizerConfig,
+    cli_provider: Option<&str>,
+    cli_model: Option<&str>,
+    cli_max_tokens: Option<usize>,
+    dry_run: bool,
+) -> Result<()> {
+    // Snapshot topics up front so consolidating one doesn't perturb iteration.
+    let mut candidates: Vec<(String, usize)> = store
+        .list_topics_with_prefix(None)?
+        .into_iter()
+        .filter(|(_, count)| *count > threshold)
+        .collect();
+    candidates.sort_by_key(|c| std::cmp::Reverse(c.1)); // biggest topics first
+
+    if candidates.is_empty() {
+        println!("No topic has more than {threshold} memories — nothing to consolidate.");
+        return Ok(());
+    }
+
+    if dry_run {
+        println!(
+            "(dry run) Would consolidate {} topic(s) over threshold {threshold}:",
+            candidates.len()
+        );
+        for (topic, count) in &candidates {
+            println!("  - {topic} ({count} memories)");
+        }
+        return Ok(());
+    }
+
+    let mut done = 0usize;
+    let mut failed = 0usize;
+    for (topic, count) in &candidates {
+        println!("[consolidate-all] {topic} ({count} memories)…");
+        match cmd_consolidate(
+            store,
+            topic,
+            false,
+            cfg,
+            cli_provider,
+            cli_model,
+            cli_max_tokens,
+        ) {
+            Ok(()) => done += 1,
+            Err(e) => {
+                eprintln!("[consolidate-all] {topic} failed: {e}");
+                failed += 1;
+            }
+        }
+    }
+
+    println!();
+    if failed == 0 {
+        println!("Consolidated {done} topic(s) over threshold {threshold}.");
+    } else {
+        println!("Consolidated {done} topic(s); {failed} failed (see errors above).");
+    }
+    Ok(())
+}
+
 fn cmd_extract(
     store: &Store,
     embedder: Option<&dyn icm_core::Embedder>,
@@ -9168,6 +9279,63 @@ mod hook_start_tests {
             ))
             .unwrap();
         store
+    }
+
+    #[test]
+    fn consolidate_all_over_threshold_and_idempotent() {
+        // #179: batch-consolidate topics over the threshold; a consolidated
+        // topic drops below it, so re-running is a no-op.
+        use icm_core::{Importance, Memory};
+        let store = icm_store::Store::in_memory().unwrap();
+        let seed = |topic: &str, n: usize| {
+            for i in 0..n {
+                store
+                    .store(Memory::new(
+                        topic.into(),
+                        format!("{topic} memory number {i}"),
+                        Importance::Medium,
+                    ))
+                    .unwrap();
+            }
+        };
+        seed("alpha", 5);
+        seed("beta", 2); // under threshold
+        seed("gamma", 4);
+
+        let cfg = config::SummarizerConfig::default();
+        // provider "none" → deterministic lexical consolidation, no LLM spawn.
+        cmd_consolidate_all(&store, 3, &cfg, Some("none"), None, None, false).unwrap();
+
+        assert_eq!(store.count_by_topic("alpha").unwrap(), 1);
+        assert_eq!(store.count_by_topic("gamma").unwrap(), 1);
+        assert_eq!(
+            store.count_by_topic("beta").unwrap(),
+            2,
+            "under-threshold topic untouched"
+        );
+
+        // Idempotent: nothing left over the threshold.
+        cmd_consolidate_all(&store, 3, &cfg, Some("none"), None, None, false).unwrap();
+        assert_eq!(store.count_by_topic("alpha").unwrap(), 1);
+        assert_eq!(store.count_by_topic("beta").unwrap(), 2);
+    }
+
+    #[test]
+    fn consolidate_all_dry_run_changes_nothing() {
+        use icm_core::{Importance, Memory};
+        let store = icm_store::Store::in_memory().unwrap();
+        for i in 0..5 {
+            store
+                .store(Memory::new("t".into(), format!("m{i}"), Importance::Medium))
+                .unwrap();
+        }
+        let cfg = config::SummarizerConfig::default();
+        cmd_consolidate_all(&store, 3, &cfg, Some("none"), None, None, true).unwrap();
+        assert_eq!(
+            store.count_by_topic("t").unwrap(),
+            5,
+            "dry-run must not consolidate"
+        );
     }
 
     #[test]
