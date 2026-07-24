@@ -5485,6 +5485,10 @@ fn cmd_hook_disable(dry_run: bool) -> Result<()> {
             "Removed {total} ICM hook entr{plural}. \
              MCP config and your memory database are untouched."
         );
+        println!(
+            "Note: edited settings files were reformatted (any JSONC comments dropped); \
+             a timestamped `.icm-bak-*` copy of each original was saved alongside it."
+        );
         println!("Re-enable with: icm init --mode hook");
     }
     Ok(())
