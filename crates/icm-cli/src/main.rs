@@ -761,6 +761,14 @@ enum HookCommands {
     },
     /// SessionEnd hook: extract memories from transcript before the session closes
     End,
+    /// Remove ICM's hooks from every detected AI tool (Claude Code, Gemini,
+    /// Codex, Copilot, OpenCode), keeping the MCP config and your memory DB.
+    /// Reverse of `icm init --mode hook`; re-enable with the same command.
+    Disable {
+        /// Preview what would be removed without modifying anything.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1536,6 +1544,15 @@ fn main() -> Result<()> {
     if let Commands::Repair { dry_run } = command {
         return cmd_repair(&db_path, dry_run);
     }
+    // `icm hook disable` only edits AI-tool settings files — it needs neither
+    // the store nor the DB (and must not create an empty one), so dispatch it
+    // before `open_store` too.
+    if let Commands::Hook {
+        command: HookCommands::Disable { dry_run },
+    } = &command
+    {
+        return cmd_hook_disable(*dry_run);
+    }
 
     let store = if read_only_requested(cli.read_only) {
         open_store_readonly(cli_db)?
@@ -2016,6 +2033,7 @@ fn main() -> Result<()> {
                 HookCommands::Prompt => "prompt",
                 HookCommands::Start { .. } => "start",
                 HookCommands::End => "end",
+                HookCommands::Disable { .. } => "disable",
             };
             let started = std::time::Instant::now();
             let result = match command {
@@ -2060,6 +2078,9 @@ fn main() -> Result<()> {
                     let emb_ref: Option<&dyn icm_core::Embedder> = None;
                     cmd_hook_end(&store, emb_ref, &cfg.memory, &cfg.extraction.summarizer)
                 }
+                // Dispatched before `open_store`; this arm only exists for
+                // match exhaustiveness and is unreachable.
+                HookCommands::Disable { dry_run } => cmd_hook_disable(dry_run),
             };
             let duration_ms = started.elapsed().as_millis().min(i64::MAX as u128) as i64;
             let exit_code = if result.is_ok() { 0 } else { 1 };
@@ -5308,19 +5329,184 @@ fn check_opencode_plugin(home: &str) -> usize {
     }
 }
 
-fn cmd_doctor(db_path: &std::path::Path) -> Result<()> {
-    let home = home_dir_str()?;
-    let current_bin = std::env::current_exe().ok();
+/// Back up a settings file before mutating it (#268). Returns the backup path.
+fn backup_settings_file(path: &std::path::Path) -> Result<PathBuf> {
+    let ts = chrono::Utc::now().format("%Y%m%d-%H%M%S");
+    let mut name = path.as_os_str().to_os_string();
+    name.push(format!(".icm-bak-{ts}"));
+    let backup = PathBuf::from(name);
+    std::fs::copy(path, &backup)
+        .with_context(|| format!("backing up {} to {}", path.display(), backup.display()))?;
+    Ok(backup)
+}
 
-    // Claude Code, Gemini CLI, and Codex CLI all use the
-    // `{hooks:{Event:[{hooks:[{command:...}]}]}}` shape but at different
-    // paths and event names. Copilot CLI uses the same outer shape but
-    // its hook entries put the command in a top-level `bash` field
-    // instead of nesting under `hooks[]`.
-    let targets: Vec<DoctorTarget> = vec![
+/// Remove ICM hook entries from one tool's settings JSON (#268), preserving
+/// every non-ICM hook and the rest of the file. Returns how many ICM hook
+/// entries were removed.
+fn disable_hooks_in_target(target: &DoctorTarget, dry_run: bool) -> Result<usize> {
+    if !target.path.exists() {
+        return Ok(0);
+    }
+    let mut config = match parse_json_config(&target.path) {
+        Ok(v) => v,
+        Err(e) => {
+            println!(
+                "[{}] {}: parse error ({e}), skipped",
+                target.label,
+                target.path.display()
+            );
+            return Ok(0);
+        }
+    };
+
+    let mut removed = 0usize;
+    if let Some(hooks) = config.get_mut("hooks").and_then(|h| h.as_object_mut()) {
+        for event in target.events {
+            let Some(arr) = hooks.get_mut(*event).and_then(|v| v.as_array_mut()) else {
+                continue;
+            };
+            match target.field {
+                HookCommandField::Command => {
+                    // Filter ICM commands out of each entry's inner hooks[].
+                    for entry in arr.iter_mut() {
+                        if let Some(inner) = entry.get_mut("hooks").and_then(|h| h.as_array_mut()) {
+                            let before = inner.len();
+                            inner.retain(|h| {
+                                h.get("command")
+                                    .and_then(|c| c.as_str())
+                                    .map(|cmd| check_icm_hook_command(cmd).is_none())
+                                    .unwrap_or(true)
+                            });
+                            removed += before - inner.len();
+                        }
+                    }
+                    // Drop entries whose hooks[] became empty.
+                    arr.retain(|entry| {
+                        entry
+                            .get("hooks")
+                            .and_then(|h| h.as_array())
+                            .map(|inner| !inner.is_empty())
+                            .unwrap_or(true)
+                    });
+                }
+                HookCommandField::BashTopLevel => {
+                    let before = arr.len();
+                    arr.retain(|entry| {
+                        entry
+                            .get("bash")
+                            .and_then(|c| c.as_str())
+                            .map(|cmd| check_icm_hook_command(cmd).is_none())
+                            .unwrap_or(true)
+                    });
+                    removed += before - arr.len();
+                }
+            }
+        }
+        // Drop now-empty event arrays so we don't leave `"Event": []` behind.
+        let empty_events: Vec<String> = target
+            .events
+            .iter()
+            .filter(|e| {
+                hooks
+                    .get(**e)
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.is_empty())
+                    .unwrap_or(false)
+            })
+            .map(|e| (*e).to_string())
+            .collect();
+        for e in empty_events {
+            hooks.remove(e.as_str());
+        }
+    }
+
+    if removed == 0 {
+        println!("[{}] no ICM hooks", target.label);
+        return Ok(0);
+    }
+    if dry_run {
+        println!(
+            "[{}] would remove {removed} ICM hook(s) from {}",
+            target.label,
+            target.path.display()
+        );
+        return Ok(removed);
+    }
+    let backup = backup_settings_file(&target.path)?;
+    let output = serde_json::to_string_pretty(&config)?;
+    std::fs::write(&target.path, output)
+        .with_context(|| format!("writing {}", target.path.display()))?;
+    println!(
+        "[{}] removed {removed} ICM hook(s) (backup: {})",
+        target.label,
+        backup.display()
+    );
+    Ok(removed)
+}
+
+/// Remove the OpenCode ICM plugin file, disabling that integration (#268).
+/// Returns 1 if a plugin was removed.
+fn disable_opencode_plugin(home: &str, dry_run: bool) -> Result<usize> {
+    let plugin = PathBuf::from(home).join(".config/opencode/plugins/icm.ts");
+    if !plugin.exists() {
+        return Ok(0);
+    }
+    if dry_run {
+        println!("[OpenCode] would remove plugin {}", plugin.display());
+        return Ok(1);
+    }
+    std::fs::remove_file(&plugin).with_context(|| format!("removing {}", plugin.display()))?;
+    println!("[OpenCode] removed plugin {}", plugin.display());
+    Ok(1)
+}
+
+/// `icm hook disable` — remove ICM's hooks from every detected AI tool while
+/// preserving the MCP server config and your memory DB (#268). Reversible via
+/// `icm init --mode hook`.
+fn cmd_hook_disable(dry_run: bool) -> Result<()> {
+    let home = home_dir_str()?;
+    let mut total = 0usize;
+    for target in hook_targets(&home) {
+        total += disable_hooks_in_target(&target, dry_run)?;
+    }
+    total += disable_opencode_plugin(&home, dry_run)?;
+
+    let plural = if total == 1 { "y" } else { "ies" };
+    println!();
+    if total == 0 {
+        println!("No ICM hooks found — nothing to disable.");
+    } else if dry_run {
+        println!(
+            "(dry run) Would remove {total} ICM hook entr{plural}. \
+             MCP config and your memory database would be left untouched."
+        );
+    } else {
+        println!(
+            "Removed {total} ICM hook entr{plural}. \
+             MCP config and your memory database are untouched."
+        );
+        println!(
+            "Note: edited settings files were reformatted (any JSONC comments dropped); \
+             a timestamped `.icm-bak-*` copy of each original was saved alongside it."
+        );
+        println!("Re-enable with: icm init --mode hook");
+    }
+    Ok(())
+}
+
+/// The per-tool hook configuration layouts ICM writes to. Shared by
+/// `icm doctor` (inspect) and `icm hook disable` (remove).
+///
+/// Claude Code, Gemini CLI, and Codex CLI all use the
+/// `{hooks:{Event:[{hooks:[{command:...}]}]}}` shape but at different paths
+/// and event names. Copilot CLI uses the same outer shape but its hook
+/// entries put the command in a top-level `bash` field instead of nesting
+/// under `hooks[]`.
+fn hook_targets(home: &str) -> Vec<DoctorTarget> {
+    vec![
         DoctorTarget {
             label: "Claude Code",
-            path: PathBuf::from(&home).join(".claude/settings.json"),
+            path: PathBuf::from(home).join(".claude/settings.json"),
             events: &[
                 "PreToolUse",
                 "PostToolUse",
@@ -5333,7 +5519,7 @@ fn cmd_doctor(db_path: &std::path::Path) -> Result<()> {
         },
         DoctorTarget {
             label: "Gemini CLI",
-            path: PathBuf::from(&home).join(".gemini/settings.json"),
+            path: PathBuf::from(home).join(".gemini/settings.json"),
             events: &[
                 "SessionStart",
                 "BeforeTool",
@@ -5345,7 +5531,7 @@ fn cmd_doctor(db_path: &std::path::Path) -> Result<()> {
         },
         DoctorTarget {
             label: "Codex CLI",
-            path: PathBuf::from(&home).join(".codex/hooks.json"),
+            path: PathBuf::from(home).join(".codex/hooks.json"),
             events: &[
                 "SessionStart",
                 "PreToolUse",
@@ -5356,7 +5542,7 @@ fn cmd_doctor(db_path: &std::path::Path) -> Result<()> {
         },
         DoctorTarget {
             label: "Copilot CLI",
-            path: PathBuf::from(&home).join(".copilot/settings.json"),
+            path: PathBuf::from(home).join(".copilot/settings.json"),
             events: &[
                 "sessionStart",
                 "preToolUse",
@@ -5365,7 +5551,14 @@ fn cmd_doctor(db_path: &std::path::Path) -> Result<()> {
             ],
             field: HookCommandField::BashTopLevel,
         },
-    ];
+    ]
+}
+
+fn cmd_doctor(db_path: &std::path::Path) -> Result<()> {
+    let home = home_dir_str()?;
+    let current_bin = std::env::current_exe().ok();
+
+    let targets = hook_targets(&home);
 
     let mut broken = 0usize;
     let mut checked = 0usize;
@@ -8975,6 +9168,73 @@ mod hook_start_tests {
             ))
             .unwrap();
         store
+    }
+
+    #[test]
+    fn hook_disable_removes_only_icm_hooks() {
+        // #268: `icm hook disable` strips ICM hook entries and nothing else.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::write(
+            &path,
+            r#"{
+              "hooks": {
+                "PostToolUse": [
+                  {"hooks": [{"type": "command", "command": "/x/icm hook post"}]},
+                  {"hooks": [{"type": "command", "command": "/y/othertool run"}]}
+                ],
+                "SessionEnd": [
+                  {"hooks": [{"type": "command", "command": "/x/icm hook end"}]}
+                ]
+              },
+              "mcpServers": {"icm": {"command": "icm"}},
+              "otherSetting": true
+            }"#,
+        )
+        .unwrap();
+
+        let target = DoctorTarget {
+            label: "Test",
+            path: path.clone(),
+            events: &["PostToolUse", "SessionEnd"],
+            field: HookCommandField::Command,
+        };
+        let removed = disable_hooks_in_target(&target, false).unwrap();
+        assert_eq!(removed, 2, "both ICM hooks should be removed");
+
+        let after: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        // The non-ICM hook survives.
+        let post = after["hooks"]["PostToolUse"].as_array().unwrap();
+        assert_eq!(post.len(), 1);
+        assert!(post[0]["hooks"][0]["command"]
+            .as_str()
+            .unwrap()
+            .contains("othertool"));
+        // The ICM-only event is dropped entirely.
+        assert!(after["hooks"].get("SessionEnd").is_none());
+        // MCP config and unrelated settings are untouched.
+        assert!(after.get("mcpServers").is_some());
+        assert_eq!(after["otherSetting"], serde_json::json!(true));
+
+        // Idempotent: a second run finds nothing to remove.
+        assert_eq!(disable_hooks_in_target(&target, false).unwrap(), 0);
+    }
+
+    #[test]
+    fn hook_disable_dry_run_does_not_modify() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let original = r#"{"hooks":{"PostToolUse":[{"hooks":[{"type":"command","command":"/x/icm hook post"}]}]}}"#;
+        std::fs::write(&path, original).unwrap();
+        let target = DoctorTarget {
+            label: "Test",
+            path: path.clone(),
+            events: &["PostToolUse"],
+            field: HookCommandField::Command,
+        };
+        assert_eq!(disable_hooks_in_target(&target, true).unwrap(), 1);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
     }
 
     #[test]
