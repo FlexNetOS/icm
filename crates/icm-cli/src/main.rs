@@ -3960,19 +3960,21 @@ fn build_hook_start_pack(store: &Store, stdin_json: &str, max_tokens: usize) -> 
         include_preferences: true,
     };
 
-    // Prefer a cached LLM briefing (issue #165) over the static semantic pack
-    // when the user has generated one — same identity snapshot above, richer
-    // narrative here, and no store scan for the pack.
-    let pack = match load_cached_briefing(project_name.as_deref()) {
-        Some(briefing) => briefing,
-        None => icm_core::build_wake_up(store, &opts)?,
-    };
+    // Compute the live static pack first, so its emptiness reflects the CURRENT
+    // store — the "start clean on empty store" guarantee must not be bypassed
+    // by a stale cache (a briefing whose memories were since pruned/forgotten).
+    let live_pack = icm_core::build_wake_up(store, &opts)?;
+    let wake_up_empty =
+        live_pack.trim().is_empty() || live_pack.starts_with(icm_core::EMPTY_PACK_HEADER);
 
-    // If the store is empty, skip injecting the placeholder output into the
-    // session — let the user start clean. We detect the empty case via the
-    // exported header constant, not substring matching the body, to stay
-    // decoupled from the exact wording in `icm_core::wake_up::render()`.
-    let wake_up_empty = pack.trim().is_empty() || pack.starts_with(icm_core::EMPTY_PACK_HEADER);
+    // Prefer a cached LLM briefing (issue #165) over the static semantic pack —
+    // but only when the live store actually has content for this project, so an
+    // empty store still starts clean.
+    let pack = if wake_up_empty {
+        live_pack
+    } else {
+        load_cached_briefing(project_name.as_deref()).unwrap_or(live_pack)
+    };
 
     if wake_up_empty && snapshot.is_empty() {
         return Ok(String::new());
@@ -7562,12 +7564,18 @@ fn cmd_wake_up(
         include_preferences: !no_preferences,
     };
 
-    // Prefer a cached LLM briefing when one exists (issue #165); otherwise
-    // render the static bullet pack. The `--format`/budget options apply to
-    // the static fallback — a cached briefing is emitted as generated.
-    let pack = match load_cached_briefing(project_ref) {
-        Some(briefing) => briefing,
-        None => build_wake_up(store, &opts)?,
+    // Prefer a cached LLM briefing when one exists (issue #165) — but only when
+    // the live store has content for this project, so an empty/pruned store
+    // isn't masked by a stale cache. The `--format`/`--no-preferences`/budget
+    // options apply to the static fallback; a cached briefing is emitted as
+    // generated (regenerate with `icm briefing` to reflect option changes).
+    let live_pack = build_wake_up(store, &opts)?;
+    let live_empty =
+        live_pack.trim().is_empty() || live_pack.starts_with(icm_core::EMPTY_PACK_HEADER);
+    let pack = if live_empty {
+        live_pack
+    } else {
+        load_cached_briefing(project_ref).unwrap_or(live_pack)
     };
     print!("{pack}");
     Ok(())
