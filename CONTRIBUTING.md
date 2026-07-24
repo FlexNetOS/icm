@@ -135,17 +135,6 @@ Every change **must** include tests where it has a runtime surface. See [Testing
 
 Update docs for new features and changes to already-documented behavior.
 
-### Contributor License Agreement (CLA)
-
-All contributions require signing our **Contributor License Agreement (CLA)** before being merged.
-
-By signing, you certify that:
-- You have authored 100% of the contribution, or have the necessary rights to submit it.
-- You grant **rtk-ai** and **rtk-ai Labs** a perpetual, worldwide, royalty-free license to use your contribution — including in commercial products such as **rtk Pro** — under the [Apache License 2.0](LICENSE).
-- If your employer has rights over your work, you have obtained their permission.
-
-**This is automatic.** When you open a Pull Request, [CLA Assistant](https://cla-assistant.io) will post a comment asking you to sign. Click the link in that comment to sign with your GitHub account. You only need to sign once.
-
 ### 5. Target `develop`
 
 Open your Pull Request against the **`develop`** branch. `main` is reserved for stable releases — only maintainer `develop` → `main` PRs (cut via release-please) target it.
