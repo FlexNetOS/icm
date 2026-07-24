@@ -7,7 +7,7 @@ use icm_core::Embedder;
 use icm_store::Store;
 
 use crate::protocol::{JsonRpcMessage, JsonRpcResponse};
-use crate::tools;
+use crate::tools::{self, AutoConsolidate};
 
 const SERVER_NAME: &str = "icm";
 const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -25,6 +25,7 @@ pub fn run_server(
     store: &Store,
     embedder: Option<&dyn Embedder>,
     compact: bool,
+    auto_consolidate: AutoConsolidate,
 ) -> anyhow::Result<()> {
     let stdin = io::stdin();
     let mut stdout = io::stdout();
@@ -85,6 +86,7 @@ pub fn run_server(
                 store,
                 embedder,
                 compact,
+                auto_consolidate,
                 &mut calls_since_store,
             ),
             other => JsonRpcResponse::method_not_found(id, other),
@@ -149,6 +151,7 @@ fn handle_tools_call(
     store: &Store,
     embedder: Option<&dyn Embedder>,
     compact: bool,
+    auto_consolidate: AutoConsolidate,
     calls_since_store: &mut u32,
 ) -> JsonRpcResponse {
     let params = match params {
@@ -174,7 +177,8 @@ fn handle_tools_call(
         *calls_since_store += 1;
     }
 
-    let mut result = tools::call_tool(store, embedder, tool_name, &args, compact);
+    let mut result =
+        tools::call_tool_with_config(store, embedder, tool_name, &args, compact, auto_consolidate);
 
     // Nudge: append a store reminder if too many calls without storing
     if *calls_since_store >= STORE_NUDGE_THRESHOLD && tool_name != "icm_memory_store" {

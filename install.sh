@@ -83,6 +83,35 @@ detect_arch() {
     esac
 }
 
+# Choose the Linux libc flavor (issue #330). The default `unknown-linux-gnu`
+# binaries are built on glibc 2.35 and carry embeddings; systems older than
+# that — or musl distros like Alpine — can't run them, so fall back to the
+# fully-static `unknown-linux-musl` build (keyword search only, no embeddings).
+# musl artifacts are published for x86_64 only.
+select_linux_libc() {
+    if [ "$ARCH" != "x86_64" ]; then
+        TARGET_SUFFIX="unknown-linux-gnu"
+        return
+    fi
+    ldd_out=$(ldd --version 2>&1 | head -1)
+    if printf '%s' "$ldd_out" | grep -qi musl; then
+        TARGET_SUFFIX="unknown-linux-musl"
+        return
+    fi
+    glibc_ver=$(printf '%s' "$ldd_out" | grep -oE '[0-9]+\.[0-9]+' | tail -1)
+    if [ -n "$glibc_ver" ]; then
+        glibc_major=${glibc_ver%%.*}
+        glibc_minor=${glibc_ver#*.}
+        if [ "$glibc_major" -lt 2 ] || { [ "$glibc_major" -eq 2 ] && [ "$glibc_minor" -lt 35 ]; }; then
+            TARGET_SUFFIX="unknown-linux-musl"
+            return
+        fi
+    fi
+    # Modern glibc (>= 2.35, e.g. Debian 12+/Ubuntu 22.04+) or undetectable:
+    # keep the full-featured gnu build.
+    TARGET_SUFFIX="unknown-linux-gnu"
+}
+
 require() {
     command -v "$1" >/dev/null 2>&1 || error "$1 is required but not installed"
 }
@@ -127,6 +156,13 @@ The download was tampered with or corrupted."
 }
 
 install_binary() {
+    # On Linux, pick gnu vs static-musl based on the running libc (#330).
+    if [ "$OS" = "linux" ]; then
+        select_linux_libc
+        if [ "$TARGET_SUFFIX" = "unknown-linux-musl" ]; then
+            info "Old or musl libc detected — installing the fully-static build (keyword search only; no embeddings)."
+        fi
+    fi
     TARGET="${ARCH}-${TARGET_SUFFIX}"
 
     if [ "$OS" = "windows" ]; then

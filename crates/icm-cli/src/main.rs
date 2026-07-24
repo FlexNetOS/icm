@@ -328,6 +328,33 @@ enum Commands {
         summarizer_max_tokens: Option<usize>,
     },
 
+    /// Consolidate every topic whose memory count exceeds a threshold
+    /// (issue #179). Idempotent — a consolidated topic drops to one memory
+    /// (below the threshold) and is skipped on the next run. Designed for
+    /// cron / systemd timers / launchd, not interactive use.
+    ConsolidateAll {
+        /// Consolidate topics with more than this many memories.
+        #[arg(long, default_value = "10", value_name = "N")]
+        threshold: usize,
+
+        /// Summarizer provider: auto | claude | codex | gemini | ollama | none
+        /// (overrides `[consolidate.summarizer] provider`).
+        #[arg(long, value_name = "PROVIDER")]
+        summarizer_provider: Option<String>,
+
+        /// Summarizer model (provider-specific). Empty = provider's cheap default.
+        #[arg(long, value_name = "MODEL")]
+        summarizer_model: Option<String>,
+
+        /// Approximate token budget for each consolidated summary.
+        #[arg(long, value_name = "N")]
+        summarizer_max_tokens: Option<usize>,
+
+        /// List the topics that would be consolidated without changing anything.
+        #[arg(long)]
+        dry_run: bool,
+    },
+
     /// Generate embeddings for memories that don't have one yet
     Embed {
         /// Only embed memories in this topic
@@ -391,8 +418,20 @@ enum Commands {
         with_codex_post_hook: bool,
     },
 
-    /// Diagnose ICM integration: check hook binary paths in Claude Code settings
+    /// Diagnose ICM integration: hook binary paths + SQLite database integrity
     Doctor,
+
+    /// Repair a corrupt SQLite memory database (issue #313).
+    ///
+    /// Backs the DB up first, then rebuilds FTS shadow tables and REINDEXes —
+    /// the common corruption class (damaged indexes/FTS, intact base tables).
+    /// Re-runs `integrity_check` and reports honestly whether the DB is now
+    /// healthy or base-table damage remains.
+    Repair {
+        /// Report what would happen (integrity status) without modifying the DB.
+        #[arg(long)]
+        dry_run: bool,
+    },
 
     /// Reverse `icm init`: remove ICM config from every detected AI tool.
     ///
@@ -525,6 +564,29 @@ enum Commands {
         /// Exclude global preferences/identity memories
         #[arg(long)]
         no_preferences: bool,
+    },
+
+    /// Compile the project's memories into an LLM wake-up briefing and cache it
+    /// (issue #165). `wake-up` and the SessionStart hook then load the cached
+    /// briefing with zero added latency. Regenerate on demand (cron / hook).
+    Briefing {
+        /// Project (default: auto-detect from PWD/git remote).
+        #[arg(short, long)]
+        project: Option<String>,
+
+        /// Summarizer provider: auto | claude | codex | gemini | ollama
+        /// (overrides `[consolidate.summarizer] provider`). `none` is rejected
+        /// — a briefing needs an LLM.
+        #[arg(long, value_name = "PROVIDER")]
+        summarizer_provider: Option<String>,
+
+        /// Summarizer model (provider-specific). Empty = provider's cheap default.
+        #[arg(long, value_name = "MODEL")]
+        summarizer_model: Option<String>,
+
+        /// Approximate token budget for the briefing.
+        #[arg(long, value_name = "N")]
+        summarizer_max_tokens: Option<usize>,
     },
 
     /// Print the deterministic identity/preferences snapshot (issue #271)
@@ -749,6 +811,14 @@ enum HookCommands {
     },
     /// SessionEnd hook: extract memories from transcript before the session closes
     End,
+    /// Remove ICM's hooks from every detected AI tool (Claude Code, Gemini,
+    /// Codex, Copilot, OpenCode), keeping the MCP config and your memory DB.
+    /// Reverse of `icm init --mode hook`; re-enable with the same command.
+    Disable {
+        /// Preview what would be removed without modifying anything.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1497,8 +1567,9 @@ fn main() -> Result<()> {
         }
     }
     let cli_db: Option<PathBuf> = cli.db.into_iter().next();
-    // `db_path` is consumed only by some feature-gated commands (e.g. the
-    // embeddings-only `embed`), so it can be unused in lean builds.
+    // `db_path` feeds the extract-pending worker lock (#322) and some
+    // feature-gated commands (e.g. the embeddings-only `embed`); it can be
+    // unused in the leanest builds.
     #[allow(unused_variables)]
     let db_path = cli_db.clone().unwrap_or_else(default_db_path);
 
@@ -1511,6 +1582,26 @@ fn main() -> Result<()> {
     if let Commands::Uninstall(opts) = command {
         let code = uninstall::run(opts)?;
         std::process::exit(code);
+    }
+
+    // `icm doctor` and `icm repair` must run BEFORE the normal store open:
+    // a corrupt DB (#313) makes `open_store` fail ("database disk image is
+    // malformed") before dispatch is ever reached, which is exactly when the
+    // user needs these commands. They open their own maintenance connection.
+    if let Commands::Doctor = command {
+        return cmd_doctor(&db_path);
+    }
+    if let Commands::Repair { dry_run } = command {
+        return cmd_repair(&db_path, dry_run);
+    }
+    // `icm hook disable` only edits AI-tool settings files — it needs neither
+    // the store nor the DB (and must not create an empty one), so dispatch it
+    // before `open_store` too.
+    if let Commands::Hook {
+        command: HookCommands::Disable { dry_run },
+    } = &command
+    {
+        return cmd_hook_disable(*dry_run);
     }
 
     let store = if read_only_requested(cli.read_only) {
@@ -1732,6 +1823,7 @@ fn main() -> Result<()> {
                 provider.as_deref(),
                 model.as_deref(),
                 dry_run,
+                &db_path,
             )
         }
         Commands::Decay { factor } => cmd_decay(&store, factor),
@@ -1750,6 +1842,21 @@ fn main() -> Result<()> {
             summarizer_provider.as_deref(),
             summarizer_model.as_deref(),
             summarizer_max_tokens,
+        ),
+        Commands::ConsolidateAll {
+            threshold,
+            summarizer_provider,
+            summarizer_model,
+            summarizer_max_tokens,
+            dry_run,
+        } => cmd_consolidate_all(
+            &store,
+            threshold,
+            &cfg.consolidate.summarizer,
+            summarizer_provider.as_deref(),
+            summarizer_model.as_deref(),
+            summarizer_max_tokens,
+            dry_run,
         ),
         Commands::Embed {
             topic,
@@ -1821,7 +1928,10 @@ fn main() -> Result<()> {
             per_project,
             with_codex_post_hook,
         } => cmd_init(mode, force, per_project, with_codex_post_hook),
-        Commands::Doctor => cmd_doctor(),
+        // Doctor and Repair are dispatched before `open_store` above; these
+        // arms exist only for match exhaustiveness and are unreachable.
+        Commands::Doctor => cmd_doctor(&db_path),
+        Commands::Repair { dry_run } => cmd_repair(&db_path, dry_run),
         Commands::Uninstall(_) => unreachable!("dispatched before open_store"),
         Commands::CodeAreas {
             in_file,
@@ -1875,6 +1985,19 @@ fn main() -> Result<()> {
             format,
             no_preferences,
         } => cmd_wake_up(&store, project, max_tokens, format, no_preferences),
+        Commands::Briefing {
+            project,
+            summarizer_provider,
+            summarizer_model,
+            summarizer_max_tokens,
+        } => cmd_briefing(
+            &store,
+            project,
+            &cfg.consolidate.summarizer,
+            summarizer_provider.as_deref(),
+            summarizer_model.as_deref(),
+            summarizer_max_tokens,
+        ),
         Commands::Context {
             project,
             max_tokens,
@@ -1958,7 +2081,15 @@ fn main() -> Result<()> {
             let emb_ref: Option<&dyn icm_core::Embedder> = None;
             // --compact flag overrides, otherwise use config (default: true)
             let use_compact = compact || cfg.mcp.compact;
-            icm_mcp::run_server(&store, emb_ref, use_compact)
+            // Honor the auto-consolidation config on the MCP store path
+            // (issue #318): previously it was hardcoded always-on at 10,
+            // ignoring an explicit `auto_consolidate_enabled = false` and
+            // destructively rolling up topics. Default config disables it.
+            let auto_consolidate = icm_mcp::AutoConsolidate {
+                enabled: cfg.memory.auto_consolidate_enabled,
+                threshold: cfg.memory.auto_consolidate_threshold,
+            };
+            icm_mcp::run_server(&store, emb_ref, use_compact, auto_consolidate)
         }
         Commands::HookLog {
             limit,
@@ -1980,6 +2111,7 @@ fn main() -> Result<()> {
                 HookCommands::Prompt => "prompt",
                 HookCommands::Start { .. } => "start",
                 HookCommands::End => "end",
+                HookCommands::Disable { .. } => "disable",
             };
             let started = std::time::Instant::now();
             let result = match command {
@@ -2024,6 +2156,9 @@ fn main() -> Result<()> {
                     let emb_ref: Option<&dyn icm_core::Embedder> = None;
                     cmd_hook_end(&store, emb_ref, &cfg.memory, &cfg.extraction.summarizer)
                 }
+                // Dispatched before `open_store`; this arm only exists for
+                // match exhaustiveness and is unreachable.
+                HookCommands::Disable { dry_run } => cmd_hook_disable(dry_run),
             };
             let duration_ms = started.elapsed().as_millis().min(i64::MAX as u128) as i64;
             let exit_code = if result.is_ok() { 0 } else { 1 };
@@ -2916,10 +3051,19 @@ fn read_transcript_capped(path: &str) -> std::io::Result<String> {
 /// non-UTF-8 input, which violates the Claude Code hook contract
 /// ("never block the user, never crash"). Audit #185 M (Hooks
 /// robustness).
+/// Max bytes read from hook stdin (a JSON event payload). Bounds memory so a
+/// pathological/hostile stdin can't exhaust it (security review, belt-and-
+/// suspenders — the caller is normally the trusted tool harness).
+const MAX_HOOK_STDIN_BYTES: u64 = 32 * 1024 * 1024;
+
 fn read_stdin_utf8_lossy() -> Option<String> {
     use std::io::Read;
     let mut bytes = Vec::new();
-    if std::io::stdin().read_to_end(&mut bytes).is_err() {
+    if std::io::stdin()
+        .take(MAX_HOOK_STDIN_BYTES)
+        .read_to_end(&mut bytes)
+        .is_err()
+    {
         return None;
     }
     String::from_utf8(bytes).ok()
@@ -3357,6 +3501,17 @@ fn cmd_hook_end(
     memory_cfg: &crate::config::MemoryConfig,
     extraction_summarizer: &crate::config::SummarizerConfig,
 ) -> Result<()> {
+    // Reentrancy guard (#322): if this hook is firing inside an
+    // ICM-spawned worker subtree, do nothing. The summarizer's
+    // `claude -p` child sets `ICM_WORKER=1`, which every hook it triggers
+    // inherits. Without this guard, that child's own SessionEnd would fork
+    // another worker → another `claude -p` → an unbounded, self-sustaining
+    // spawn loop (thermal runaway). A worker session has no durable
+    // transcript worth extracting anyway.
+    if std::env::var_os("ICM_WORKER").is_some() {
+        return Ok(());
+    }
+
     // Async path: when a provider is configured, drain the
     // pending_extractions queue in a detached subprocess and return
     // immediately so Claude Code doesn't kill us with "Hook cancelled".
@@ -3369,6 +3524,9 @@ fn cmd_hook_end(
             // config so it picks up the same provider.
             let mut cmd = std::process::Command::new(&self_path);
             cmd.arg("extract-pending").arg("--limit").arg("20");
+            // Mark the worker subtree (#322) so any hook fired by an LLM
+            // CLI it spawns short-circuits instead of forking again.
+            cmd.env("ICM_WORKER", "1");
             cmd.stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null());
@@ -3811,13 +3969,21 @@ fn build_hook_start_pack(store: &Store, stdin_json: &str, max_tokens: usize) -> 
         include_preferences: true,
     };
 
-    let pack = icm_core::build_wake_up(store, &opts)?;
+    // Compute the live static pack first, so its emptiness reflects the CURRENT
+    // store — the "start clean on empty store" guarantee must not be bypassed
+    // by a stale cache (a briefing whose memories were since pruned/forgotten).
+    let live_pack = icm_core::build_wake_up(store, &opts)?;
+    let wake_up_empty =
+        live_pack.trim().is_empty() || live_pack.starts_with(icm_core::EMPTY_PACK_HEADER);
 
-    // If the store is empty, skip injecting the placeholder output into the
-    // session — let the user start clean. We detect the empty case via the
-    // exported header constant, not substring matching the body, to stay
-    // decoupled from the exact wording in `icm_core::wake_up::render()`.
-    let wake_up_empty = pack.trim().is_empty() || pack.starts_with(icm_core::EMPTY_PACK_HEADER);
+    // Prefer a cached LLM briefing (issue #165) over the static semantic pack —
+    // but only when the live store actually has content for this project, so an
+    // empty store still starts clean.
+    let pack = if wake_up_empty {
+        live_pack
+    } else {
+        load_cached_briefing(project_name.as_deref()).unwrap_or(live_pack)
+    };
 
     if wake_up_empty && snapshot.is_empty() {
         return Ok(String::new());
@@ -5162,10 +5328,26 @@ struct DoctorTarget {
 /// Inspect a single hook command string. Returns `Some((bin_path, exists))`
 /// if the command references ICM, `None` if it should be skipped.
 fn check_icm_hook_command(cmd: &str) -> Option<(&str, bool)> {
+    let bin_path = cmd.split_whitespace().next().unwrap_or("");
+    // Harden against false positives (security review): require the invoked
+    // *binary* to actually be an icm binary, not merely a command that mentions
+    // "icm hook" somewhere (e.g. a note/arg of an unrelated tool). Otherwise
+    // `icm hook disable` could strip a legitimate non-ICM hook.
+    let base = bin_path
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(bin_path)
+        .to_ascii_lowercase();
+    let is_icm_binary = base == "icm"
+        || base == "icm.exe"
+        || base.starts_with("icm-post-tool")
+        || base.starts_with("icm-pretool");
+    if !is_icm_binary {
+        return None;
+    }
     if !cmd_matches_icm_pattern(cmd, "icm hook") && !cmd_matches_icm_pattern(cmd, "icm-post-tool") {
         return None;
     }
-    let bin_path = cmd.split_whitespace().next().unwrap_or("");
     let exists = std::path::Path::new(bin_path).exists();
     Some((bin_path, exists))
 }
@@ -5258,19 +5440,184 @@ fn check_opencode_plugin(home: &str) -> usize {
     }
 }
 
-fn cmd_doctor() -> Result<()> {
-    let home = home_dir_str()?;
-    let current_bin = std::env::current_exe().ok();
+/// Back up a settings file before mutating it (#268). Returns the backup path.
+fn backup_settings_file(path: &std::path::Path) -> Result<PathBuf> {
+    let ts = chrono::Utc::now().format("%Y%m%d-%H%M%S");
+    let mut name = path.as_os_str().to_os_string();
+    name.push(format!(".icm-bak-{ts}"));
+    let backup = PathBuf::from(name);
+    std::fs::copy(path, &backup)
+        .with_context(|| format!("backing up {} to {}", path.display(), backup.display()))?;
+    Ok(backup)
+}
 
-    // Claude Code, Gemini CLI, and Codex CLI all use the
-    // `{hooks:{Event:[{hooks:[{command:...}]}]}}` shape but at different
-    // paths and event names. Copilot CLI uses the same outer shape but
-    // its hook entries put the command in a top-level `bash` field
-    // instead of nesting under `hooks[]`.
-    let targets: Vec<DoctorTarget> = vec![
+/// Remove ICM hook entries from one tool's settings JSON (#268), preserving
+/// every non-ICM hook and the rest of the file. Returns how many ICM hook
+/// entries were removed.
+fn disable_hooks_in_target(target: &DoctorTarget, dry_run: bool) -> Result<usize> {
+    if !target.path.exists() {
+        return Ok(0);
+    }
+    let mut config = match parse_json_config(&target.path) {
+        Ok(v) => v,
+        Err(e) => {
+            println!(
+                "[{}] {}: parse error ({e}), skipped",
+                target.label,
+                target.path.display()
+            );
+            return Ok(0);
+        }
+    };
+
+    let mut removed = 0usize;
+    if let Some(hooks) = config.get_mut("hooks").and_then(|h| h.as_object_mut()) {
+        for event in target.events {
+            let Some(arr) = hooks.get_mut(*event).and_then(|v| v.as_array_mut()) else {
+                continue;
+            };
+            match target.field {
+                HookCommandField::Command => {
+                    // Filter ICM commands out of each entry's inner hooks[].
+                    for entry in arr.iter_mut() {
+                        if let Some(inner) = entry.get_mut("hooks").and_then(|h| h.as_array_mut()) {
+                            let before = inner.len();
+                            inner.retain(|h| {
+                                h.get("command")
+                                    .and_then(|c| c.as_str())
+                                    .map(|cmd| check_icm_hook_command(cmd).is_none())
+                                    .unwrap_or(true)
+                            });
+                            removed += before - inner.len();
+                        }
+                    }
+                    // Drop entries whose hooks[] became empty.
+                    arr.retain(|entry| {
+                        entry
+                            .get("hooks")
+                            .and_then(|h| h.as_array())
+                            .map(|inner| !inner.is_empty())
+                            .unwrap_or(true)
+                    });
+                }
+                HookCommandField::BashTopLevel => {
+                    let before = arr.len();
+                    arr.retain(|entry| {
+                        entry
+                            .get("bash")
+                            .and_then(|c| c.as_str())
+                            .map(|cmd| check_icm_hook_command(cmd).is_none())
+                            .unwrap_or(true)
+                    });
+                    removed += before - arr.len();
+                }
+            }
+        }
+        // Drop now-empty event arrays so we don't leave `"Event": []` behind.
+        let empty_events: Vec<String> = target
+            .events
+            .iter()
+            .filter(|e| {
+                hooks
+                    .get(**e)
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.is_empty())
+                    .unwrap_or(false)
+            })
+            .map(|e| (*e).to_string())
+            .collect();
+        for e in empty_events {
+            hooks.remove(e.as_str());
+        }
+    }
+
+    if removed == 0 {
+        println!("[{}] no ICM hooks", target.label);
+        return Ok(0);
+    }
+    if dry_run {
+        println!(
+            "[{}] would remove {removed} ICM hook(s) from {}",
+            target.label,
+            target.path.display()
+        );
+        return Ok(removed);
+    }
+    let backup = backup_settings_file(&target.path)?;
+    let output = serde_json::to_string_pretty(&config)?;
+    std::fs::write(&target.path, output)
+        .with_context(|| format!("writing {}", target.path.display()))?;
+    println!(
+        "[{}] removed {removed} ICM hook(s) (backup: {})",
+        target.label,
+        backup.display()
+    );
+    Ok(removed)
+}
+
+/// Remove the OpenCode ICM plugin file, disabling that integration (#268).
+/// Returns 1 if a plugin was removed.
+fn disable_opencode_plugin(home: &str, dry_run: bool) -> Result<usize> {
+    let plugin = PathBuf::from(home).join(".config/opencode/plugins/icm.ts");
+    if !plugin.exists() {
+        return Ok(0);
+    }
+    if dry_run {
+        println!("[OpenCode] would remove plugin {}", plugin.display());
+        return Ok(1);
+    }
+    std::fs::remove_file(&plugin).with_context(|| format!("removing {}", plugin.display()))?;
+    println!("[OpenCode] removed plugin {}", plugin.display());
+    Ok(1)
+}
+
+/// `icm hook disable` — remove ICM's hooks from every detected AI tool while
+/// preserving the MCP server config and your memory DB (#268). Reversible via
+/// `icm init --mode hook`.
+fn cmd_hook_disable(dry_run: bool) -> Result<()> {
+    let home = home_dir_str()?;
+    let mut total = 0usize;
+    for target in hook_targets(&home) {
+        total += disable_hooks_in_target(&target, dry_run)?;
+    }
+    total += disable_opencode_plugin(&home, dry_run)?;
+
+    let plural = if total == 1 { "y" } else { "ies" };
+    println!();
+    if total == 0 {
+        println!("No ICM hooks found — nothing to disable.");
+    } else if dry_run {
+        println!(
+            "(dry run) Would remove {total} ICM hook entr{plural}. \
+             MCP config and your memory database would be left untouched."
+        );
+    } else {
+        println!(
+            "Removed {total} ICM hook entr{plural}. \
+             MCP config and your memory database are untouched."
+        );
+        println!(
+            "Note: edited settings files were reformatted (any JSONC comments dropped); \
+             a timestamped `.icm-bak-*` copy of each original was saved alongside it."
+        );
+        println!("Re-enable with: icm init --mode hook");
+    }
+    Ok(())
+}
+
+/// The per-tool hook configuration layouts ICM writes to. Shared by
+/// `icm doctor` (inspect) and `icm hook disable` (remove).
+///
+/// Claude Code, Gemini CLI, and Codex CLI all use the
+/// `{hooks:{Event:[{hooks:[{command:...}]}]}}` shape but at different paths
+/// and event names. Copilot CLI uses the same outer shape but its hook
+/// entries put the command in a top-level `bash` field instead of nesting
+/// under `hooks[]`.
+fn hook_targets(home: &str) -> Vec<DoctorTarget> {
+    vec![
         DoctorTarget {
             label: "Claude Code",
-            path: PathBuf::from(&home).join(".claude/settings.json"),
+            path: PathBuf::from(home).join(".claude/settings.json"),
             events: &[
                 "PreToolUse",
                 "PostToolUse",
@@ -5283,7 +5630,7 @@ fn cmd_doctor() -> Result<()> {
         },
         DoctorTarget {
             label: "Gemini CLI",
-            path: PathBuf::from(&home).join(".gemini/settings.json"),
+            path: PathBuf::from(home).join(".gemini/settings.json"),
             events: &[
                 "SessionStart",
                 "BeforeTool",
@@ -5295,7 +5642,7 @@ fn cmd_doctor() -> Result<()> {
         },
         DoctorTarget {
             label: "Codex CLI",
-            path: PathBuf::from(&home).join(".codex/hooks.json"),
+            path: PathBuf::from(home).join(".codex/hooks.json"),
             events: &[
                 "SessionStart",
                 "PreToolUse",
@@ -5306,7 +5653,7 @@ fn cmd_doctor() -> Result<()> {
         },
         DoctorTarget {
             label: "Copilot CLI",
-            path: PathBuf::from(&home).join(".copilot/settings.json"),
+            path: PathBuf::from(home).join(".copilot/settings.json"),
             events: &[
                 "sessionStart",
                 "preToolUse",
@@ -5315,7 +5662,14 @@ fn cmd_doctor() -> Result<()> {
             ],
             field: HookCommandField::BashTopLevel,
         },
-    ];
+    ]
+}
+
+fn cmd_doctor(db_path: &std::path::Path) -> Result<()> {
+    let home = home_dir_str()?;
+    let current_bin = std::env::current_exe().ok();
+
+    let targets = hook_targets(&home);
 
     let mut broken = 0usize;
     let mut checked = 0usize;
@@ -5342,7 +5696,222 @@ fn cmd_doctor() -> Result<()> {
         }
     }
 
+    // Database integrity (#313). Uses a maintenance connection so a corrupt
+    // DB is still diagnosable (the normal store open would fail first).
+    println!();
+    report_db_integrity(db_path);
+
     Ok(())
+}
+
+/// Print a one-block SQLite integrity verdict for `icm doctor` (#313).
+/// Tolerant of every failure mode: a missing DB, a non-SQLite backend, or an
+/// unreadable file are all reported rather than propagated.
+fn report_db_integrity(db_path: &std::path::Path) {
+    if !db_path.exists() {
+        println!(
+            "Database: none yet at {} (nothing to check).",
+            db_path.display()
+        );
+        return;
+    }
+    // Open READ-ONLY and run only the structural (PRAGMA) check: `doctor` is a
+    // diagnostic and must not write / checkpoint the DB it inspects. The deeper
+    // FTS content check runs during the actual `icm repair`.
+    let store = match Store::open_readonly(db_path) {
+        Ok(s) => s,
+        Err(e) => {
+            println!(
+                "Database integrity: could not open {}: {e}",
+                db_path.display()
+            );
+            return;
+        }
+    };
+    match store.integrity_check_structural() {
+        Ok(rows) if rows.len() == 1 && rows[0] == "ok" => {
+            println!("Database integrity: ok ({}).", db_path.display());
+        }
+        Ok(rows) => {
+            println!(
+                "Database integrity: DEGRADED — {} problem(s) at {}:",
+                rows.len(),
+                db_path.display()
+            );
+            for line in rows.iter().take(8) {
+                println!("  - {line}");
+            }
+            if rows.len() > 8 {
+                println!("  … and {} more", rows.len() - 8);
+            }
+            println!("To attempt recovery: icm repair");
+        }
+        Err(e) => {
+            println!("Database integrity: check failed: {e}");
+            println!("To attempt recovery: icm repair");
+        }
+    }
+}
+
+/// Copy the DB (and any `-wal` / `-shm` sidecars) to a timestamped sibling
+/// backup before repair mutates anything (#313). Returns the backup path.
+fn backup_db(db_path: &std::path::Path) -> Result<PathBuf> {
+    use std::ffi::OsString;
+    let ts = chrono::Utc::now().format("%Y%m%d-%H%M%S");
+    // Append the suffix to the raw file name (OsString, not a lossy `display()`
+    // round-trip) so non-UTF8 paths back up to the right place.
+    let mut backup_name = db_path
+        .file_name()
+        .map(|s| s.to_os_string())
+        .unwrap_or_else(|| OsString::from("memories.db"));
+    backup_name.push(format!(".backup-{ts}"));
+    let backup = db_path.with_file_name(&backup_name);
+    std::fs::copy(db_path, &backup)
+        .with_context(|| format!("backing up {} to {}", db_path.display(), backup.display()))?;
+    // Also preserve the WAL/SHM sidecars if present so the backup captures
+    // rows that a WAL-mode DB may hold only in `-wal` until checkpoint. A
+    // sidecar copy failure is surfaced (not silently dropped): the backup
+    // would otherwise be an incomplete snapshot the user is told is intact.
+    for ext in ["-wal", "-shm"] {
+        let mut side = db_path.as_os_str().to_os_string();
+        side.push(ext);
+        let side = PathBuf::from(side);
+        if side.exists() {
+            let mut side_backup = backup.as_os_str().to_os_string();
+            side_backup.push(ext);
+            if let Err(e) = std::fs::copy(&side, PathBuf::from(side_backup)) {
+                eprintln!(
+                    "[repair] warning: could not back up sidecar {} ({e}); \
+                     the backup may be missing recently-written rows",
+                    side.display()
+                );
+            }
+        }
+    }
+    Ok(backup)
+}
+
+/// `icm repair` — recover a corrupt SQLite memory DB (issue #313).
+fn cmd_repair(db_path: &std::path::Path, dry_run: bool) -> Result<()> {
+    if !db_path.exists() {
+        println!("No database at {} — nothing to repair.", db_path.display());
+        return Ok(());
+    }
+
+    if dry_run {
+        // A dry run must NOT modify the DB — open READ-ONLY and run only the
+        // structural (PRAGMA) check (no writable open, no WAL checkpoint). The
+        // deeper FTS content check runs in the actual repair below.
+        let store = match Store::open_readonly(db_path) {
+            Ok(s) => s,
+            Err(e) => {
+                println!("Could not open {} for inspection: {e}", db_path.display());
+                return Ok(());
+            }
+        };
+        let problems = store.integrity_check_structural()?;
+        if problems.len() == 1 && problems[0] == "ok" {
+            println!(
+                "integrity_check (structural): ok — {} looks healthy.",
+                db_path.display()
+            );
+            println!("(dry run is read-only; run `icm repair` for the deeper FTS content check.)");
+            return Ok(());
+        }
+        println!(
+            "integrity_check reported {} structural problem(s) on {}:",
+            problems.len(),
+            db_path.display()
+        );
+        for line in problems.iter().take(8) {
+            println!("  - {line}");
+        }
+        if problems.len() > 8 {
+            println!("  … and {} more", problems.len() - 8);
+        }
+        println!(
+            "\n(dry run) Would back up the DB, rebuild FTS shadow tables + REINDEX, \
+             then re-check (the real run also runs a deeper FTS content check)."
+        );
+        return Ok(());
+    }
+
+    let store = match Store::open_maintenance(db_path) {
+        Ok(s) => s,
+        Err(e) => {
+            // Too damaged to open at all (or a non-SQLite backend). Don't
+            // risk an in-place mutation — guide the user to file-level
+            // salvage instead.
+            println!("Could not open {} for repair: {e}", db_path.display());
+            println!("The database may be too damaged for in-place repair, or the");
+            println!("active backend is not SQLite. To salvage rows from the file:");
+            println!(
+                "  sqlite3 \"{}\" \".recover\" | sqlite3 recovered.db",
+                db_path.display()
+            );
+            println!("  then move recovered.db into place.");
+            std::process::exit(1);
+        }
+    };
+
+    let before = store.integrity_check()?;
+    let healthy = before.len() == 1 && before[0] == "ok";
+
+    if healthy {
+        println!(
+            "integrity_check: ok — {} is healthy, nothing to repair.",
+            db_path.display()
+        );
+        return Ok(());
+    }
+
+    println!(
+        "integrity_check reported {} problem(s) on {}:",
+        before.len(),
+        db_path.display()
+    );
+    for line in before.iter().take(8) {
+        println!("  - {line}");
+    }
+    if before.len() > 8 {
+        println!("  … and {} more", before.len() - 8);
+    }
+
+    // Always back up before mutating a damaged DB.
+    let backup = backup_db(db_path)?;
+    println!("\nBacked up to {}", backup.display());
+
+    println!("Rebuilding FTS shadow tables + REINDEX…");
+    let rebuilt = store.rebuild_search_indexes()?;
+    println!(
+        "Rebuilt: {}",
+        if rebuilt.is_empty() {
+            "(no FTS tables)".to_string()
+        } else {
+            rebuilt.join(", ")
+        }
+    );
+
+    let after = store.integrity_check()?;
+    if after.len() == 1 && after[0] == "ok" {
+        println!("\n✔ Repair succeeded: integrity_check is now ok.");
+        Ok(())
+    } else {
+        println!(
+            "\n✗ Index/FTS rebuild did not fully repair the database — {} problem(s) remain,",
+            after.len()
+        );
+        println!("  which points at base-table (not just index) corruption.");
+        println!("  Your original is preserved at {}.", backup.display());
+        println!("  Deeper recovery (salvages intact rows from a damaged b-tree):");
+        println!(
+            "    sqlite3 \"{}\" \".recover\" | sqlite3 recovered.db",
+            backup.display()
+        );
+        println!("    then rebuild FTS and swap recovered.db into place.");
+        // Non-zero exit so scripts/automation can detect partial recovery.
+        std::process::exit(1);
+    }
 }
 
 /// Inject ICM hook into a settings.json file (Claude Code or Gemini CLI) for a given event name.
@@ -6213,6 +6782,53 @@ fn cli_on_path(name: &str) -> bool {
     })
 }
 
+/// Best-effort inter-process singleton lock for the extract-pending worker
+/// (#322). Held for the lifetime of the value; the OS releases the advisory
+/// `flock` when the file descriptor closes on drop.
+struct WorkerLock {
+    #[cfg(unix)]
+    _file: std::fs::File,
+}
+
+impl WorkerLock {
+    /// Try to take the lock next to the DB. `Ok(Some(_))` = acquired,
+    /// `Ok(None)` = another process already holds it, `Err` = the lockfile
+    /// itself could not be created (caller may proceed without the guard).
+    fn acquire(db_path: &std::path::Path) -> Result<Option<Self>> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            let lock_path = db_path.with_extension("extract.lock");
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                // We only need a valid fd to flock; never write to or
+                // truncate the lockfile (state lives in the advisory lock).
+                .truncate(false)
+                .open(&lock_path)
+                .with_context(|| format!("opening worker lockfile {}", lock_path.display()))?;
+            // SAFETY: valid fd from the File above; LOCK_NB makes it
+            // non-blocking so a busy lock returns immediately.
+            let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+            if rc == 0 {
+                Ok(Some(Self { _file: file }))
+            } else {
+                let err = std::io::Error::last_os_error();
+                if err.raw_os_error() == Some(libc::EWOULDBLOCK) {
+                    Ok(None)
+                } else {
+                    Err(anyhow::Error::new(err).context("flock on worker lockfile"))
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = db_path;
+            Ok(Some(Self {}))
+        }
+    }
+}
+
 /// Process the async extraction queue.
 ///
 /// Reads up to `limit` oldest pending rows from `pending_extractions`.
@@ -6240,7 +6856,32 @@ fn cmd_extract_pending(
     cli_provider: Option<&str>,
     cli_model: Option<&str>,
     dry_run: bool,
+    db_path: &std::path::Path,
 ) -> Result<()> {
+    // Singleton guard (#322): only one worker drains the queue at a time.
+    // On a default install every ending Claude Code / Codex / editor session
+    // forks a worker; uncapped they pile up (the incident ran 5+ at once,
+    // each booting an LLM CLI) and hammer the same non-WAL SQLite DB, which
+    // makes the concurrent-write corruption in #313 far likelier. A dry-run
+    // only previews, so it takes no lock.
+    let _lock = if dry_run {
+        None
+    } else {
+        match WorkerLock::acquire(db_path) {
+            Ok(Some(l)) => Some(l),
+            Ok(None) => {
+                println!("Another extract-pending worker is already running; skipping.");
+                return Ok(());
+            }
+            Err(e) => {
+                eprintln!(
+                    "[extract-pending] lock unavailable ({e}); proceeding without singleton guard"
+                );
+                None
+            }
+        }
+    };
+
     let pending = store.list_pending_extractions(limit)?;
     if pending.is_empty() {
         println!("No pending extractions.");
@@ -6550,6 +7191,99 @@ fn cmd_consolidate(
     Ok(())
 }
 
+/// `icm consolidate-all` — batch-consolidate every topic over `threshold`
+/// (issue #179). Reuses [`cmd_consolidate`] per topic; naturally idempotent
+/// because a consolidated topic collapses to one memory (below the threshold)
+/// and is skipped next time. Never keeps originals — that would defeat the
+/// idempotency the cron use case relies on.
+fn cmd_consolidate_all(
+    store: &Store,
+    threshold: usize,
+    cfg: &config::SummarizerConfig,
+    cli_provider: Option<&str>,
+    cli_model: Option<&str>,
+    cli_max_tokens: Option<usize>,
+    dry_run: bool,
+) -> Result<()> {
+    // `threshold = 0` would leave a just-consolidated single-memory topic still
+    // "over" the threshold (1 > 0), so every run re-consolidates everything —
+    // infinite churn on a cron timer. Require >= 1.
+    if threshold == 0 {
+        bail!("--threshold must be >= 1 (0 would re-consolidate every topic on every run)");
+    }
+
+    // Safety guard (see #186): a batch run with the summarizer resolving to
+    // `none` would replace EVERY over-threshold topic with a lexical ' | '
+    // join and delete the originals — a store-wide quality loss from a bare
+    // cron `consolidate-all`. Refuse unless the user explicitly opted into
+    // lexical with `--summarizer-provider none`.
+    let resolved = resolve_consolidate_provider(cfg, cli_provider)?;
+    let explicit_none = cli_provider
+        .map(|p| p.trim().eq_ignore_ascii_case("none"))
+        .unwrap_or(false);
+    if matches!(resolved, summarizer::ProviderKind::None) && !explicit_none {
+        bail!(
+            "consolidate-all would replace every over-threshold topic with a lexical \
+             ' | ' join and delete the originals (summarizer provider resolves to 'none'). \
+             Pass --summarizer-provider <claude|codex|gemini|ollama> for real consolidation, \
+             or --summarizer-provider none to explicitly accept lexical joins."
+        );
+    }
+
+    // Snapshot topics up front so consolidating one doesn't perturb iteration.
+    let mut candidates: Vec<(String, usize)> = store
+        .list_topics_with_prefix(None)?
+        .into_iter()
+        .filter(|(_, count)| *count > threshold)
+        .collect();
+    candidates.sort_by_key(|c| std::cmp::Reverse(c.1)); // biggest topics first
+
+    if candidates.is_empty() {
+        println!("No topic has more than {threshold} memories — nothing to consolidate.");
+        return Ok(());
+    }
+
+    if dry_run {
+        println!(
+            "(dry run) Would consolidate {} topic(s) over threshold {threshold}:",
+            candidates.len()
+        );
+        for (topic, count) in &candidates {
+            println!("  - {topic} ({count} memories)");
+        }
+        return Ok(());
+    }
+
+    let mut done = 0usize;
+    let mut failed = 0usize;
+    for (topic, count) in &candidates {
+        println!("[consolidate-all] {topic} ({count} memories)…");
+        match cmd_consolidate(
+            store,
+            topic,
+            false,
+            cfg,
+            cli_provider,
+            cli_model,
+            cli_max_tokens,
+        ) {
+            Ok(()) => done += 1,
+            Err(e) => {
+                eprintln!("[consolidate-all] {topic} failed: {e}");
+                failed += 1;
+            }
+        }
+    }
+
+    println!();
+    if failed == 0 {
+        println!("Consolidated {done} topic(s) over threshold {threshold}.");
+    } else {
+        println!("Consolidated {done} topic(s); {failed} failed (see errors above).");
+    }
+    Ok(())
+}
+
 fn cmd_extract(
     store: &Store,
     embedder: Option<&dyn icm_core::Embedder>,
@@ -6683,6 +7417,180 @@ fn cmd_recall_project(store: &Store, limit: usize) -> Result<()> {
 /// Selects critical/high memories (plus preferences) optionally scoped to a
 /// project, ranks by importance × recency × weight, and truncates to fit the
 /// token budget.
+/// Sanitize a project name into a safe cache filename (issue #165).
+fn briefing_filename(project: &str) -> String {
+    let safe: String = project
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || matches!(c, '-' | '_' | '.') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    format!("wake-up-{safe}.md")
+}
+
+/// Resolve the cache path for a project's LLM wake-up briefing (issue #165).
+/// Lives under the OS cache dir so it's disposable (`~/Library/Caches/…` on
+/// macOS, `~/.cache/icm/…` on Linux). Returns `None` if no cache dir resolves.
+fn briefing_cache_path(project: &str) -> Option<PathBuf> {
+    let dir = directories::ProjectDirs::from("dev", "icm", "icm")
+        .map(|d| d.cache_dir().join("briefings"))?;
+    Some(dir.join(briefing_filename(project)))
+}
+
+/// Load a briefing from an explicit path if it exists and is non-empty (pure,
+/// testable core of [`load_cached_briefing`]).
+fn load_cached_briefing_at(path: &std::path::Path) -> Option<String> {
+    let content = std::fs::read_to_string(path).ok()?;
+    if content.trim().is_empty() {
+        None
+    } else {
+        Some(content)
+    }
+}
+
+/// Load a cached LLM briefing for `project`, if one exists and is non-empty
+/// (issue #165). Used by the wake-up paths to prefer the richer briefing over
+/// the static bullet pack when the user has generated one.
+fn load_cached_briefing(project: Option<&str>) -> Option<String> {
+    load_cached_briefing_at(&briefing_cache_path(project?)?)
+}
+
+/// Build the LLM prompt that compiles a project's memories into a structured
+/// wake-up briefing (issue #165).
+fn build_briefing_prompt(
+    project: &str,
+    memories: &[icm_core::Memory],
+    max_tokens: usize,
+) -> String {
+    let mut joined = String::new();
+    for m in memories {
+        joined.push_str(&format!(
+            "- [{}] ({}) {}\n",
+            m.importance, m.topic, m.summary
+        ));
+    }
+    format!(
+        "Compile a wake-up briefing for the project '{project}' from its stored \
+         memories below. Write a concise, structured briefing (~{max_tokens} tokens \
+         max) that an AI agent reads at the start of a session. Use these sections, \
+         omitting any with no supporting content:\n\
+         ## State of work — what is in flight, what is blocked\n\
+         ## Recent decisions — the decision and its rationale\n\
+         ## Errors & resolutions — problems hit and how they were solved\n\
+         ## Preferences — project-specific user preferences to respect\n\
+         Be specific and factual; do NOT invent anything the memories don't support. \
+         Output Markdown only, no preamble.\n\n\
+         Memories:\n{joined}"
+    )
+}
+
+/// `icm briefing` — compile the project's memories into an LLM wake-up briefing
+/// and cache it (issue #165). Session start / `icm wake-up` then load the cached
+/// briefing with zero added latency. Regenerate on demand (cron / hook).
+fn cmd_briefing(
+    store: &Store,
+    project: Option<String>,
+    cfg: &config::SummarizerConfig,
+    cli_provider: Option<&str>,
+    cli_model: Option<&str>,
+    cli_max_tokens: Option<usize>,
+) -> Result<()> {
+    let detected;
+    let project_name: &str = match project.as_deref() {
+        Some(p) if !p.is_empty() && p != "-" => p,
+        _ => {
+            detected = detect_project();
+            if detected.is_empty() || detected == "unknown" {
+                bail!("could not auto-detect a project — pass --project <name>");
+            }
+            detected.as_str()
+        }
+    };
+
+    // A briefing is an LLM narrative; a lexical join isn't one. Refuse `none`.
+    let resolved = resolve_consolidate_provider(cfg, cli_provider)?;
+    if matches!(resolved, summarizer::ProviderKind::None) {
+        bail!(
+            "briefing needs an LLM summarizer (provider resolved to 'none'); \
+             pass --summarizer-provider <claude|codex|gemini|ollama>"
+        );
+    }
+
+    let mut memories: Vec<icm_core::Memory> = store
+        .list_all()?
+        .into_iter()
+        .filter(|m| {
+            icm_core::project_matches(&m.topic, Some(project_name))
+                || icm_core::is_preference_topic(&m.topic)
+        })
+        .collect();
+    if memories.is_empty() {
+        bail!("no memories found for project '{project_name}'");
+    }
+    // Feed the LLM the most important, most recent memories — not the entire
+    // topic history. Keeps the prompt (and latency) bounded and the briefing
+    // focused. Importance first (Critical→Low), then newest first.
+    let importance_rank = |i: &Importance| match i {
+        Importance::Critical => 0,
+        Importance::High => 1,
+        Importance::Medium => 2,
+        Importance::Low => 3,
+    };
+    memories.sort_by(|a, b| {
+        importance_rank(&a.importance)
+            .cmp(&importance_rank(&b.importance))
+            .then(b.created_at.cmp(&a.created_at))
+    });
+    const MAX_BRIEFING_MEMORIES: usize = 60;
+    memories.truncate(MAX_BRIEFING_MEMORIES);
+
+    let max_tokens = cli_max_tokens.unwrap_or_else(|| cfg.max_tokens.max(400));
+    let model_owned: Option<String> = cli_model.map(String::from).or_else(|| {
+        if cfg.model.is_empty() {
+            None
+        } else {
+            Some(cfg.model.clone())
+        }
+    });
+    let prompt = build_briefing_prompt(project_name, &memories, max_tokens);
+    let provider = summarizer::make_summarizer(resolved)?;
+    // A briefing is a heavier LLM task than a single-topic consolidation and an
+    // LLM CLI's cold start can be slow, so allow a more generous timeout than
+    // the shared consolidate default (still overridable upward via config).
+    let timeout_secs = cfg.timeout_secs.max(120);
+    let req = summarizer::SummarizeRequest {
+        prompt: &prompt,
+        model: model_owned.as_deref(),
+        max_tokens,
+        timeout: std::time::Duration::from_secs(timeout_secs),
+    };
+    let briefing = match provider.summarize(&req) {
+        Ok(s) if !s.trim().is_empty() => s,
+        Ok(_) => bail!("summarizer '{}' returned empty output", provider.name()),
+        Err(e) => bail!("summarizer '{}' failed: {e}", provider.name()),
+    };
+
+    let path = briefing_cache_path(project_name)
+        .ok_or_else(|| anyhow::anyhow!("cannot resolve cache directory"))?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating cache dir {}", parent.display()))?;
+    }
+    std::fs::write(&path, &briefing).with_context(|| format!("writing {}", path.display()))?;
+    println!(
+        "Wrote wake-up briefing for '{project_name}' ({} memories) via {} to {}",
+        memories.len(),
+        provider.name(),
+        path.display()
+    );
+    println!("It will be loaded at the next session start / `icm wake-up`.");
+    Ok(())
+}
+
 fn cmd_wake_up(
     store: &Store,
     project: Option<String>,
@@ -6715,7 +7623,19 @@ fn cmd_wake_up(
         include_preferences: !no_preferences,
     };
 
-    let pack = build_wake_up(store, &opts)?;
+    // Prefer a cached LLM briefing when one exists (issue #165) — but only when
+    // the live store has content for this project, so an empty/pruned store
+    // isn't masked by a stale cache. The `--format`/`--no-preferences`/budget
+    // options apply to the static fallback; a cached briefing is emitted as
+    // generated (regenerate with `icm briefing` to reflect option changes).
+    let live_pack = build_wake_up(store, &opts)?;
+    let live_empty =
+        live_pack.trim().is_empty() || live_pack.starts_with(icm_core::EMPTY_PACK_HEADER);
+    let pack = if live_empty {
+        live_pack
+    } else {
+        load_cached_briefing(project_ref).unwrap_or(live_pack)
+    };
     print!("{pack}");
     Ok(())
 }
@@ -8675,6 +9595,199 @@ mod hook_start_tests {
     }
 
     #[test]
+    fn consolidate_all_over_threshold_and_idempotent() {
+        // #179: batch-consolidate topics over the threshold; a consolidated
+        // topic drops below it, so re-running is a no-op.
+        use icm_core::{Importance, Memory};
+        let store = icm_store::Store::in_memory().unwrap();
+        let seed = |topic: &str, n: usize| {
+            for i in 0..n {
+                store
+                    .store(Memory::new(
+                        topic.into(),
+                        format!("{topic} memory number {i}"),
+                        Importance::Medium,
+                    ))
+                    .unwrap();
+            }
+        };
+        seed("alpha", 5);
+        seed("beta", 2); // under threshold
+        seed("gamma", 4);
+
+        let cfg = config::SummarizerConfig::default();
+        // provider "none" → deterministic lexical consolidation, no LLM spawn.
+        cmd_consolidate_all(&store, 3, &cfg, Some("none"), None, None, false).unwrap();
+
+        assert_eq!(store.count_by_topic("alpha").unwrap(), 1);
+        assert_eq!(store.count_by_topic("gamma").unwrap(), 1);
+        assert_eq!(
+            store.count_by_topic("beta").unwrap(),
+            2,
+            "under-threshold topic untouched"
+        );
+
+        // Idempotent: nothing left over the threshold.
+        cmd_consolidate_all(&store, 3, &cfg, Some("none"), None, None, false).unwrap();
+        assert_eq!(store.count_by_topic("alpha").unwrap(), 1);
+        assert_eq!(store.count_by_topic("beta").unwrap(), 2);
+    }
+
+    #[test]
+    fn consolidate_all_dry_run_changes_nothing() {
+        use icm_core::{Importance, Memory};
+        let store = icm_store::Store::in_memory().unwrap();
+        for i in 0..5 {
+            store
+                .store(Memory::new("t".into(), format!("m{i}"), Importance::Medium))
+                .unwrap();
+        }
+        let cfg = config::SummarizerConfig::default();
+        cmd_consolidate_all(&store, 3, &cfg, Some("none"), None, None, true).unwrap();
+        assert_eq!(
+            store.count_by_topic("t").unwrap(),
+            5,
+            "dry-run must not consolidate"
+        );
+    }
+
+    #[test]
+    fn consolidate_all_guards_lexical_and_zero_threshold() {
+        use icm_core::{Importance, Memory};
+        let store = icm_store::Store::in_memory().unwrap();
+        for i in 0..5 {
+            store
+                .store(Memory::new("t".into(), format!("m{i}"), Importance::Medium))
+                .unwrap();
+        }
+        let cfg = config::SummarizerConfig::default(); // provider defaults to "none"
+                                                       // Bare run (no explicit provider) resolves to none → refuse (a batch
+                                                       // lexical join + delete of originals across the whole store).
+        assert!(cmd_consolidate_all(&store, 3, &cfg, None, None, None, false).is_err());
+        // threshold 0 → refuse.
+        assert!(cmd_consolidate_all(&store, 0, &cfg, Some("none"), None, None, false).is_err());
+        // Neither refused call touched the data.
+        assert_eq!(store.count_by_topic("t").unwrap(), 5);
+        // Explicit `none` is an accepted opt-in and does consolidate.
+        assert!(cmd_consolidate_all(&store, 3, &cfg, Some("none"), None, None, false).is_ok());
+        assert_eq!(store.count_by_topic("t").unwrap(), 1);
+    }
+
+    #[test]
+    fn briefing_filename_sanitizes() {
+        assert_eq!(briefing_filename("icm"), "wake-up-icm.md");
+        assert_eq!(briefing_filename("context-icm"), "wake-up-context-icm.md");
+        assert_eq!(briefing_filename("a/b c:d"), "wake-up-a_b_c_d.md");
+    }
+
+    #[test]
+    fn load_cached_briefing_at_present_empty_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("b.md");
+        assert!(load_cached_briefing_at(&path).is_none(), "missing → none");
+        std::fs::write(&path, "   \n").unwrap();
+        assert!(
+            load_cached_briefing_at(&path).is_none(),
+            "whitespace → none"
+        );
+        std::fs::write(&path, "## State of work\n- shipping").unwrap();
+        assert_eq!(
+            load_cached_briefing_at(&path).unwrap(),
+            "## State of work\n- shipping"
+        );
+    }
+
+    #[test]
+    fn build_briefing_prompt_has_sections_and_memories() {
+        use icm_core::{Importance, Memory};
+        let mems = vec![
+            Memory::new(
+                "decisions-icm".into(),
+                "use SQLite for storage".into(),
+                Importance::High,
+            ),
+            Memory::new(
+                "errors-resolved".into(),
+                "fixed the spawn loop".into(),
+                Importance::Critical,
+            ),
+        ];
+        let p = build_briefing_prompt("icm", &mems, 400);
+        assert!(p.contains("project 'icm'"));
+        assert!(p.contains("## State of work"));
+        assert!(p.contains("## Recent decisions"));
+        assert!(p.contains("use SQLite for storage"));
+        assert!(p.contains("fixed the spawn loop"));
+    }
+
+    #[test]
+    fn hook_disable_removes_only_icm_hooks() {
+        // #268: `icm hook disable` strips ICM hook entries and nothing else.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::write(
+            &path,
+            r#"{
+              "hooks": {
+                "PostToolUse": [
+                  {"hooks": [{"type": "command", "command": "/x/icm hook post"}]},
+                  {"hooks": [{"type": "command", "command": "/y/othertool run"}]}
+                ],
+                "SessionEnd": [
+                  {"hooks": [{"type": "command", "command": "/x/icm hook end"}]}
+                ]
+              },
+              "mcpServers": {"icm": {"command": "icm"}},
+              "otherSetting": true
+            }"#,
+        )
+        .unwrap();
+
+        let target = DoctorTarget {
+            label: "Test",
+            path: path.clone(),
+            events: &["PostToolUse", "SessionEnd"],
+            field: HookCommandField::Command,
+        };
+        let removed = disable_hooks_in_target(&target, false).unwrap();
+        assert_eq!(removed, 2, "both ICM hooks should be removed");
+
+        let after: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        // The non-ICM hook survives.
+        let post = after["hooks"]["PostToolUse"].as_array().unwrap();
+        assert_eq!(post.len(), 1);
+        assert!(post[0]["hooks"][0]["command"]
+            .as_str()
+            .unwrap()
+            .contains("othertool"));
+        // The ICM-only event is dropped entirely.
+        assert!(after["hooks"].get("SessionEnd").is_none());
+        // MCP config and unrelated settings are untouched.
+        assert!(after.get("mcpServers").is_some());
+        assert_eq!(after["otherSetting"], serde_json::json!(true));
+
+        // Idempotent: a second run finds nothing to remove.
+        assert_eq!(disable_hooks_in_target(&target, false).unwrap(), 0);
+    }
+
+    #[test]
+    fn hook_disable_dry_run_does_not_modify() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let original = r#"{"hooks":{"PostToolUse":[{"hooks":[{"type":"command","command":"/x/icm hook post"}]}]}}"#;
+        std::fs::write(&path, original).unwrap();
+        let target = DoctorTarget {
+            label: "Test",
+            path: path.clone(),
+            events: &["PostToolUse"],
+            field: HookCommandField::Command,
+        };
+        assert_eq!(disable_hooks_in_target(&target, true).unwrap(), 1);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+    }
+
+    #[test]
     fn project_from_path_extracts_basename() {
         assert_eq!(
             project_from_path("/Users/patrick/dev/rtk-ai/icm"),
@@ -8710,6 +9823,36 @@ mod hook_start_tests {
             project_from_path(dir.path().to_str().unwrap()),
             Some("myproject".into())
         );
+    }
+
+    // Linux-only: advisory `flock` on the macOS CI runners' temp filesystem is
+    // unreliable in several ways — it has both failed to refuse a second
+    // holder AND failed to re-grant after release — so this test flaked there
+    // in more than one direction. The guard itself works on real installs
+    // (DB on local disk) and its cross-process behavior is covered by a manual
+    // e2e; Linux CI (where flock is reliable) gives the real unit coverage.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn worker_lock_is_exclusive_and_releases_on_drop() {
+        // #322: a second worker must not run while the first holds the lock,
+        // and the lock must free up once the first finishes.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("memories.db");
+
+        let first = WorkerLock::acquire(&db).unwrap();
+        assert!(first.is_some(), "first acquire should succeed");
+
+        // Held: a concurrent acquire is refused (Ok(None)), not an error.
+        let second = WorkerLock::acquire(&db).unwrap();
+        assert!(
+            second.is_none(),
+            "second acquire must be refused while held"
+        );
+
+        // Release, then the lock is available again.
+        drop(first);
+        let third = WorkerLock::acquire(&db).unwrap();
+        assert!(third.is_some(), "acquire should succeed after release");
     }
 
     #[test]
@@ -9726,8 +10869,19 @@ mod doctor_tests {
         // counted, only icm-owned ones.
         assert!(check_icm_hook_command("/usr/bin/rtk hook claude").is_none());
         assert!(check_icm_hook_command("npx prettier --write").is_none());
+        // Security-review hardening: a non-ICM command that merely MENTIONS
+        // "icm hook" (in a note/arg) must not be misidentified as an ICM hook,
+        // or `icm hook disable` would strip it.
+        assert!(
+            check_icm_hook_command("mytool --note \"run icm hook later\"").is_none(),
+            "a non-icm binary mentioning 'icm hook' must not match"
+        );
+        assert!(check_icm_hook_command("/usr/local/bin/othertool icm-post-tool").is_none());
+        // Real ICM invocations still match (direct binary + `.exe` + post-tool).
         let (bin, exists) = check_icm_hook_command("/usr/local/bin/icm hook pre").unwrap();
         assert_eq!(bin, "/usr/local/bin/icm");
+        assert!(check_icm_hook_command("C:\\tools\\icm.exe hook post").is_some());
+        assert!(check_icm_hook_command("/opt/icm/icm-post-tool.sh").is_some());
         // Path doesn't actually exist on the test runner — `exists` is `false`.
         assert!(!exists);
     }

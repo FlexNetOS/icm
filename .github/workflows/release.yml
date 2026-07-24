@@ -45,12 +45,22 @@ jobs:
           - target: aarch64-apple-darwin
             os: macos-latest
             archive: tar.gz
+          # Build the glibc binaries on an older runner (glibc 2.35) so they
+          # run on Debian 12 "Bookworm" (glibc 2.36) and other current distros
+          # — ubuntu-latest's glibc is too new (issue #330).
           - target: x86_64-unknown-linux-gnu
-            os: ubuntu-latest
+            os: ubuntu-22.04
             archive: tar.gz
           - target: aarch64-unknown-linux-gnu
+            os: ubuntu-22.04
+            archive: tar.gz
+          # Fully-static musl binary for old-glibc distros (issue #330:
+          # Debian Bookworm's glibc 2.36 is older than ubuntu-latest's).
+          # No embeddings: ort/onnxruntime has no static musl build.
+          - target: x86_64-unknown-linux-musl
             os: ubuntu-latest
             archive: tar.gz
+            flags: --no-default-features --features backend-sqlite,tui,http-api
           - target: x86_64-pc-windows-msvc
             os: windows-latest
             archive: zip
@@ -70,6 +80,12 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
 
+      - name: Install musl tools
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+
       - name: Build (cross aarch64)
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         run: cargo build --release --target ${{ matrix.target }} -p icm-cli --features vendored-openssl
@@ -78,7 +94,11 @@ jobs:
 
       - name: Build
         if: matrix.target != 'aarch64-unknown-linux-gnu'
-        run: cargo build --release --target ${{ matrix.target }} -p icm-cli
+        # Target-specific, so a no-op for non-musl targets: sqlite-vec.c uses
+        # BSD type names (u_int8_t/…) that glibc provides but musl does not.
+        env:
+          CFLAGS_x86_64_unknown_linux_musl: "-Du_int8_t=uint8_t -Du_int16_t=uint16_t -Du_int32_t=uint32_t -Du_int64_t=uint64_t"
+        run: cargo build --release --target ${{ matrix.target }} -p icm-cli ${{ matrix.flags }}
 
       - name: Package (Unix)
         if: matrix.archive == 'tar.gz'
@@ -101,7 +121,8 @@ jobs:
 
   build-deb:
     name: Build .deb
-    runs-on: ubuntu-latest
+    # Older glibc (2.35) so the packaged binary runs on Debian 12 (#330).
+    runs-on: ubuntu-22.04
     steps:
       - name: Checkout
         uses: actions/checkout@v4

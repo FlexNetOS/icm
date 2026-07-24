@@ -52,6 +52,40 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace
 
+  # Validates the fully-static musl binary shipped for old-glibc distros
+  # (issue #330: the glibc binaries need symbols newer than Debian Bookworm's
+  # glibc 2.36). Embeddings are dropped because `ort`/onnxruntime ships only
+  # glibc prebuilt binaries and can't link statically against musl.
+  musl:
+    name: musl static build
+    needs: clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+      - name: Install musl tools
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: Build static musl binary (no embeddings)
+        # sqlite-vec.c uses BSD type names (u_int8_t/u_int16_t/u_int64_t) that
+        # glibc provides but musl does not; map them to the standard names.
+        env:
+          CFLAGS_x86_64_unknown_linux_musl: "-Du_int8_t=uint8_t -Du_int16_t=uint16_t -Du_int32_t=uint32_t -Du_int64_t=uint64_t"
+        run: >-
+          cargo build --release --target x86_64-unknown-linux-musl -p icm-cli
+          --no-default-features --features "backend-sqlite,tui,http-api"
+      - name: Verify the binary is fully static
+        run: |
+          bin=target/x86_64-unknown-linux-musl/release/icm
+          file "$bin"
+          if ldd "$bin" 2>&1 | grep -Eq "statically linked|not a dynamic executable"; then
+            echo "OK: statically linked — runs on any Linux regardless of glibc"
+          else
+            echo "FAIL: binary is dynamically linked"; ldd "$bin"; exit 1
+          fi
+
   security:
     name: security scan
     needs: clippy

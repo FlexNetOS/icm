@@ -23,6 +23,20 @@ pub(crate) fn db_err(e: rusqlite::Error) -> IcmError {
     IcmError::Database(e.to_string())
 }
 
+/// True when a rusqlite error is a "no such table" (a legacy DB missing an
+/// FTS shadow table we optionally rebuild — issue #313).
+fn is_missing_table(e: &rusqlite::Error) -> bool {
+    e.to_string().contains("no such table")
+}
+
+/// FTS5 shadow tables maintained by ICM, checked/rebuilt during repair (#313).
+const FTS_TABLES: [&str; 4] = [
+    "memories_fts",
+    "concepts_fts",
+    "feedback_fts",
+    "messages_fts",
+];
+
 // Shared public row types live in `crate::common` so all backends can be
 // compiled into one binary without colliding definitions (issue #301).
 pub use crate::common::{CodeArea, HookEvent, HookEventInsert, HookStatsRow, PendingRow};
@@ -45,22 +59,10 @@ fn ensure_sqlite_vec() {
     });
 }
 
-/// Open `path` strictly read-only **and** immutable.
-///
-/// `SQLITE_OPEN_READ_ONLY` alone is not enough on a `chmod -w` parent
-/// directory: SQLite still tries to create / refresh the `-shm` and
-/// `-wal` companion files for any WAL-mode database, which fails with
-/// "attempt to write a readonly database". The `immutable=1` URI flag
-/// tells SQLite the file will not change for the lifetime of the
-/// connection and disables that WAL bookkeeping path entirely. This
-/// is the standard recipe for read-only sandboxes and matches what
-/// every SQLite "read-only inspect" tool does.
-///
-/// URI-encodes the path so a backslash on Windows or a `?`/`#` in a
-/// pathological filename can't break the URI parser.
-fn open_readonly_immutable(path: &Path) -> IcmResult<Connection> {
-    let raw = path.to_string_lossy();
-    let encoded: String = raw
+/// URI-encode a filesystem path for a SQLite `file:` URI so a backslash on
+/// Windows or a `?`/`#`/`%` in a pathological filename can't break the parser.
+fn encode_sqlite_uri_path(path: &Path) -> String {
+    path.to_string_lossy()
         .chars()
         .map(|c| match c {
             '?' | '#' | '%' => format!("%{:02X}", c as u32),
@@ -68,8 +70,23 @@ fn open_readonly_immutable(path: &Path) -> IcmResult<Connection> {
             '\\' => "/".into(),
             other => other.to_string(),
         })
-        .collect();
-    let uri = format!("file:{encoded}?mode=ro&immutable=1");
+        .collect()
+}
+
+/// Open `path` strictly read-only. When `immutable` is set, add the
+/// `immutable=1` URI flag — SQLite then assumes the file never changes and
+/// touches no `-shm`/`-wal` sidecars, which is required on a `chmod -w`
+/// parent directory (issue #263) but serves a permanently stale snapshot and
+/// eventually reports spurious `SQLITE_CORRUPT` on a live DB (issue #319).
+/// Plain `mode=ro` (immutable = false) is WAL-aware and sees committed
+/// writes, at the cost of needing a writable directory for the sidecars.
+fn open_readonly_uri(path: &Path, immutable: bool) -> IcmResult<Connection> {
+    let encoded = encode_sqlite_uri_path(path);
+    let uri = if immutable {
+        format!("file:{encoded}?mode=ro&immutable=1")
+    } else {
+        format!("file:{encoded}?mode=ro")
+    };
     Connection::open_with_flags(
         uri,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
@@ -77,6 +94,41 @@ fn open_readonly_immutable(path: &Path) -> IcmResult<Connection> {
             | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
     .map_err(|e| IcmError::Database(format!("cannot open database read-only: {e}")))
+}
+
+/// Open a long-lived read-only connection (issue #319).
+///
+/// Prefer a normal WAL-aware `mode=ro` connection: it respects locking and
+/// sees writes committed after it opened — the actual deployment model for
+/// `icm --read-only serve`, where hooks keep writing the same DB. Fall back to
+/// `immutable=1` only when the live open can't even read the DB, e.g. a
+/// `chmod -w` sandbox where SQLite can't create the `-shm` sidecar for a
+/// WAL-mode file (issue #263). The read probe is essential: on such a
+/// directory the open may *succeed* yet the first real read fails, so opening
+/// alone is not a sufficient signal.
+fn open_readonly_connection(path: &Path) -> IcmResult<Connection> {
+    if let Ok(conn) = open_readonly_uri(path, false) {
+        // Give a momentarily-locked writer time to release before deciding
+        // the live open is unusable.
+        let _ = conn.execute_batch("PRAGMA busy_timeout=30000;");
+        // Exercise a real table read (touches the WAL/-shm path) — `SELECT 1`
+        // would not.
+        if conn
+            .query_row("SELECT count(*) FROM sqlite_master", [], |_| Ok(()))
+            .is_ok()
+        {
+            return Ok(conn);
+        }
+    }
+    // Live open unusable (e.g. a read-only sandbox dir, #263). Fall back to an
+    // immutable snapshot — but warn, because a long-lived reader on this
+    // connection will NOT see subsequent writes (the #319 staleness tradeoff).
+    tracing::warn!(
+        path = %path.display(),
+        "read-only DB opened immutable (sandbox fallback): writes committed after \
+         this point will not be visible until the connection is reopened"
+    );
+    open_readonly_uri(path, true)
 }
 
 /// In-process LRU cache size for hot memories. Each entry is one
@@ -123,7 +175,7 @@ impl SqliteStore {
                 path.display()
             )));
         }
-        let conn = open_readonly_immutable(path)?;
+        let conn = open_readonly_connection(path)?;
         // foreign_keys is a no-op for reads; busy_timeout is still useful
         // when another writer holds the file.
         conn.execute_batch("PRAGMA foreign_keys=ON; PRAGMA busy_timeout=30000;")
@@ -133,6 +185,147 @@ impl SqliteStore {
             cache: Mutex::new(new_cache()),
             readonly: true,
         })
+    }
+
+    /// Open an existing database for maintenance — integrity check and
+    /// repair (issue #313).
+    ///
+    /// Writable (so `REINDEX` and FTS `'rebuild'` can run) but, unlike
+    /// [`Self::with_dims`], it deliberately does NOT:
+    /// - run `init_db_with_dims` — schema migration would fail on, or mutate,
+    ///   a corrupt DB before it can even be inspected;
+    /// - switch `journal_mode` — a damaged file's on-disk format is left
+    ///   exactly as found so recovery reasons about the real state.
+    ///
+    /// Returns [`IcmError::NotFound`] when the file is absent.
+    pub fn open_maintenance(path: &Path) -> IcmResult<Self> {
+        ensure_sqlite_vec();
+        if !path.exists() {
+            return Err(IcmError::NotFound(format!(
+                "database not found at {}",
+                path.display()
+            )));
+        }
+        let conn = Connection::open(path)
+            .map_err(|e| IcmError::Database(format!("cannot open database: {e}")))?;
+        conn.execute_batch("PRAGMA busy_timeout=30000;")
+            .map_err(db_err)?;
+        Ok(Self {
+            conn,
+            cache: Mutex::new(new_cache()),
+            readonly: false,
+        })
+    }
+
+    /// Check database integrity (issue #313) and return a list of problems.
+    /// A healthy database yields exactly `["ok"]`; a damaged one yields one
+    /// entry per problem.
+    ///
+    /// Two complementary checks run:
+    /// 1. `PRAGMA integrity_check` — structural b-tree / page validation.
+    ///    This is what caught the shadow-table and index damage reported in
+    ///    the incident (`btreeInitPage`, `wrong # of entries in index …`).
+    /// 2. FTS5 `'integrity-check'` per shadow table — validates each FTS
+    ///    index's internal structure, complementing the structural pass for
+    ///    damage confined to the FTS shadow tables.
+    ///
+    /// This never returns `Err`: even a failure to *run* a check (e.g. an FTS
+    /// vtable too damaged to instantiate) is recorded as a problem, so the
+    /// caller — `icm doctor` / `icm repair` — always gets a usable verdict on
+    /// a badly corrupt database instead of a propagated error.
+    pub fn integrity_check(&self) -> IcmResult<Vec<String>> {
+        let mut problems = Vec::new();
+
+        // 1. Structural check. Record a run failure as a problem instead of
+        //    aborting the whole verdict.
+        match self.run_integrity_pragma() {
+            Ok(lines) => problems.extend(lines.into_iter().filter(|l| l != "ok")),
+            Err(e) => problems.push(format!("integrity_check pragma failed: {e}")),
+        }
+
+        // 2. Per-FTS-table consistency.
+        for table in FTS_TABLES {
+            // `rank = 1` makes FTS5 verify the index against the *content*
+            // table, not just its own internal structure. Without it, an
+            // index that is stale or out of step with the base table (e.g.
+            // an interrupted write) is reported as healthy. Requires
+            // SQLite ≥ 3.37 (bundled rusqlite is well past that).
+            let sql = format!("INSERT INTO {table}({table}, rank) VALUES('integrity-check', 1);");
+            match self.conn.execute_batch(&sql) {
+                Ok(()) => {}
+                Err(e) if is_missing_table(&e) => {} // legacy DB without this table
+                Err(e) => problems.push(format!("fts5 {table}: {e}")),
+            }
+        }
+
+        if problems.is_empty() {
+            Ok(vec!["ok".to_string()])
+        } else {
+            Ok(problems)
+        }
+    }
+
+    /// Structural-only integrity check (`PRAGMA integrity_check`), safe on a
+    /// read-only connection (issue #313 follow-up). Unlike
+    /// [`Self::integrity_check`] it does NOT run the FTS5 `'integrity-check'`
+    /// (which is an `INSERT` and needs a writable connection), so it never
+    /// mutates the DB or triggers a WAL checkpoint. Used by the read-only
+    /// inspection paths (`icm doctor`, `icm repair --dry-run`). A healthy DB
+    /// yields `["ok"]`. Never returns `Err`.
+    pub fn integrity_check_structural(&self) -> IcmResult<Vec<String>> {
+        let problems: Vec<String> = match self.run_integrity_pragma() {
+            Ok(lines) => lines.into_iter().filter(|l| l != "ok").collect(),
+            Err(e) => vec![format!("integrity_check pragma failed: {e}")],
+        };
+        if problems.is_empty() {
+            Ok(vec!["ok".to_string()])
+        } else {
+            Ok(problems)
+        }
+    }
+
+    /// Run `PRAGMA integrity_check` and collect its result rows.
+    fn run_integrity_pragma(&self) -> IcmResult<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("PRAGMA integrity_check")
+            .map_err(db_err)?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(db_err)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(db_err)?);
+        }
+        Ok(out)
+    }
+
+    /// Rebuild the FTS5 shadow tables from their content tables and `REINDEX`
+    /// every b-tree index (issue #313). This repairs the most common
+    /// corruption class — damaged indexes / FTS shadow tables with intact
+    /// base tables — without touching row data.
+    ///
+    /// Best-effort by design: a shadow table too damaged for `'rebuild'` to
+    /// even instantiate is skipped rather than aborting the whole repair, and
+    /// `REINDEX` failure is tolerated too. The caller re-runs
+    /// [`Self::integrity_check`] afterwards and reports any damage that
+    /// survived, so nothing is silently claimed fixed. Returns the FTS tables
+    /// that were successfully rebuilt.
+    pub fn rebuild_search_indexes(&self) -> IcmResult<Vec<String>> {
+        let mut rebuilt = Vec::new();
+        for table in FTS_TABLES {
+            let sql = format!("INSERT INTO {table}({table}) VALUES('rebuild');");
+            // A missing (legacy DB) or too-corrupt-to-instantiate shadow table
+            // is skipped rather than aborting; the post-repair integrity check
+            // surfaces any table that could not be restored.
+            if self.conn.execute_batch(&sql).is_ok() {
+                rebuilt.push(table.to_string());
+            }
+        }
+        // May fail on a badly damaged b-tree; the post-repair integrity check
+        // reports whatever REINDEX could not fix.
+        let _ = self.conn.execute_batch("REINDEX;");
+        Ok(rebuilt)
     }
 
     /// True when the store was opened read-only (issue #263). Read-like
@@ -164,8 +357,10 @@ impl SqliteStore {
         // which fails when the parent directory is non-writable.
         // The `immutable=1` URI flag tells SQLite the file will not
         // change during the connection's lifetime and stops it from
-        // touching WAL infrastructure entirely.
-        let conn = open_readonly_immutable(path)?;
+        // touching WAL infrastructure entirely. This is a one-shot probe
+        // (not a long-lived connection), so the staleness that #319 fixes
+        // for `open_readonly` does not apply here.
+        let conn = open_readonly_uri(path, true)?;
         // Probe for the metadata table — legacy DBs predate it.
         let has_table: bool = conn
             .query_row(
@@ -3830,6 +4025,114 @@ mod tests {
         Concept::new(memoir_id.into(), name.into(), definition.into())
     }
 
+    // === Integrity check / repair (issue #313) ===
+
+    #[test]
+    fn integrity_check_ok_on_healthy_db() {
+        let store = test_store();
+        store.store(make_memory("t", "healthy row")).unwrap();
+        assert_eq!(store.integrity_check().unwrap(), vec!["ok".to_string()]);
+    }
+
+    #[test]
+    fn integrity_check_structural_works_on_a_read_only_connection() {
+        // #313 follow-up: `icm doctor` / `repair --dry-run` must inspect a DB
+        // without a writable open. The structural check runs `PRAGMA
+        // integrity_check` only (no FTS INSERT), so it works read-only.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ro.db");
+        let _ = seed_writable_db(&path);
+
+        let ro = SqliteStore::open_readonly(&path).unwrap();
+        assert!(ro.is_readonly());
+        // Read-only structural check succeeds and reports healthy.
+        assert_eq!(
+            ro.integrity_check_structural().unwrap(),
+            vec!["ok".to_string()]
+        );
+        // The full check issues an FTS `INSERT` a read-only connection can't
+        // run, so it degrades to reporting that as a problem — which is exactly
+        // why the read-only inspection paths use the structural variant.
+        assert_ne!(ro.integrity_check().unwrap(), vec!["ok".to_string()]);
+    }
+
+    #[test]
+    fn rebuild_search_indexes_lists_fts_tables_and_keeps_integrity() {
+        let store = test_store();
+        store.store(make_memory("t", "a row to index")).unwrap();
+        let rebuilt = store.rebuild_search_indexes().unwrap();
+        // memories_fts always exists; the concepts/feedback/messages FTS
+        // tables are created by schema init too.
+        assert!(
+            rebuilt.contains(&"memories_fts".to_string()),
+            "got: {rebuilt:?}"
+        );
+        assert_eq!(store.integrity_check().unwrap(), vec!["ok".to_string()]);
+    }
+
+    #[test]
+    fn rebuild_search_indexes_regenerates_fts_from_content() {
+        // The core repair mechanism (#313): rebuilding must reconstruct the
+        // FTS index from the intact content table. Deterministically wipe the
+        // FTS index (the "index damaged, base table intact" class) and prove
+        // rebuild restores searchability.
+        let store = test_store();
+        store
+            .store(make_memory("t", "singulartoken repairable"))
+            .unwrap();
+
+        let fts_hits = |s: &SqliteStore| -> i64 {
+            s.conn
+                .query_row(
+                    "SELECT COUNT(*) FROM memories_fts WHERE memories_fts MATCH 'singulartoken'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        };
+        assert_eq!(fts_hits(&store), 1, "token should be indexed after store");
+
+        // Wipe the FTS index while leaving the content row in `memories`.
+        store
+            .conn
+            .execute_batch("INSERT INTO memories_fts(memories_fts) VALUES('delete-all');")
+            .unwrap();
+        assert_eq!(fts_hits(&store), 0, "index wiped → no FTS hit");
+
+        // integrity_check (rank=1 content check) must flag the desync so that
+        // `icm repair` actually triggers on it rather than reporting healthy.
+        assert_ne!(
+            store.integrity_check().unwrap(),
+            vec!["ok".to_string()],
+            "index/content desync must be detected"
+        );
+
+        store.rebuild_search_indexes().unwrap();
+        assert_eq!(fts_hits(&store), 1, "rebuild must regenerate the FTS index");
+        assert_eq!(store.integrity_check().unwrap(), vec!["ok".to_string()]);
+    }
+
+    #[test]
+    fn open_maintenance_errors_on_missing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("absent.db");
+        match SqliteStore::open_maintenance(&path) {
+            Ok(_) => panic!("open_maintenance on missing file must error"),
+            Err(IcmError::NotFound(_)) => {}
+            Err(other) => panic!("expected NotFound, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn open_maintenance_opens_existing_db_writable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("seeded.db");
+        let _ = seed_writable_db(&path);
+        let store = SqliteStore::open_maintenance(&path).unwrap();
+        assert!(!store.is_readonly());
+        assert_eq!(store.integrity_check().unwrap(), vec!["ok".to_string()]);
+    }
+
     // === Read-only store (issue #263) ===
 
     fn seed_writable_db(path: &Path) -> Memory {
@@ -3866,6 +4169,92 @@ mod tests {
         let got = ro.get(&seeded.id).unwrap().expect("memory must be present");
         assert_eq!(got.topic, "project:icm");
         assert_eq!(got.summary, "read-only fixture summary");
+    }
+
+    #[test]
+    fn read_only_connection_sees_writes_committed_after_open() {
+        // #319: a long-lived `--read-only serve` connection must observe
+        // writes that hooks/CLI commit to the same DB *after* the server
+        // opened. The old `immutable=1` open served a permanently stale
+        // snapshot (and eventually spurious "database disk image is malformed"
+        // on a healthy DB).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("live.db");
+        let _ = seed_writable_db(&path); // 1 memory, WAL mode
+
+        let ro = SqliteStore::open_readonly(&path).unwrap();
+        assert_eq!(ro.count().unwrap(), 1);
+
+        // A separate writer commits a new memory to the same file.
+        {
+            let rw = SqliteStore::new(&path).unwrap();
+            let mut m = make_memory("project:icm", "written after the reader opened");
+            m.embedding = Some(vec![0.2_f32; icm_core::DEFAULT_EMBEDDING_DIMS]);
+            rw.store(m).unwrap();
+        }
+
+        // The already-open read-only connection must now see it.
+        assert_eq!(
+            ro.count().unwrap(),
+            2,
+            "read-only connection must see writes committed after it opened"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_readonly_falls_back_to_immutable_on_unwritable_dir() {
+        // #263 must keep working after #319: on a `chmod -w` parent directory
+        // the live `mode=ro` open can't create the `-shm` sidecar for a WAL
+        // DB, so open_readonly must fall back to `immutable=1` and still read.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sandboxed.db");
+        let seeded = seed_writable_db(&path);
+        // Keep the DB in WAL mode (that's what forces the -shm requirement)
+        // but fold all rows into the main file and drop the sidecars, so a
+        // fresh read-only open must recreate -shm — which fails in a
+        // read-only dir. (A DELETE-mode DB would open fine via plain mode=ro
+        // and never exercise the fallback.)
+        {
+            let rw = SqliteStore::new(&path).unwrap();
+            rw.conn
+                .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+                .unwrap();
+        }
+        for ext in ["-wal", "-shm"] {
+            let mut side = path.as_os_str().to_os_string();
+            side.push(ext);
+            let _ = std::fs::remove_file(std::path::PathBuf::from(side));
+        }
+
+        let original = std::fs::metadata(dir.path()).unwrap().permissions();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        // Guard: confirm the live `mode=ro` path is genuinely unusable here,
+        // otherwise this test would pass without ever exercising the fallback.
+        let live_reads = match open_readonly_uri(&path, false) {
+            Ok(conn) => conn
+                .query_row("SELECT count(*) FROM sqlite_master", [], |_| Ok(()))
+                .is_ok(),
+            Err(_) => false,
+        };
+        // The public open_readonly must still succeed via the immutable fallback.
+        let opened = SqliteStore::open_readonly(&path);
+
+        // Restore permissions before asserting so tempdir cleanup succeeds.
+        std::fs::set_permissions(dir.path(), original).unwrap();
+
+        assert!(
+            !live_reads,
+            "sandbox setup must make the live mode=ro path unusable, else the fallback isn't tested"
+        );
+        let ro = opened.expect("read-only open must fall back to immutable on a chmod -w dir");
+        let got = ro
+            .get(&seeded.id)
+            .unwrap()
+            .expect("memory must be readable");
+        assert_eq!(got.topic, "project:icm");
     }
 
     #[test]
