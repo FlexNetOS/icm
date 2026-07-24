@@ -5690,7 +5690,10 @@ fn report_db_integrity(db_path: &std::path::Path) {
         );
         return;
     }
-    let store = match Store::open_maintenance(db_path) {
+    // Open READ-ONLY and run only the structural (PRAGMA) check: `doctor` is a
+    // diagnostic and must not write / checkpoint the DB it inspects. The deeper
+    // FTS content check runs during the actual `icm repair`.
+    let store = match Store::open_readonly(db_path) {
         Ok(s) => s,
         Err(e) => {
             println!(
@@ -5700,7 +5703,7 @@ fn report_db_integrity(db_path: &std::path::Path) {
             return;
         }
     };
-    match store.integrity_check() {
+    match store.integrity_check_structural() {
         Ok(rows) if rows.len() == 1 && rows[0] == "ok" => {
             println!("Database integrity: ok ({}).", db_path.display());
         }
@@ -5770,6 +5773,44 @@ fn cmd_repair(db_path: &std::path::Path, dry_run: bool) -> Result<()> {
         return Ok(());
     }
 
+    if dry_run {
+        // A dry run must NOT modify the DB — open READ-ONLY and run only the
+        // structural (PRAGMA) check (no writable open, no WAL checkpoint). The
+        // deeper FTS content check runs in the actual repair below.
+        let store = match Store::open_readonly(db_path) {
+            Ok(s) => s,
+            Err(e) => {
+                println!("Could not open {} for inspection: {e}", db_path.display());
+                return Ok(());
+            }
+        };
+        let problems = store.integrity_check_structural()?;
+        if problems.len() == 1 && problems[0] == "ok" {
+            println!(
+                "integrity_check (structural): ok — {} looks healthy.",
+                db_path.display()
+            );
+            println!("(dry run is read-only; run `icm repair` for the deeper FTS content check.)");
+            return Ok(());
+        }
+        println!(
+            "integrity_check reported {} structural problem(s) on {}:",
+            problems.len(),
+            db_path.display()
+        );
+        for line in problems.iter().take(8) {
+            println!("  - {line}");
+        }
+        if problems.len() > 8 {
+            println!("  … and {} more", problems.len() - 8);
+        }
+        println!(
+            "\n(dry run) Would back up the DB, rebuild FTS shadow tables + REINDEX, \
+             then re-check (the real run also runs a deeper FTS content check)."
+        );
+        return Ok(());
+    }
+
     let store = match Store::open_maintenance(db_path) {
         Ok(s) => s,
         Err(e) => {
@@ -5809,13 +5850,6 @@ fn cmd_repair(db_path: &std::path::Path, dry_run: bool) -> Result<()> {
     }
     if before.len() > 8 {
         println!("  … and {} more", before.len() - 8);
-    }
-
-    if dry_run {
-        println!(
-            "\n(dry run) Would back up the DB, rebuild FTS shadow tables + REINDEX, then re-check."
-        );
-        return Ok(());
     }
 
     // Always back up before mutating a damaged DB.
