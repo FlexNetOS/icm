@@ -566,6 +566,29 @@ enum Commands {
         no_preferences: bool,
     },
 
+    /// Compile the project's memories into an LLM wake-up briefing and cache it
+    /// (issue #165). `wake-up` and the SessionStart hook then load the cached
+    /// briefing with zero added latency. Regenerate on demand (cron / hook).
+    Briefing {
+        /// Project (default: auto-detect from PWD/git remote).
+        #[arg(short, long)]
+        project: Option<String>,
+
+        /// Summarizer provider: auto | claude | codex | gemini | ollama
+        /// (overrides `[consolidate.summarizer] provider`). `none` is rejected
+        /// — a briefing needs an LLM.
+        #[arg(long, value_name = "PROVIDER")]
+        summarizer_provider: Option<String>,
+
+        /// Summarizer model (provider-specific). Empty = provider's cheap default.
+        #[arg(long, value_name = "MODEL")]
+        summarizer_model: Option<String>,
+
+        /// Approximate token budget for the briefing.
+        #[arg(long, value_name = "N")]
+        summarizer_max_tokens: Option<usize>,
+    },
+
     /// Print the deterministic identity/preferences snapshot (issue #271)
     ///
     /// Unlike `wake-up` which mixes decisions/errors/milestones into a
@@ -1962,6 +1985,19 @@ fn main() -> Result<()> {
             format,
             no_preferences,
         } => cmd_wake_up(&store, project, max_tokens, format, no_preferences),
+        Commands::Briefing {
+            project,
+            summarizer_provider,
+            summarizer_model,
+            summarizer_max_tokens,
+        } => cmd_briefing(
+            &store,
+            project,
+            &cfg.consolidate.summarizer,
+            summarizer_provider.as_deref(),
+            summarizer_model.as_deref(),
+            summarizer_max_tokens,
+        ),
         Commands::Context {
             project,
             max_tokens,
@@ -3924,13 +3960,21 @@ fn build_hook_start_pack(store: &Store, stdin_json: &str, max_tokens: usize) -> 
         include_preferences: true,
     };
 
-    let pack = icm_core::build_wake_up(store, &opts)?;
+    // Compute the live static pack first, so its emptiness reflects the CURRENT
+    // store — the "start clean on empty store" guarantee must not be bypassed
+    // by a stale cache (a briefing whose memories were since pruned/forgotten).
+    let live_pack = icm_core::build_wake_up(store, &opts)?;
+    let wake_up_empty =
+        live_pack.trim().is_empty() || live_pack.starts_with(icm_core::EMPTY_PACK_HEADER);
 
-    // If the store is empty, skip injecting the placeholder output into the
-    // session — let the user start clean. We detect the empty case via the
-    // exported header constant, not substring matching the body, to stay
-    // decoupled from the exact wording in `icm_core::wake_up::render()`.
-    let wake_up_empty = pack.trim().is_empty() || pack.starts_with(icm_core::EMPTY_PACK_HEADER);
+    // Prefer a cached LLM briefing (issue #165) over the static semantic pack —
+    // but only when the live store actually has content for this project, so an
+    // empty store still starts clean.
+    let pack = if wake_up_empty {
+        live_pack
+    } else {
+        load_cached_briefing(project_name.as_deref()).unwrap_or(live_pack)
+    };
 
     if wake_up_empty && snapshot.is_empty() {
         return Ok(String::new());
@@ -7314,6 +7358,180 @@ fn cmd_recall_project(store: &Store, limit: usize) -> Result<()> {
 /// Selects critical/high memories (plus preferences) optionally scoped to a
 /// project, ranks by importance × recency × weight, and truncates to fit the
 /// token budget.
+/// Sanitize a project name into a safe cache filename (issue #165).
+fn briefing_filename(project: &str) -> String {
+    let safe: String = project
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || matches!(c, '-' | '_' | '.') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    format!("wake-up-{safe}.md")
+}
+
+/// Resolve the cache path for a project's LLM wake-up briefing (issue #165).
+/// Lives under the OS cache dir so it's disposable (`~/Library/Caches/…` on
+/// macOS, `~/.cache/icm/…` on Linux). Returns `None` if no cache dir resolves.
+fn briefing_cache_path(project: &str) -> Option<PathBuf> {
+    let dir = directories::ProjectDirs::from("dev", "icm", "icm")
+        .map(|d| d.cache_dir().join("briefings"))?;
+    Some(dir.join(briefing_filename(project)))
+}
+
+/// Load a briefing from an explicit path if it exists and is non-empty (pure,
+/// testable core of [`load_cached_briefing`]).
+fn load_cached_briefing_at(path: &std::path::Path) -> Option<String> {
+    let content = std::fs::read_to_string(path).ok()?;
+    if content.trim().is_empty() {
+        None
+    } else {
+        Some(content)
+    }
+}
+
+/// Load a cached LLM briefing for `project`, if one exists and is non-empty
+/// (issue #165). Used by the wake-up paths to prefer the richer briefing over
+/// the static bullet pack when the user has generated one.
+fn load_cached_briefing(project: Option<&str>) -> Option<String> {
+    load_cached_briefing_at(&briefing_cache_path(project?)?)
+}
+
+/// Build the LLM prompt that compiles a project's memories into a structured
+/// wake-up briefing (issue #165).
+fn build_briefing_prompt(
+    project: &str,
+    memories: &[icm_core::Memory],
+    max_tokens: usize,
+) -> String {
+    let mut joined = String::new();
+    for m in memories {
+        joined.push_str(&format!(
+            "- [{}] ({}) {}\n",
+            m.importance, m.topic, m.summary
+        ));
+    }
+    format!(
+        "Compile a wake-up briefing for the project '{project}' from its stored \
+         memories below. Write a concise, structured briefing (~{max_tokens} tokens \
+         max) that an AI agent reads at the start of a session. Use these sections, \
+         omitting any with no supporting content:\n\
+         ## State of work — what is in flight, what is blocked\n\
+         ## Recent decisions — the decision and its rationale\n\
+         ## Errors & resolutions — problems hit and how they were solved\n\
+         ## Preferences — project-specific user preferences to respect\n\
+         Be specific and factual; do NOT invent anything the memories don't support. \
+         Output Markdown only, no preamble.\n\n\
+         Memories:\n{joined}"
+    )
+}
+
+/// `icm briefing` — compile the project's memories into an LLM wake-up briefing
+/// and cache it (issue #165). Session start / `icm wake-up` then load the cached
+/// briefing with zero added latency. Regenerate on demand (cron / hook).
+fn cmd_briefing(
+    store: &Store,
+    project: Option<String>,
+    cfg: &config::SummarizerConfig,
+    cli_provider: Option<&str>,
+    cli_model: Option<&str>,
+    cli_max_tokens: Option<usize>,
+) -> Result<()> {
+    let detected;
+    let project_name: &str = match project.as_deref() {
+        Some(p) if !p.is_empty() && p != "-" => p,
+        _ => {
+            detected = detect_project();
+            if detected.is_empty() || detected == "unknown" {
+                bail!("could not auto-detect a project — pass --project <name>");
+            }
+            detected.as_str()
+        }
+    };
+
+    // A briefing is an LLM narrative; a lexical join isn't one. Refuse `none`.
+    let resolved = resolve_consolidate_provider(cfg, cli_provider)?;
+    if matches!(resolved, summarizer::ProviderKind::None) {
+        bail!(
+            "briefing needs an LLM summarizer (provider resolved to 'none'); \
+             pass --summarizer-provider <claude|codex|gemini|ollama>"
+        );
+    }
+
+    let mut memories: Vec<icm_core::Memory> = store
+        .list_all()?
+        .into_iter()
+        .filter(|m| {
+            icm_core::project_matches(&m.topic, Some(project_name))
+                || icm_core::is_preference_topic(&m.topic)
+        })
+        .collect();
+    if memories.is_empty() {
+        bail!("no memories found for project '{project_name}'");
+    }
+    // Feed the LLM the most important, most recent memories — not the entire
+    // topic history. Keeps the prompt (and latency) bounded and the briefing
+    // focused. Importance first (Critical→Low), then newest first.
+    let importance_rank = |i: &Importance| match i {
+        Importance::Critical => 0,
+        Importance::High => 1,
+        Importance::Medium => 2,
+        Importance::Low => 3,
+    };
+    memories.sort_by(|a, b| {
+        importance_rank(&a.importance)
+            .cmp(&importance_rank(&b.importance))
+            .then(b.created_at.cmp(&a.created_at))
+    });
+    const MAX_BRIEFING_MEMORIES: usize = 60;
+    memories.truncate(MAX_BRIEFING_MEMORIES);
+
+    let max_tokens = cli_max_tokens.unwrap_or_else(|| cfg.max_tokens.max(400));
+    let model_owned: Option<String> = cli_model.map(String::from).or_else(|| {
+        if cfg.model.is_empty() {
+            None
+        } else {
+            Some(cfg.model.clone())
+        }
+    });
+    let prompt = build_briefing_prompt(project_name, &memories, max_tokens);
+    let provider = summarizer::make_summarizer(resolved)?;
+    // A briefing is a heavier LLM task than a single-topic consolidation and an
+    // LLM CLI's cold start can be slow, so allow a more generous timeout than
+    // the shared consolidate default (still overridable upward via config).
+    let timeout_secs = cfg.timeout_secs.max(120);
+    let req = summarizer::SummarizeRequest {
+        prompt: &prompt,
+        model: model_owned.as_deref(),
+        max_tokens,
+        timeout: std::time::Duration::from_secs(timeout_secs),
+    };
+    let briefing = match provider.summarize(&req) {
+        Ok(s) if !s.trim().is_empty() => s,
+        Ok(_) => bail!("summarizer '{}' returned empty output", provider.name()),
+        Err(e) => bail!("summarizer '{}' failed: {e}", provider.name()),
+    };
+
+    let path = briefing_cache_path(project_name)
+        .ok_or_else(|| anyhow::anyhow!("cannot resolve cache directory"))?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating cache dir {}", parent.display()))?;
+    }
+    std::fs::write(&path, &briefing).with_context(|| format!("writing {}", path.display()))?;
+    println!(
+        "Wrote wake-up briefing for '{project_name}' ({} memories) via {} to {}",
+        memories.len(),
+        provider.name(),
+        path.display()
+    );
+    println!("It will be loaded at the next session start / `icm wake-up`.");
+    Ok(())
+}
+
 fn cmd_wake_up(
     store: &Store,
     project: Option<String>,
@@ -7346,7 +7564,19 @@ fn cmd_wake_up(
         include_preferences: !no_preferences,
     };
 
-    let pack = build_wake_up(store, &opts)?;
+    // Prefer a cached LLM briefing when one exists (issue #165) — but only when
+    // the live store has content for this project, so an empty/pruned store
+    // isn't masked by a stale cache. The `--format`/`--no-preferences`/budget
+    // options apply to the static fallback; a cached briefing is emitted as
+    // generated (regenerate with `icm briefing` to reflect option changes).
+    let live_pack = build_wake_up(store, &opts)?;
+    let live_empty =
+        live_pack.trim().is_empty() || live_pack.starts_with(icm_core::EMPTY_PACK_HEADER);
+    let pack = if live_empty {
+        live_pack
+    } else {
+        load_cached_briefing(project_ref).unwrap_or(live_pack)
+    };
     print!("{pack}");
     Ok(())
 }
@@ -9382,6 +9612,53 @@ mod hook_start_tests {
         // Explicit `none` is an accepted opt-in and does consolidate.
         assert!(cmd_consolidate_all(&store, 3, &cfg, Some("none"), None, None, false).is_ok());
         assert_eq!(store.count_by_topic("t").unwrap(), 1);
+    }
+
+    #[test]
+    fn briefing_filename_sanitizes() {
+        assert_eq!(briefing_filename("icm"), "wake-up-icm.md");
+        assert_eq!(briefing_filename("context-icm"), "wake-up-context-icm.md");
+        assert_eq!(briefing_filename("a/b c:d"), "wake-up-a_b_c_d.md");
+    }
+
+    #[test]
+    fn load_cached_briefing_at_present_empty_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("b.md");
+        assert!(load_cached_briefing_at(&path).is_none(), "missing → none");
+        std::fs::write(&path, "   \n").unwrap();
+        assert!(
+            load_cached_briefing_at(&path).is_none(),
+            "whitespace → none"
+        );
+        std::fs::write(&path, "## State of work\n- shipping").unwrap();
+        assert_eq!(
+            load_cached_briefing_at(&path).unwrap(),
+            "## State of work\n- shipping"
+        );
+    }
+
+    #[test]
+    fn build_briefing_prompt_has_sections_and_memories() {
+        use icm_core::{Importance, Memory};
+        let mems = vec![
+            Memory::new(
+                "decisions-icm".into(),
+                "use SQLite for storage".into(),
+                Importance::High,
+            ),
+            Memory::new(
+                "errors-resolved".into(),
+                "fixed the spawn loop".into(),
+                Importance::Critical,
+            ),
+        ];
+        let p = build_briefing_prompt("icm", &mems, 400);
+        assert!(p.contains("project 'icm'"));
+        assert!(p.contains("## State of work"));
+        assert!(p.contains("## Recent decisions"));
+        assert!(p.contains("use SQLite for storage"));
+        assert!(p.contains("fixed the spawn loop"));
     }
 
     #[test]
