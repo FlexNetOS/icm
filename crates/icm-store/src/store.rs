@@ -265,6 +265,25 @@ impl SqliteStore {
         }
     }
 
+    /// Structural-only integrity check (`PRAGMA integrity_check`), safe on a
+    /// read-only connection (issue #313 follow-up). Unlike
+    /// [`Self::integrity_check`] it does NOT run the FTS5 `'integrity-check'`
+    /// (which is an `INSERT` and needs a writable connection), so it never
+    /// mutates the DB or triggers a WAL checkpoint. Used by the read-only
+    /// inspection paths (`icm doctor`, `icm repair --dry-run`). A healthy DB
+    /// yields `["ok"]`. Never returns `Err`.
+    pub fn integrity_check_structural(&self) -> IcmResult<Vec<String>> {
+        let problems: Vec<String> = match self.run_integrity_pragma() {
+            Ok(lines) => lines.into_iter().filter(|l| l != "ok").collect(),
+            Err(e) => vec![format!("integrity_check pragma failed: {e}")],
+        };
+        if problems.is_empty() {
+            Ok(vec!["ok".to_string()])
+        } else {
+            Ok(problems)
+        }
+    }
+
     /// Run `PRAGMA integrity_check` and collect its result rows.
     fn run_integrity_pragma(&self) -> IcmResult<Vec<String>> {
         let mut stmt = self
@@ -4013,6 +4032,28 @@ mod tests {
         let store = test_store();
         store.store(make_memory("t", "healthy row")).unwrap();
         assert_eq!(store.integrity_check().unwrap(), vec!["ok".to_string()]);
+    }
+
+    #[test]
+    fn integrity_check_structural_works_on_a_read_only_connection() {
+        // #313 follow-up: `icm doctor` / `repair --dry-run` must inspect a DB
+        // without a writable open. The structural check runs `PRAGMA
+        // integrity_check` only (no FTS INSERT), so it works read-only.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ro.db");
+        let _ = seed_writable_db(&path);
+
+        let ro = SqliteStore::open_readonly(&path).unwrap();
+        assert!(ro.is_readonly());
+        // Read-only structural check succeeds and reports healthy.
+        assert_eq!(
+            ro.integrity_check_structural().unwrap(),
+            vec!["ok".to_string()]
+        );
+        // The full check issues an FTS `INSERT` a read-only connection can't
+        // run, so it degrades to reporting that as a problem — which is exactly
+        // why the read-only inspection paths use the structural variant.
+        assert_ne!(ro.integrity_check().unwrap(), vec!["ok".to_string()]);
     }
 
     #[test]

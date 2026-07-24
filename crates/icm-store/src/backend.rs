@@ -224,6 +224,19 @@ impl Store {
         }
     }
 
+    /// Structural-only integrity check, safe on a read-only connection
+    /// (issue #313 follow-up). Does not run the write-requiring FTS5 check.
+    pub fn integrity_check_structural(&self) -> IcmResult<Vec<String>> {
+        match self {
+            #[cfg(feature = "backend-sqlite")]
+            Store::Sqlite(s) => s.integrity_check_structural(),
+            #[allow(unreachable_patterns)]
+            _ => Err(IcmError::Config(
+                "integrity_check is only supported on the SQLite backend".into(),
+            )),
+        }
+    }
+
     /// Rebuild FTS shadow tables and `REINDEX` on the SQLite backend
     /// (issue #313). Returns the FTS tables rebuilt. Other backends return a
     /// config error.
