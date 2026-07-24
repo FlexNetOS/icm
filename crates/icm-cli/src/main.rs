@@ -3051,10 +3051,19 @@ fn read_transcript_capped(path: &str) -> std::io::Result<String> {
 /// non-UTF-8 input, which violates the Claude Code hook contract
 /// ("never block the user, never crash"). Audit #185 M (Hooks
 /// robustness).
+/// Max bytes read from hook stdin (a JSON event payload). Bounds memory so a
+/// pathological/hostile stdin can't exhaust it (security review, belt-and-
+/// suspenders — the caller is normally the trusted tool harness).
+const MAX_HOOK_STDIN_BYTES: u64 = 32 * 1024 * 1024;
+
 fn read_stdin_utf8_lossy() -> Option<String> {
     use std::io::Read;
     let mut bytes = Vec::new();
-    if std::io::stdin().read_to_end(&mut bytes).is_err() {
+    if std::io::stdin()
+        .take(MAX_HOOK_STDIN_BYTES)
+        .read_to_end(&mut bytes)
+        .is_err()
+    {
         return None;
     }
     String::from_utf8(bytes).ok()
@@ -5319,10 +5328,26 @@ struct DoctorTarget {
 /// Inspect a single hook command string. Returns `Some((bin_path, exists))`
 /// if the command references ICM, `None` if it should be skipped.
 fn check_icm_hook_command(cmd: &str) -> Option<(&str, bool)> {
+    let bin_path = cmd.split_whitespace().next().unwrap_or("");
+    // Harden against false positives (security review): require the invoked
+    // *binary* to actually be an icm binary, not merely a command that mentions
+    // "icm hook" somewhere (e.g. a note/arg of an unrelated tool). Otherwise
+    // `icm hook disable` could strip a legitimate non-ICM hook.
+    let base = bin_path
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(bin_path)
+        .to_ascii_lowercase();
+    let is_icm_binary = base == "icm"
+        || base == "icm.exe"
+        || base.starts_with("icm-post-tool")
+        || base.starts_with("icm-pretool");
+    if !is_icm_binary {
+        return None;
+    }
     if !cmd_matches_icm_pattern(cmd, "icm hook") && !cmd_matches_icm_pattern(cmd, "icm-post-tool") {
         return None;
     }
-    let bin_path = cmd.split_whitespace().next().unwrap_or("");
     let exists = std::path::Path::new(bin_path).exists();
     Some((bin_path, exists))
 }
@@ -10844,8 +10869,19 @@ mod doctor_tests {
         // counted, only icm-owned ones.
         assert!(check_icm_hook_command("/usr/bin/rtk hook claude").is_none());
         assert!(check_icm_hook_command("npx prettier --write").is_none());
+        // Security-review hardening: a non-ICM command that merely MENTIONS
+        // "icm hook" (in a note/arg) must not be misidentified as an ICM hook,
+        // or `icm hook disable` would strip it.
+        assert!(
+            check_icm_hook_command("mytool --note \"run icm hook later\"").is_none(),
+            "a non-icm binary mentioning 'icm hook' must not match"
+        );
+        assert!(check_icm_hook_command("/usr/local/bin/othertool icm-post-tool").is_none());
+        // Real ICM invocations still match (direct binary + `.exe` + post-tool).
         let (bin, exists) = check_icm_hook_command("/usr/local/bin/icm hook pre").unwrap();
         assert_eq!(bin, "/usr/local/bin/icm");
+        assert!(check_icm_hook_command("C:\\tools\\icm.exe hook post").is_some());
+        assert!(check_icm_hook_command("/opt/icm/icm-post-tool.sh").is_some());
         // Path doesn't actually exist on the test runner — `exists` is `false`.
         assert!(!exists);
     }
