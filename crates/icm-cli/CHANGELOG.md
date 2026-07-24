@@ -1,5 +1,38 @@
 # Changelog
 
+## [0.10.58](https://github.com/rtk-ai/icm/compare/icm-v0.10.57...icm-v0.10.58) (2026-07-24)
+
+
+### Features
+
+* **consolidate:** add `icm consolidate-all` for batch/cron rollups ([#179](https://github.com/rtk-ai/icm/issues/179)) ([b9b4d21](https://github.com/rtk-ai/icm/commit/b9b4d212a3e5ec55579d33c827c1d26c5297ce66))
+* **consolidate:** add `icm consolidate-all` for batch/cron rollups ([#179](https://github.com/rtk-ai/icm/issues/179)) ([6d7858c](https://github.com/rtk-ai/icm/commit/6d7858c021c3ab411905841b2495ca49a890cb49))
+* **hooks:** add `icm hook disable` ([#268](https://github.com/rtk-ai/icm/issues/268)) ([9c8c802](https://github.com/rtk-ai/icm/commit/9c8c80228f614fa0656b8e2b16e7770dd5cffa38))
+* **hooks:** add `icm hook disable` to remove ICM hooks ([#268](https://github.com/rtk-ai/icm/issues/268)) ([1c0c35f](https://github.com/rtk-ai/icm/commit/1c0c35f8209b97ea04f70a21597a16576aae9960))
+* **hooks:** note reformatting/comment-drop in hook disable output ([098d54a](https://github.com/rtk-ai/icm/commit/098d54a1ff85d79f2a538f702a535137c7956e1f))
+* **store:** `icm repair` + database integrity in `icm doctor` ([#313](https://github.com/rtk-ai/icm/issues/313)) ([48a1512](https://github.com/rtk-ai/icm/commit/48a15126ff9291e0d12cf7bd4c5a1817cf41d289))
+* **store:** icm repair + database integrity in icm doctor ([#313](https://github.com/rtk-ai/icm/issues/313)) ([ab80b04](https://github.com/rtk-ai/icm/commit/ab80b04d476a91c68290477cfec8baf23385543a))
+* **wake-up:** LLM-summarized briefing, cached + loaded at session start ([#165](https://github.com/rtk-ai/icm/issues/165)) ([f48fd7e](https://github.com/rtk-ai/icm/commit/f48fd7e3f81daf82c08911e31b2905f8087a78fc))
+* **wake-up:** LLM-summarized briefing, cached and loaded at session start ([#165](https://github.com/rtk-ai/icm/issues/165)) ([ba17fcb](https://github.com/rtk-ai/icm/commit/ba17fcb84b4c126614b798e2be13111e45e8422b))
+
+
+### Bug Fixes
+
+* **consolidate:** guard consolidate-all against lexical-by-default and threshold 0 ([67dd838](https://github.com/rtk-ai/icm/commit/67dd838db5d559a8f17e954ad86c0ad4fbdb0b17))
+* **hooks:** harden ICM-hook detection + cap hook stdin (security review) ([c5e43b2](https://github.com/rtk-ai/icm/commit/c5e43b23699bb232174eb40a379501360b261fc2))
+* **hooks:** harden ICM-hook detection + cap hook stdin (security review) ([e551c27](https://github.com/rtk-ai/icm/commit/e551c27814df67a74dd3520357faa1367b6160ee))
+* **hooks:** stop SessionEnd from spawning a self-sustaining claude -p loop ([#322](https://github.com/rtk-ai/icm/issues/322)) ([b2bb71d](https://github.com/rtk-ai/icm/commit/b2bb71d4a36786677f451aed3c1f2ab0e61b1a61))
+* **hooks:** stop SessionEnd self-sustaining `claude -p` spawn loop ([#322](https://github.com/rtk-ai/icm/issues/322)) ([e24961f](https://github.com/rtk-ai/icm/commit/e24961f323d9b8ec94cddb8cbacda3a6c5eded72))
+* **mcp:** honor auto_consolidate config on MCP store path ([#318](https://github.com/rtk-ai/icm/issues/318)) ([fea20f9](https://github.com/rtk-ai/icm/commit/fea20f91e3ac1cffb19eb742b98a1ebf44f3e8d2))
+* **mcp:** honor auto_consolidate config on the MCP store path ([#318](https://github.com/rtk-ai/icm/issues/318)) ([1accc36](https://github.com/rtk-ai/icm/commit/1accc36675d68ce28c33e4c409e528600408a640))
+* **recall:** keyword-OR fallback when FTS AND-match misses natural-language queries ([bd3a0f1](https://github.com/rtk-ai/icm/commit/bd3a0f187cb5020f6ea57a58fca2b3e309796226))
+* **recall:** keyword-OR fallback when FTS AND-match misses natural-language queries ([c54ffbe](https://github.com/rtk-ai/icm/commit/c54ffbe14a30a6591a25e738db978c33e5713add))
+* **recall:** rank keyword-fallback candidates by relevance, add cross-project coverage ([b934509](https://github.com/rtk-ai/icm/commit/b934509c9a8081c3a37ac3389eeb2227de3182ca))
+* **store:** detect FTS index/content desync (rank=1) + backup robustness ([#313](https://github.com/rtk-ai/icm/issues/313)) ([d16f3c1](https://github.com/rtk-ai/icm/commit/d16f3c171c0e3e44c1cfacdd211ee2c98edda8df))
+* **store:** make `icm doctor` and `repair --dry-run` truly read-only ([#313](https://github.com/rtk-ai/icm/issues/313)) ([af2cbc3](https://github.com/rtk-ai/icm/commit/af2cbc34938515bbd54e123d1065bd84e194302f))
+* **store:** make icm doctor and repair --dry-run truly read-only ([#313](https://github.com/rtk-ai/icm/issues/313)) ([bdc955a](https://github.com/rtk-ai/icm/commit/bdc955a0cefe1cf7e5354d70ca78238b3524abda))
+* **wake-up:** don't let a stale briefing cache mask an empty store ([#165](https://github.com/rtk-ai/icm/issues/165)) ([8bf702c](https://github.com/rtk-ai/icm/commit/8bf702c6f996e86356728e753c654a1d5199683e))
+
 ## [0.10.57](https://github.com/rtk-ai/icm/compare/icm-v0.10.56...icm-v0.10.57) (2026-06-24)
 
 
