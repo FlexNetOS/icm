@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.10.59](https://github.com/rtk-ai/icm/compare/icm-v0.10.58...icm-v0.10.59) (2026-07-25)
+
+
+### Features
+
+* **embeddings:** add load-dynamic ort variant for homebrew-core builds ([#345](https://github.com/rtk-ai/icm/issues/345)) ([#346](https://github.com/rtk-ai/icm/issues/346)) ([fe2fdcb](https://github.com/rtk-ai/icm/commit/fe2fdcbf4c8c77e742d8d5ae7786e698aeb4288c))
+* **embeddings:** first-launch opt-in onnxruntime download for load-dynamic build ([#345](https://github.com/rtk-ai/icm/issues/345)) ([#348](https://github.com/rtk-ai/icm/issues/348)) ([2b1d6e7](https://github.com/rtk-ai/icm/commit/2b1d6e7e387636cc6c6c5af93d5063e2cd563e96))
+
 ## [0.10.58](https://github.com/rtk-ai/icm/compare/icm-v0.10.57...icm-v0.10.58) (2026-07-24)
 
 
