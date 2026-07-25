@@ -1,6 +1,12 @@
 mod archive;
+// The bench suite embeds ~30 KB of synthetic fixtures (a full fake Rust
+// project) and ships agent-benchmark harness code; none of it belongs in the
+// production binary (audit finding). Compiled only with `--features bench`.
+#[cfg(feature = "bench")]
 mod bench_data;
+#[cfg(feature = "bench")]
 mod bench_format;
+#[cfg(feature = "bench")]
 mod bench_knowledge;
 
 pub mod cloud;
@@ -28,6 +34,7 @@ mod upgrade;
 mod web;
 
 use std::path::{Path, PathBuf};
+#[cfg(feature = "bench")]
 use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
@@ -480,6 +487,7 @@ enum Commands {
     },
 
     /// Run performance benchmark on in-memory store
+    #[cfg(feature = "bench")]
     Bench {
         /// Number of memories to seed
         #[arg(short, long, default_value = "1000")]
@@ -645,6 +653,7 @@ enum Commands {
     },
 
     /// Benchmark memory recall accuracy with and without ICM
+    #[cfg(feature = "bench")]
     BenchRecall {
         /// Model to use
         #[arg(short, long, default_value = "sonnet")]
@@ -660,6 +669,7 @@ enum Commands {
     },
 
     /// Benchmark Claude Code efficiency with and without ICM
+    #[cfg(feature = "bench")]
     BenchAgent {
         /// Number of sessions per mode
         #[arg(short, long, default_value = "10")]
@@ -685,6 +695,7 @@ enum Commands {
     /// `ANTHROPIC_API_KEY` set, also calls the Anthropic `count_tokens`
     /// API for true token counts (lets you see the Opus 4.7 tokenizer
     /// inflation directly).
+    #[cfg(feature = "bench")]
     BenchFormat {
         /// Number of synthetic memories in the fixture
         #[arg(short, long, default_value = "10")]
@@ -2110,18 +2121,22 @@ fn main() -> Result<()> {
         }
         Commands::Config => cmd_config(),
         Commands::Upgrade { apply, check } => upgrade::cmd_upgrade(apply, check),
+        #[cfg(feature = "bench")]
         Commands::Bench { count } => cmd_bench(count),
+        #[cfg(feature = "bench")]
         Commands::BenchRecall {
             model,
             runs,
             verbose,
         } => cmd_bench_recall(&model, runs, verbose),
+        #[cfg(feature = "bench")]
         Commands::BenchAgent {
             sessions,
             model,
             runs,
             verbose,
         } => cmd_bench_agent(sessions, &model, runs, verbose),
+        #[cfg(feature = "bench")]
         Commands::BenchFormat {
             count,
             model,
@@ -7837,6 +7852,7 @@ fn print_memory_detail(mem: &Memory, score: Option<f32>) {
 // Benchmark
 // ---------------------------------------------------------------------------
 
+#[cfg(feature = "bench")]
 fn cmd_bench(count: usize) -> Result<()> {
     const DIMS: usize = 384;
     const SEARCH_ITERS: usize = 100;
@@ -7949,6 +7965,7 @@ fn cmd_bench(count: usize) -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "bench")]
 fn print_bench_row(label: &str, ops: usize, total_ms: f64) {
     let per_op = total_ms / ops as f64;
     let (total_str, per_str) = (format_duration(total_ms), format_duration(per_op));
@@ -7958,6 +7975,7 @@ fn print_bench_row(label: &str, ops: usize, total_ms: f64) {
     );
 }
 
+#[cfg(feature = "bench")]
 fn format_duration(ms: f64) -> String {
     if ms < 0.001 {
         format!("{:.1} ns", ms * 1_000_000.0)
@@ -7974,6 +7992,7 @@ fn format_duration(ms: f64) -> String {
 // Agent Benchmark
 // ---------------------------------------------------------------------------
 
+#[cfg(feature = "bench")]
 struct SessionResult {
     num_turns: u64,
     input_tokens: u64,
@@ -7983,14 +8002,17 @@ struct SessionResult {
     response: String,
 }
 
+#[cfg(feature = "bench")]
 struct CleanupDir(PathBuf);
 
+#[cfg(feature = "bench")]
 impl Drop for CleanupDir {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
     }
 }
 
+#[cfg(feature = "bench")]
 fn cmd_bench_recall(model: &str, runs: usize, verbose: bool) -> Result<()> {
     // Check claude is in PATH
     let check = std::process::Command::new("claude")
@@ -8236,6 +8258,7 @@ fn cmd_bench_recall(model: &str, runs: usize, verbose: bool) -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "bench")]
 fn cmd_bench_agent(sessions: usize, model: &str, runs: usize, verbose: bool) -> Result<()> {
     // Check claude is in PATH
     let check = std::process::Command::new("claude")
@@ -8420,6 +8443,7 @@ fn cmd_bench_agent(sessions: usize, model: &str, runs: usize, verbose: bool) -> 
     Ok(())
 }
 
+#[cfg(feature = "bench")]
 fn pct_delta(a: f64, b: f64) -> f64 {
     if a == 0.0 {
         0.0
@@ -8428,6 +8452,7 @@ fn pct_delta(a: f64, b: f64) -> f64 {
     }
 }
 
+#[cfg(feature = "bench")]
 fn run_claude_session(
     prompt: &str,
     model: &str,
@@ -8494,6 +8519,7 @@ fn run_claude_session(
     Ok(parse_session_result(&json, wall_ms))
 }
 
+#[cfg(feature = "bench")]
 fn parse_session_result(json: &Value, wall_ms: u64) -> SessionResult {
     let num_turns = json.get("num_turns").and_then(|v| v.as_u64()).unwrap_or(1);
 
@@ -8547,6 +8573,7 @@ fn parse_session_result(json: &Value, wall_ms: u64) -> SessionResult {
     }
 }
 
+#[cfg(feature = "bench")]
 fn display_bench_results(
     without: &[SessionResult],
     with_icm: &[SessionResult],
@@ -8678,6 +8705,7 @@ fn display_bench_results(
     );
 }
 
+#[cfg(feature = "bench")]
 fn display_bench_results_averaged(
     all_wo: &[Vec<SessionResult>],
     all_wi: &[Vec<SessionResult>],
@@ -8830,6 +8858,7 @@ fn display_bench_results_averaged(
     }
 }
 
+#[cfg(feature = "bench")]
 fn aggregate_results(results: &[SessionResult]) -> SessionResult {
     SessionResult {
         num_turns: results.iter().map(|s| s.num_turns).sum(),
@@ -8841,6 +8870,7 @@ fn aggregate_results(results: &[SessionResult]) -> SessionResult {
     }
 }
 
+#[cfg(feature = "bench")]
 fn fmt_tokens(n: u64) -> String {
     if n >= 1_000_000 {
         format!("{:.1}M", n as f64 / 1_000_000.0)
@@ -8851,6 +8881,7 @@ fn fmt_tokens(n: u64) -> String {
     }
 }
 
+#[cfg(feature = "bench")]
 fn fmt_delta(without: f64, with_icm: f64) -> String {
     if without == 0.0 {
         return "N/A".into();
@@ -8863,14 +8894,17 @@ fn fmt_delta(without: f64, with_icm: f64) -> String {
     }
 }
 
+#[cfg(feature = "bench")]
 fn fmt_cost(c: f64) -> String {
     format!("${c:.4}")
 }
 
+#[cfg(feature = "bench")]
 fn fmt_duration_s(ms: u64) -> String {
     format!("{:.1}s", ms as f64 / 1000.0)
 }
 
+#[cfg(feature = "bench")]
 fn truncate_words(s: &str, max_chars: usize) -> String {
     let s = s.replace('\n', " ");
     if s.len() <= max_chars {
