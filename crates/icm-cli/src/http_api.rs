@@ -20,7 +20,10 @@
 //!
 //! Bound to `127.0.0.1` by default — the user has to type any other
 //! bind explicitly. An optional `--token` enables `Authorization:
-//! Bearer <token>` checking; absent token = open localhost API.
+//! Bearer <token>` checking; a loopback bind may run without one
+//! ("open localhost API"), but any other interface without a token
+//! is refused at startup — otherwise the full memory store would be
+//! reachable, unauthenticated, to anyone on that interface.
 
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -61,6 +64,24 @@ pub struct AppState {
     embedder: Option<Arc<dyn Embedder + Send + Sync>>,
     /// When set, every request must carry `Authorization: Bearer <token>`.
     token: Option<String>,
+}
+
+/// Audit finding: every store access here treated a poisoned Mutex as a
+/// *permanent* fault ("store poisoned", 500) rather than recovering, unlike
+/// `web.rs::lock_store` (fixed in #372) — a single panic anywhere in Store
+/// while the lock was held (a future bug, an upstream edge case) would
+/// permanently 500 all five endpoints (recall/store/consolidate/stats/
+/// topics) for the rest of the process, recoverable only by restarting
+/// `icm serve --http`. A stdlib Mutex poison flag carries no corruption
+/// guarantee for a plain data store — the guard's data is still valid,
+/// just possibly mid-mutation from the panicking call, which the store's
+/// own operations are already robust to (each is a self-contained SQL
+/// statement/transaction).
+fn lock_store(state: &AppState) -> std::sync::MutexGuard<'_, Store> {
+    state
+        .store
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 impl AppState {
@@ -160,6 +181,18 @@ pub struct ConsolidateReq {
 // Server entry
 // ---------------------------------------------------------------------------
 
+/// Pure guard, factored out for unit testing: reject a non-loopback bind
+/// with no token. Returns `Err(message)` when the combination is unsafe.
+fn check_bind_requires_token(addr: &SocketAddr, token: &Option<String>) -> Result<(), String> {
+    if token.is_none() && !addr.ip().is_loopback() {
+        return Err(format!(
+            "refusing to bind {addr}: only loopback addresses (127.0.0.1, ::1) may run \
+             without --token. Pass --token <TOKEN> to expose on other interfaces."
+        ));
+    }
+    Ok(())
+}
+
 /// Run the HTTP server until it's interrupted. Loads NOTHING beyond
 /// what the caller has already loaded — the warm store and embedder
 /// are pre-built by `cmd_serve` and handed to us as `Arc`s.
@@ -170,6 +203,14 @@ pub async fn run_http_server(
     addr: SocketAddr,
     token: Option<String>,
 ) -> Result<()> {
+    // A non-loopback bind with no token exposes the full memory store —
+    // recall, store, consolidate — to anyone who can reach the interface,
+    // with zero authentication (security audit finding). Loopback-only
+    // still works without a token, matching the doc comment's original
+    // intent ("absent token = open localhost API").
+    if let Err(msg) = check_bind_requires_token(&addr, &token) {
+        anyhow::bail!(msg);
+    }
     let state = AppState {
         store: Arc::new(Mutex::new(store)),
         embedder: embedder.map(Arc::from),
@@ -222,13 +263,27 @@ async fn auth_middleware(
         .and_then(|s| s.strip_prefix("Bearer "))
         .map(str::trim);
     match presented {
-        Some(tok) if tok == expected => next.run(request).await,
+        // Constant-time compare: a naive `==` leaks a timing side-channel an
+        // attacker can use to brute-force the token byte-by-byte (audit
+        // finding).
+        Some(tok) if constant_time_eq(tok.as_bytes(), expected.as_bytes()) => {
+            next.run(request).await
+        }
         _ => (
             StatusCode::UNAUTHORIZED,
             "missing or invalid Bearer token\n",
         )
             .into_response(),
     }
+}
+
+/// Compare two byte strings in time independent of where they first differ.
+/// Still short-circuits on length (safe: lengths aren't secret here).
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
 // ---------------------------------------------------------------------------
@@ -257,10 +312,7 @@ fn run_recall(state: &AppState, req: &RecallReq) -> Result<Vec<(Memory, Option<f
     if req.query.trim().is_empty() {
         anyhow::bail!("missing required field: query");
     }
-    let store = state
-        .store
-        .lock()
-        .map_err(|_| anyhow::anyhow!("store poisoned"))?;
+    let store = lock_store(state);
     if let Err(e) = store.maybe_auto_decay() {
         tracing::warn!(error = %e, "auto-decay failed during /recall");
     }
@@ -390,10 +442,7 @@ async fn handle_store(
         }
     }
 
-    let outcome = match state.store.lock() {
-        Ok(store) => store.store(mem.clone()),
-        Err(_) => return err_response(StatusCode::INTERNAL_SERVER_ERROR, "store poisoned", format),
-    };
+    let outcome = lock_store(&state).store(mem.clone());
     match outcome {
         Ok(id) => {
             let mut stored = mem;
@@ -452,10 +501,7 @@ async fn handle_consolidate(
     if req.topic.trim().is_empty() {
         return err_response(StatusCode::BAD_REQUEST, "topic required", format);
     }
-    let store = match state.store.lock() {
-        Ok(s) => s,
-        Err(_) => return err_response(StatusCode::INTERNAL_SERVER_ERROR, "store poisoned", format),
-    };
+    let store = lock_store(&state);
     let topic_memories = match store.get_by_topic(&req.topic) {
         Ok(ms) => ms,
         Err(e) => {
@@ -505,10 +551,7 @@ async fn handle_stats(
     Query(q): Query<FormatQuery>,
 ) -> Response {
     let format = OutputFormat::resolve(&q, &headers);
-    let store = match state.store.lock() {
-        Ok(s) => s,
-        Err(_) => return err_response(StatusCode::INTERNAL_SERVER_ERROR, "store poisoned", format),
-    };
+    let store = lock_store(&state);
     match store.stats() {
         Ok(s) => {
             let payload = json!({
@@ -557,10 +600,7 @@ async fn handle_topics(
     Query(q): Query<FormatQuery>,
 ) -> Response {
     let format = OutputFormat::resolve(&q, &headers);
-    let store = match state.store.lock() {
-        Ok(s) => s,
-        Err(_) => return err_response(StatusCode::INTERNAL_SERVER_ERROR, "store poisoned", format),
-    };
+    let store = lock_store(&state);
     match store.list_topics() {
         Ok(rows) => match format {
             OutputFormat::Json => json_value_response(json!(rows
@@ -728,5 +768,73 @@ mod tests {
 
         assert!(parse_keywords_value(None).is_empty());
         assert!(parse_keywords_value(Some(&json!(42))).is_empty());
+    }
+
+    /// Audit regression: a non-loopback bind with no `--token` exposes the
+    /// full memory store (recall/store/consolidate) unauthenticated to
+    /// anyone who can reach the interface — must be rejected.
+    #[test]
+    fn non_loopback_bind_without_token_is_rejected() {
+        let addr: SocketAddr = "0.0.0.0:8420".parse().unwrap();
+        let err = check_bind_requires_token(&addr, &None).unwrap_err();
+        assert!(err.contains("--token"));
+
+        let addr: SocketAddr = "203.0.113.5:8420".parse().unwrap();
+        assert!(check_bind_requires_token(&addr, &None).is_err());
+    }
+
+    #[test]
+    fn loopback_bind_without_token_is_still_allowed() {
+        // Loopback-only stays usable without a token — same intent as the
+        // module doc comment ("absent token = open localhost API"), just
+        // now scoped to loopback instead of any address.
+        let addr: SocketAddr = "127.0.0.1:8420".parse().unwrap();
+        assert!(check_bind_requires_token(&addr, &None).is_ok());
+        let addr: SocketAddr = "[::1]:8420".parse().unwrap();
+        assert!(check_bind_requires_token(&addr, &None).is_ok());
+    }
+
+    #[test]
+    fn non_loopback_bind_with_token_is_allowed() {
+        let addr: SocketAddr = "0.0.0.0:8420".parse().unwrap();
+        assert!(check_bind_requires_token(&addr, &Some("secret".into())).is_ok());
+    }
+
+    #[test]
+    fn constant_time_eq_matches_naive_equality() {
+        assert!(constant_time_eq(b"secret", b"secret"));
+        assert!(!constant_time_eq(b"secret", b"wrong!"));
+        assert!(!constant_time_eq(b"short", b"longer-string"));
+        assert!(constant_time_eq(b"", b""));
+    }
+
+    /// Audit regression: every store access here treated a poisoned Mutex
+    /// as a permanent fault ("store poisoned", 500), unlike web.rs's
+    /// lock_store (fixed in #372) — a single panic anywhere in Store while
+    /// the lock was held would permanently break recall/store/consolidate/
+    /// stats/topics for the rest of the process.
+    #[test]
+    fn lock_store_recovers_from_a_poisoned_mutex() {
+        let state = AppState {
+            store: Arc::new(Mutex::new(Store::in_memory().unwrap())),
+            embedder: None,
+            token: None,
+        };
+
+        // Poison the mutex: panic while holding the guard on another thread.
+        let poisoner = state.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoner.store.lock().unwrap();
+            panic!("intentional poison");
+        })
+        .join();
+        assert!(state.store.is_poisoned(), "setup: mutex must be poisoned");
+
+        // The recovering lock still yields a working store.
+        let store = lock_store(&state);
+        assert!(
+            store.stats().is_ok(),
+            "store must remain usable after poison"
+        );
     }
 }

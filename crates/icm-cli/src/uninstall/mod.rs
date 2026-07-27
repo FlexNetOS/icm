@@ -21,6 +21,21 @@ pub(crate) mod process;
 pub(crate) mod report;
 pub(crate) mod scan_dir;
 
+/// Write `content` to `path` atomically: write to a temp file in the same
+/// directory, then rename over the target. A crash or kill mid-write
+/// leaves either the old file fully intact or the new one fully written —
+/// never a truncated/corrupted file (audit finding: `formats.rs`/
+/// `backup.rs` both used plain `fs::write`, truncate-then-write, which can
+/// leave the user's real settings.json/config.toml or our own backup
+/// manifest half-written on a crash).
+pub(crate) fn atomic_write(path: &std::path::Path, content: &[u8]) -> std::io::Result<()> {
+    let mut tmp_name = path.file_name().unwrap_or_default().to_os_string();
+    tmp_name.push(".icm-tmp");
+    let tmp_path = path.with_file_name(tmp_name);
+    std::fs::write(&tmp_path, content)?;
+    std::fs::rename(&tmp_path, path)
+}
+
 /// CLI surface for `icm uninstall`. Kept here so the rest of the crate only
 /// imports `UninstallOpts` from this module.
 #[derive(Args, Debug, Clone)]
@@ -95,7 +110,9 @@ pub fn run(opts: UninstallOpts) -> Result<i32> {
     // corruption risk). Skip it otherwise — most users run in
     // --mode standard which never spawns `icm serve`.
     if opts.purge_data {
-        plan.processes = process::detect_icm_serve();
+        let detection = process::detect_icm_serve();
+        plan.processes = detection.processes;
+        plan.process_detection_unsupported = detection.unsupported;
     }
 
     // --- Read-only modes ---
@@ -159,14 +176,26 @@ pub fn run(opts: UninstallOpts) -> Result<i32> {
         // Refuse to purge while `icm serve` is running unless the user
         // explicitly opted in via `-y`. Serve keeps the SQLite DB open
         // via WAL; deleting underneath it can corrupt cross-session
-        // neighbour processes.
-        if !plan.processes.is_empty() && !opts.yes {
+        // neighbour processes. Audit finding: process detection isn't
+        // implemented on every platform (Windows/BSD) and can fail even
+        // where it is (e.g. `/proc` unreadable) — `process_detection_unsupported`
+        // must gate this the same as "a process was found," or an empty
+        // list silently defeats the only safeguard here.
+        if should_refuse_purge(&plan, opts.yes) {
             println!();
-            println!(
-                "Refusing to --purge-data: {} `icm serve` process(es) detected. \
-                Stop them with `pkill -f 'icm serve'` (or pass -y to override at your own risk).",
-                plan.processes.len()
-            );
+            if plan.process_detection_unsupported {
+                println!(
+                    "Refusing to --purge-data: `icm serve` process detection isn't \
+                    supported on this platform, so we can't confirm none is running. \
+                    Stop any `icm serve` process yourself, then pass -y to override."
+                );
+            } else {
+                println!(
+                    "Refusing to --purge-data: {} `icm serve` process(es) detected. \
+                    Stop them with `pkill -f 'icm serve'` (or pass -y to override at your own risk).",
+                    plan.processes.len()
+                );
+            }
             for p in &plan.processes {
                 println!("  pid={:<6} {}", p.pid, p.cmdline);
             }
@@ -177,6 +206,13 @@ pub fn run(opts: UninstallOpts) -> Result<i32> {
                     "WARNING: {} `icm serve` process(es) still running — \
                     purging the DB anyway because -y was passed.",
                     plan.processes.len()
+                );
+            } else if plan.process_detection_unsupported {
+                println!();
+                println!(
+                    "WARNING: process detection isn't supported on this platform — \
+                    purging the DB anyway because -y was passed. Make sure `icm serve` \
+                    isn't running."
                 );
             }
             let purge_outcomes = mutate::purge_data(&plan, &mut backup_session);
@@ -196,4 +232,91 @@ pub fn run(opts: UninstallOpts) -> Result<i32> {
         after.total_hits(),
     );
     Ok(exit)
+}
+
+/// Whether `--purge-data` must refuse: a live `icm serve` was detected, or
+/// detection wasn't possible at all (audit finding — an empty process list
+/// is otherwise indistinguishable from "confirmed nothing running"), and
+/// the user hasn't passed `-y` to override.
+fn should_refuse_purge(plan: &discover::RemovalPlan, yes: bool) -> bool {
+    (!plan.processes.is_empty() || plan.process_detection_unsupported) && !yes
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::uninstall::discover::RunningProcess;
+
+    #[test]
+    fn should_refuse_purge_when_a_process_is_detected() {
+        let mut plan = discover::RemovalPlan::default();
+        plan.processes.push(RunningProcess {
+            pid: 1234,
+            cmdline: "icm serve".into(),
+        });
+        assert!(should_refuse_purge(&plan, false));
+        assert!(!should_refuse_purge(&plan, true), "-y must override");
+    }
+
+    /// Audit regression: detection-unsupported must refuse by default, the
+    /// same as a confirmed-running process — not be treated as "confirmed
+    /// nothing running" just because the list happens to be empty.
+    #[test]
+    fn should_refuse_purge_when_detection_is_unsupported() {
+        let plan = discover::RemovalPlan {
+            process_detection_unsupported: true,
+            ..Default::default()
+        };
+        assert!(should_refuse_purge(&plan, false));
+        assert!(!should_refuse_purge(&plan, true), "-y must override");
+    }
+
+    #[test]
+    fn should_not_refuse_purge_when_confirmed_clean() {
+        let plan = discover::RemovalPlan::default();
+        assert!(!should_refuse_purge(&plan, false));
+    }
+
+    #[test]
+    fn atomic_write_replaces_content_and_leaves_no_temp_file() {
+        let dir =
+            std::env::temp_dir().join(format!("icm-atomic-write-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("target.txt");
+        std::fs::write(&path, "v1").unwrap();
+
+        atomic_write(&path, b"v2").unwrap();
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "v2");
+        assert!(!path.with_file_name("target.txt.icm-tmp").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Audit finding: plain `fs::write` truncates the destination before
+    /// writing, so a write failure mid-way corrupts the existing file. The
+    /// atomic version must leave the original file fully intact if the
+    /// (separate) temp file write fails, since the destination is only ever
+    /// touched by the final `rename`.
+    #[test]
+    fn atomic_write_preserves_original_when_temp_write_fails() {
+        let dir =
+            std::env::temp_dir().join(format!("icm-atomic-write-fail-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("target.txt");
+        std::fs::write(&path, "original").unwrap();
+        // Force the temp-file write to fail by pre-occupying its path with
+        // a directory instead of a plain file.
+        let tmp_path = path.with_file_name("target.txt.icm-tmp");
+        std::fs::create_dir_all(&tmp_path).unwrap();
+
+        let result = atomic_write(&path, b"new content");
+
+        assert!(result.is_err(), "write into a directory must fail");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "original",
+            "destination must be untouched when the temp write fails"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

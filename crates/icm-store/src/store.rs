@@ -419,8 +419,37 @@ impl SqliteStore {
         let now = Utc::now();
         let now_str = now.to_rfc3339();
 
-        // Atomic check-and-update: only one caller wins the race.
-        // First, try to claim the decay slot by inserting or conditionally updating.
+        // Audit finding: this used to apply a flat 0.95 step whenever >= 1
+        // day had passed, regardless of HOW MANY days had actually passed —
+        // a machine touched once a week decayed at 0.95/week (≈0.993/day)
+        // instead of the documented 0.95/day. Read the previous timestamp
+        // first so the step can be `0.95 ^ elapsed_days` (compounded),
+        // matching the documented per-day rate regardless of gaps between
+        // calls. (The 0.95 base itself stays hardcoded here — wiring the
+        // CLI's configurable `decay_rate` through to this crate is a
+        // separate, out-of-scope change.)
+        let last_decay_at: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT value FROM icm_metadata WHERE key = 'last_decay_at'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(db_err)?;
+        let elapsed_days = last_decay_at
+            .as_deref()
+            .and_then(|prev| prev.parse::<DateTime<Utc>>().ok())
+            .map(|prev| (now - prev).num_seconds() as f64 / 86_400.0)
+            .filter(|d| d.is_finite() && *d > 0.0)
+            .unwrap_or(1.0); // first run ever: preserve the historical single-step behavior
+
+        // Atomic check-and-update: only one caller wins the race. (A narrow
+        // window between the read above and this claim could let a losing
+        // racer's `elapsed_days` be computed from a slightly stale
+        // timestamp, but only one claim ever succeeds — a day or two of
+        // imprecision in a decay RATE is harmless, not worth a stricter
+        // compare-and-swap loop.)
         let changed = self
             .conn
             .execute(
@@ -432,7 +461,8 @@ impl SqliteStore {
             .map_err(db_err)?;
 
         if changed > 0 {
-            self.apply_decay(0.95)?;
+            let factor = 0.95_f64.powf(elapsed_days) as f32;
+            self.apply_decay(factor)?;
         }
 
         Ok(())
@@ -1002,6 +1032,32 @@ const SELECT_COLS: &str = "id, created_at, updated_at, last_accessed, access_cou
 /// A query like `"sqlite-vec"` makes FTS5 interpret `-` as NOT and `vec` as a
 /// column name, causing "no such column: vec".
 ///
+/// Escape `%`, `_`, and the escape character itself so a keyword can be
+/// safely wrapped in a `%...%` LIKE pattern. Pair with `ESCAPE '\'` in the
+/// SQL — without it, a keyword containing `%` matches every row and `_`
+/// matches any single character (audit finding).
+fn escape_like_wildcards(s: &str) -> String {
+    s.replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
+}
+
+/// Cap on auxiliary metadata (transcript sessions/messages) - best-effort
+/// truncation, not rejection, matching MAX_MESSAGE_BYTES's rationale.
+const MAX_METADATA_BYTES: usize = 8 * 1024;
+
+/// Truncate `s` to at most `max` bytes without splitting a UTF-8 char.
+fn truncate_at_char_boundary(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
+    }
+    let mut cut = max;
+    while !s.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    &s[..cut]
+}
+
 /// This function strips special chars and wraps each token in double quotes.
 fn sanitize_fts_query(query: &str) -> String {
     // Limit input length to prevent abuse (UTF-8 safe truncation)
@@ -1044,6 +1100,19 @@ fn sanitize_fts_query(query: &str) -> String {
     tokens.join(" ")
 }
 
+/// Whether `e` is FTS5 rejecting a malformed MATCH query (e.g. "hello AND",
+/// unbalanced parens) rather than a genuine database error. Used by
+/// `search_transcripts` to degrade to "no results" instead of surfacing a
+/// raw sqlite error, without pre-sanitizing the query text away from valid
+/// FTS5 syntax (which callers rely on — see
+/// `test_transcript_search_fts5_boolean_and_phrase`).
+fn is_fts5_syntax_error(e: &rusqlite::Error) -> bool {
+    matches!(
+        e,
+        rusqlite::Error::SqliteFailure(_, Some(msg)) if msg.contains("fts5: syntax error")
+    )
+}
+
 // ---------------------------------------------------------------------------
 // MemoryStore impl
 // ---------------------------------------------------------------------------
@@ -1079,41 +1148,49 @@ const MAX_TOPIC_BYTES: usize = 256;
 ///   `MAX_SUMMARY_BYTES` — see the constant docs for rationale.
 fn validate_and_normalize(mut memory: Memory) -> IcmResult<Memory> {
     memory.topic = memory.topic.trim().to_string();
+    validate_fields(&memory.topic, &memory.summary)?;
+    Ok(memory)
+}
 
-    if memory.topic.is_empty() {
+/// The borrowed core of [`validate_and_normalize`], shared with `update()`
+/// (audit finding: the update path previously bypassed every size/content
+/// check, so oversized or NUL-carrying payloads could enter the store by
+/// storing small then updating big).
+fn validate_fields(topic: &str, summary: &str) -> IcmResult<()> {
+    if topic.is_empty() {
         return Err(IcmError::InvalidInput("topic cannot be empty".into()));
     }
-    if memory.summary.trim().is_empty() {
+    if summary.trim().is_empty() {
         return Err(IcmError::InvalidInput("summary cannot be empty".into()));
     }
-    if memory.topic.contains('\0') {
+    if topic.contains('\0') {
         return Err(IcmError::InvalidInput(
             "topic must not contain NUL bytes".into(),
         ));
     }
-    if memory.summary.contains('\0') {
+    if summary.contains('\0') {
         return Err(IcmError::InvalidInput(
             "summary must not contain NUL bytes".into(),
         ));
     }
-    if memory.topic.contains(['\n', '\r', '\t']) {
+    if topic.contains(['\n', '\r', '\t']) {
         return Err(IcmError::InvalidInput(
             "topic must not contain newline / CR / tab characters".into(),
         ));
     }
-    if memory.topic.len() > MAX_TOPIC_BYTES {
+    if topic.len() > MAX_TOPIC_BYTES {
         return Err(IcmError::InvalidInput(format!(
             "topic exceeds {} bytes",
             MAX_TOPIC_BYTES
         )));
     }
-    if memory.summary.len() > MAX_SUMMARY_BYTES {
+    if summary.len() > MAX_SUMMARY_BYTES {
         return Err(IcmError::InvalidInput(format!(
             "summary exceeds {} bytes",
             MAX_SUMMARY_BYTES
         )));
     }
-    Ok(memory)
+    Ok(())
 }
 
 /// Local total order on `Importance` (Critical > High > Medium > Low).
@@ -1235,9 +1312,19 @@ impl SqliteStore {
             ) = self
                 .conn
                 .query_row(
+                    // Audit finding: `summary_hash` already encodes the topic
+                    // (Rust `to_lowercase()`, full Unicode) as part of the
+                    // hash input — an additional `LOWER(topic) = LOWER(?)`
+                    // comparison here used SQLite's built-in `LOWER()`,
+                    // which is ASCII-only and does not fold e.g. 'É' → 'é'.
+                    // For an all-caps accented topic like "DÉCISIONS" that
+                    // mismatch meant this SELECT could fail to find the row
+                    // the `INSERT OR IGNORE` conflict was already about,
+                    // even though `summary_hash` alone uniquely identifies
+                    // it. `summary_hash` is sufficient on its own.
                     "SELECT id, importance, keywords, raw_excerpt FROM memories
-                     WHERE LOWER(topic) = LOWER(?1) AND summary_hash = ?2",
-                    params![memory.topic, hash],
+                     WHERE summary_hash = ?1",
+                    params![hash],
                     |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
                 )
                 .map_err(db_err)?;
@@ -1348,6 +1435,11 @@ impl MemoryStore for SqliteStore {
     }
 
     fn update(&self, memory: &Memory) -> IcmResult<()> {
+        // Same constraints as `store()` — without this, oversized or
+        // NUL-carrying payloads could bypass validation by storing small
+        // then updating big (audit finding).
+        validate_fields(&memory.topic, &memory.summary)?;
+
         let keywords_json = serde_json::to_string(&memory.keywords)?;
         let related_json = serde_json::to_string(&memory.related_ids)?;
         let st = source_type(&memory.source);
@@ -1359,72 +1451,144 @@ impl MemoryStore for SqliteStore {
         // would otherwise reflect stale state.
         let hash = summary_hash(&memory.topic, &memory.summary);
 
-        let changed = self
-            .conn
-            .execute(
-                "UPDATE memories SET
-                 updated_at = ?2, last_accessed = ?3, access_count = ?4, weight = ?5,
-                 topic = ?6, summary = ?7, raw_excerpt = ?8, keywords = ?9,
-                 importance = ?10, source_type = ?11, source_data = ?12, related_ids = ?13,
-                 embedding = ?14, summary_hash = ?15
-                 WHERE id = ?1",
-                params![
-                    memory.id,
-                    memory.updated_at.to_rfc3339(),
-                    memory.last_accessed.to_rfc3339(),
-                    memory.access_count,
-                    memory.weight,
-                    memory.topic,
-                    memory.summary,
-                    memory.raw_excerpt,
-                    keywords_json,
-                    memory.importance.to_string(),
-                    st,
-                    sd,
-                    related_json,
-                    emb_blob,
-                    hash,
-                ],
-            )
+        // memories + vec_memories must move together: a failure between the
+        // row update and the vector sync would leave a memory invisible to
+        // (or stale in) vector search (audit finding — same pattern as
+        // `store()` / `consolidate_topic`).
+        self.conn
+            .execute_batch("BEGIN IMMEDIATE;")
             .map_err(db_err)?;
 
-        if changed == 0 {
-            return Err(IcmError::NotFound(memory.id.clone()));
-        }
-
-        // Sync vec_memories: always delete old, re-insert if embedding exists
-        let _ = self.conn.execute(
-            "DELETE FROM vec_memories WHERE memory_id = ?1",
-            params![memory.id],
-        );
-        if let Some(ref blob) = emb_blob {
-            self.conn
+        let result: IcmResult<()> = (|| {
+            let changed = self
+                .conn
                 .execute(
-                    "INSERT INTO vec_memories (memory_id, embedding) VALUES (?1, ?2)",
-                    params![memory.id, blob],
+                    "UPDATE memories SET
+                     updated_at = ?2, last_accessed = ?3, access_count = ?4, weight = ?5,
+                     topic = ?6, summary = ?7, raw_excerpt = ?8, keywords = ?9,
+                     importance = ?10, source_type = ?11, source_data = ?12, related_ids = ?13,
+                     embedding = ?14, summary_hash = ?15
+                     WHERE id = ?1",
+                    params![
+                        memory.id,
+                        memory.updated_at.to_rfc3339(),
+                        memory.last_accessed.to_rfc3339(),
+                        memory.access_count,
+                        memory.weight,
+                        memory.topic,
+                        memory.summary,
+                        memory.raw_excerpt,
+                        keywords_json,
+                        memory.importance.to_string(),
+                        st,
+                        sd,
+                        related_json,
+                        emb_blob,
+                        hash,
+                    ],
                 )
                 .map_err(db_err)?;
-        }
 
-        self.cache_invalidate(&memory.id);
-        Ok(())
+            if changed == 0 {
+                return Err(IcmError::NotFound(memory.id.clone()));
+            }
+
+            // Sync vec_memories: always delete old, re-insert if embedding exists
+            self.conn
+                .execute(
+                    "DELETE FROM vec_memories WHERE memory_id = ?1",
+                    params![memory.id],
+                )
+                .map_err(db_err)?;
+            if let Some(ref blob) = emb_blob {
+                self.conn
+                    .execute(
+                        "INSERT INTO vec_memories (memory_id, embedding) VALUES (?1, ?2)",
+                        params![memory.id, blob],
+                    )
+                    .map_err(db_err)?;
+            }
+            Ok(())
+        })();
+
+        match result {
+            Ok(()) => {
+                self.conn.execute_batch("COMMIT;").map_err(db_err)?;
+                self.cache_invalidate(&memory.id);
+                Ok(())
+            }
+            Err(e) => {
+                let _ = self.conn.execute_batch("ROLLBACK;");
+                Err(e)
+            }
+        }
     }
 
     fn delete(&self, id: &str) -> IcmResult<()> {
-        let _ = self
-            .conn
-            .execute("DELETE FROM vec_memories WHERE memory_id = ?1", params![id]);
-
-        let changed = self
-            .conn
-            .execute("DELETE FROM memories WHERE id = ?1", params![id])
+        // Both deletes in one transaction so a failure can't strand an
+        // orphaned vector or a memory whose vector is gone (audit finding).
+        self.conn
+            .execute_batch("BEGIN IMMEDIATE;")
             .map_err(db_err)?;
 
-        if changed == 0 {
-            return Err(IcmError::NotFound(id.to_string()));
+        let result: IcmResult<()> = (|| {
+            self.conn
+                .execute("DELETE FROM vec_memories WHERE memory_id = ?1", params![id])
+                .map_err(db_err)?;
+
+            let changed = self
+                .conn
+                .execute("DELETE FROM memories WHERE id = ?1", params![id])
+                .map_err(db_err)?;
+
+            if changed == 0 {
+                return Err(IcmError::NotFound(id.to_string()));
+            }
+
+            // Manual-testing finding: deleting a memory left it as a
+            // dangling entry in every other memory's `related_ids`
+            // (auto-link back-references) forever — `expand_with_neighbors`
+            // tolerates the miss silently, but each stale id still spends a
+            // slot out of the caller's `max_neighbors` budget instead of
+            // surfacing a real, live neighbor, and any external consumer of
+            // the JSON export sees a reference to nothing. Strip the
+            // deleted id from every `related_ids` array that mentions it.
+            // The `LIKE` clause is a cheap prefilter (only rows that could
+            // possibly match do the JSON rewrite); it matches the
+            // JSON-quoted form specifically so a ULID that happens to be a
+            // literal substring of another can't cause a false hit.
+            self.conn
+                .execute(
+                    "UPDATE memories
+                        SET related_ids = (
+                            SELECT COALESCE(json_group_array(value), '[]')
+                            FROM json_each(memories.related_ids)
+                            WHERE value != ?1
+                        )
+                        WHERE related_ids LIKE '%\"' || ?1 || '\"%'",
+                    params![id],
+                )
+                .map_err(db_err)?;
+
+            Ok(())
+        })();
+
+        match result {
+            Ok(()) => {
+                self.conn.execute_batch("COMMIT;").map_err(db_err)?;
+                // The related_ids cleanup above can touch an arbitrary
+                // number of other rows, not just `id` — clear the whole
+                // cache rather than tracking which ones, so a cached
+                // neighbor's `related_ids` can't keep serving the
+                // just-deleted id after this returns.
+                self.cache_clear();
+                Ok(())
+            }
+            Err(e) => {
+                let _ = self.conn.execute_batch("ROLLBACK;");
+                Err(e)
+            }
         }
-        self.cache_invalidate(id);
-        Ok(())
     }
 
     fn search_by_keywords(&self, keywords: &[&str], limit: usize) -> IcmResult<Vec<Memory>> {
@@ -1436,10 +1600,20 @@ impl MemoryStore for SqliteStore {
         let keywords = &keywords[..keywords.len().min(50)];
         let limit = limit.min(100);
 
+        // Audit finding: a keyword containing `%` or `_` was interpolated
+        // straight into the LIKE pattern unescaped. `%` matches every row
+        // (`"100%"` as a keyword becomes the pattern `%100%%%`, which
+        // degrades to "contains 100" at best and can blow up matching);
+        // `_` matches any single character (`"snake_case"` also matches
+        // "snakeXcase"). Both are plausible keywords coming from an LLM via
+        // MCP. Escape them and declare the escape character explicitly.
         let where_parts: Vec<String> = (0..keywords.len())
             .map(|i| {
                 let p = i + 1;
-                format!("(keywords LIKE ?{p} OR summary LIKE ?{p} OR topic LIKE ?{p})")
+                format!(
+                    "(keywords LIKE ?{p} ESCAPE '\\' OR summary LIKE ?{p} ESCAPE '\\' \
+                     OR topic LIKE ?{p} ESCAPE '\\')"
+                )
             })
             .collect();
         let where_clause = where_parts.join(" OR ");
@@ -1453,7 +1627,10 @@ impl MemoryStore for SqliteStore {
 
         let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = keywords
             .iter()
-            .map(|k| Box::new(format!("%{k}%")) as Box<dyn rusqlite::types::ToSql>)
+            .map(|k| {
+                Box::new(format!("%{}%", escape_like_wildcards(k)))
+                    as Box<dyn rusqlite::types::ToSql>
+            })
             .collect();
         param_values.push(Box::new(limit as i64));
 
@@ -1587,9 +1764,15 @@ impl MemoryStore for SqliteStore {
                 }) {
                     for row in rows.flatten() {
                         let (memory, rank) = row;
-                        // Normalize FTS rank (lower is better, typically negative)
-                        // Convert to 0..1 score where higher is better
-                        let score = 1.0 / (1.0 + rank.abs());
+                        // FTS5 bm25 rank is <= 0, MORE negative = MORE
+                        // relevant. `1.0 / (1.0 + |rank|)` inverted this: it
+                        // DECREASES as relevance increases (audit finding,
+                        // proven wrong e.g. rank=-4.83 (strong match) scored
+                        // 0.17 while rank=-0.2 (weak match) scored 0.83).
+                        // `|rank| / (1.0 + |rank|)` keeps the same bounded
+                        // [0,1) shape but is correctly monotonically
+                        // INCREASING in relevance.
+                        let score = rank.abs() / (1.0 + rank.abs());
                         fts_scores.insert(memory.id.clone(), score);
                         all_memories.insert(memory.id.clone(), memory);
                     }
@@ -1704,10 +1887,19 @@ impl MemoryStore for SqliteStore {
         //   high:     0.5x decay (half speed)
         //   medium:   1.0x decay (normal)
         //   low:      2.0x decay (double speed)
+        // Audit finding: for `low` importance (2x multiplier) with a
+        // low-access memory, the multiplier `1.0 - (1.0-f)*mult/denom` goes
+        // NEGATIVE once `f < 0.5` — `icm decay --factor 0.4` (accepted by
+        // the CLI's own `[0.0, 1.0)` validation) drove low-importance
+        // weights negative, putting them last in every `ORDER BY weight
+        // DESC` and prunable on the next pass. `MAX(0.0, ...)` clamps the
+        // multiplier at the SQL layer so weight can never go negative
+        // regardless of the caller (CLI, MCP, or any future direct caller
+        // that bypasses the CLI's own boundary check).
         let changed = self
             .conn
             .execute(
-                "UPDATE memories SET weight = weight * (
+                "UPDATE memories SET weight = weight * MAX(0.0,
                     1.0 - (1.0 - ?1) *
                     CASE importance
                         WHEN 'high' THEN 0.5
@@ -1728,26 +1920,45 @@ impl MemoryStore for SqliteStore {
     }
 
     fn prune(&self, weight_threshold: f32) -> IcmResult<usize> {
-        // Never prune critical or high importance memories
-        let _ = self.conn.execute(
-            "DELETE FROM vec_memories WHERE memory_id IN (
-                SELECT id FROM memories WHERE weight < ?1 AND importance NOT IN ('critical', 'high')
-            )",
-            params![weight_threshold],
-        );
+        // Never prune critical or high importance memories. Both deletes in
+        // one transaction, and the vec_memories error is propagated instead
+        // of swallowed — a partial prune would leave orphaned vectors that
+        // keep matching KNN search for rows that no longer exist (audit
+        // finding).
+        self.conn
+            .execute_batch("BEGIN IMMEDIATE;")
+            .map_err(db_err)?;
 
-        let changed = self
-            .conn
-            .execute(
-                "DELETE FROM memories WHERE weight < ?1 AND importance NOT IN ('critical', 'high')",
+        let result: IcmResult<usize> = (|| {
+            self.conn.execute(
+                "DELETE FROM vec_memories WHERE memory_id IN (
+                    SELECT id FROM memories WHERE weight < ?1 AND importance NOT IN ('critical', 'high')
+                )",
                 params![weight_threshold],
             )
             .map_err(db_err)?;
 
-        if changed > 0 {
-            self.cache_clear();
+            self.conn
+                .execute(
+                    "DELETE FROM memories WHERE weight < ?1 AND importance NOT IN ('critical', 'high')",
+                    params![weight_threshold],
+                )
+                .map_err(db_err)
+        })();
+
+        match result {
+            Ok(changed) => {
+                self.conn.execute_batch("COMMIT;").map_err(db_err)?;
+                if changed > 0 {
+                    self.cache_clear();
+                }
+                Ok(changed)
+            }
+            Err(e) => {
+                let _ = self.conn.execute_batch("ROLLBACK;");
+                Err(e)
+            }
         }
-        Ok(changed)
     }
 
     fn get_by_topic(&self, topic: &str) -> IcmResult<Vec<Memory>> {
@@ -1793,14 +2004,40 @@ impl MemoryStore for SqliteStore {
     }
 
     fn consolidate_topic(&self, topic: &str, consolidated: Memory) -> IcmResult<()> {
+        // The consolidated memory goes through the same validation as any
+        // other write — MCP `icm_memory_consolidate` passes a caller-provided
+        // summary that previously bypassed every size/content check.
+        let consolidated = validate_and_normalize(consolidated)?;
+
         self.conn
             .execute_batch("BEGIN IMMEDIATE;")
             .map_err(db_err)?;
 
+        // Manual-testing finding: captured before the delete below, since
+        // afterward the rows (and thus this query) are gone. Used to clean
+        // up any *other* memory's related_ids that pointed at these —
+        // same dangling-reference bug already fixed for the single-id
+        // `delete`, reachable here too since this is a second, separate
+        // bulk-delete code path.
+        let deleted_ids: Vec<String> = {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT id FROM memories WHERE topic = ?1 AND importance != 'critical'")
+                .map_err(db_err)?;
+            let rows = stmt
+                .query_map(params![topic], |row| row.get::<_, String>(0))
+                .map_err(db_err)?;
+            rows.collect::<rusqlite::Result<Vec<_>>>().map_err(db_err)?
+        };
+
+        // `critical` memories are never deleted — same contract as
+        // `apply_decay` and `prune`. Consolidation replaces the expendable
+        // tail of a topic, not its "never forget" entries (audit finding:
+        // this DELETE previously wiped critical memories too).
         // Clean vec_memories for entries about to be deleted
         if let Err(e) = self.conn.execute(
             "DELETE FROM vec_memories WHERE memory_id IN (
-                SELECT id FROM memories WHERE topic = ?1
+                SELECT id FROM memories WHERE topic = ?1 AND importance != 'critical'
             )",
             params![topic],
         ) {
@@ -1809,13 +2046,34 @@ impl MemoryStore for SqliteStore {
             return Err(IcmError::Database(e.to_string()));
         }
 
-        if let Err(e) = self
-            .conn
-            .execute("DELETE FROM memories WHERE topic = ?1", params![topic])
-        {
+        if let Err(e) = self.conn.execute(
+            "DELETE FROM memories WHERE topic = ?1 AND importance != 'critical'",
+            params![topic],
+        ) {
             tracing::warn!(topic, error = %e, "consolidate_topic: rolling back after memories delete failed");
             let _ = self.conn.execute_batch("ROLLBACK;");
             return Err(IcmError::Database(e.to_string()));
+        }
+
+        if !deleted_ids.is_empty() {
+            let ids_json = serde_json::to_string(&deleted_ids).map_err(IcmError::from)?;
+            if let Err(e) = self.conn.execute(
+                "UPDATE memories
+                    SET related_ids = (
+                        SELECT COALESCE(json_group_array(value), '[]')
+                        FROM json_each(memories.related_ids)
+                        WHERE value NOT IN (SELECT value FROM json_each(?1))
+                    )
+                    WHERE EXISTS (
+                        SELECT 1 FROM json_each(memories.related_ids)
+                        WHERE value IN (SELECT value FROM json_each(?1))
+                    )",
+                params![ids_json],
+            ) {
+                tracing::warn!(topic, error = %e, "consolidate_topic: rolling back after related_ids cleanup failed");
+                let _ = self.conn.execute_batch("ROLLBACK;");
+                return Err(IcmError::Database(e.to_string()));
+            }
         }
 
         if let Err(e) = self.store_inner(&consolidated) {
@@ -2291,15 +2549,18 @@ impl MemoirStore for SqliteStore {
         label: &Label,
         limit: usize,
     ) -> IcmResult<Vec<Concept>> {
-        // Search JSON labels column using LIKE with the serialized label pattern
+        // Search JSON labels column using LIKE with the serialized label pattern.
+        // namespace/value come from the caller (MCP tool args) and can contain
+        // %/_ ; escape them so they can't turn into unintended wildcards.
         let pattern = format!(
             "%\"namespace\":\"{}\"%\"value\":\"{}\"%",
-            label.namespace, label.value
+            escape_like_wildcards(&label.namespace),
+            escape_like_wildcards(&label.value)
         );
 
         let sql = format!(
             "SELECT {CONCEPT_COLS} FROM concepts
-             WHERE memoir_id = ?1 AND labels LIKE ?2
+             WHERE memoir_id = ?1 AND labels LIKE ?2 ESCAPE '\\'
              ORDER BY confidence DESC
              LIMIT ?3"
         );
@@ -2839,13 +3100,14 @@ fn row_to_fact(row: &rusqlite::Row<'_>) -> rusqlite::Result<Fact> {
     })
 }
 
-impl FactsStore for SqliteStore {
-    fn set_fact(&self, entity: &str, key: &str, value: &str, source: &str) -> IcmResult<String> {
-        if entity.is_empty() || key.is_empty() {
-            return Err(IcmError::InvalidInput(
-                "entity and key must be non-empty".into(),
-            ));
-        }
+impl SqliteStore {
+    fn set_fact_inner(
+        &self,
+        entity: &str,
+        key: &str,
+        value: &str,
+        source: &str,
+    ) -> IcmResult<String> {
         let conn = &self.conn;
         // Active row lookup
         let existing: Option<(String, String)> = conn
@@ -2891,6 +3153,36 @@ impl FactsStore for SqliteStore {
         )
         .map_err(db_err)?;
         Ok(new.id)
+    }
+}
+
+impl FactsStore for SqliteStore {
+    fn set_fact(&self, entity: &str, key: &str, value: &str, source: &str) -> IcmResult<String> {
+        if entity.is_empty() || key.is_empty() {
+            return Err(IcmError::InvalidInput(
+                "entity and key must be non-empty".into(),
+            ));
+        }
+        // SELECT (find active row) -> UPDATE (supersede it) -> INSERT (new
+        // row) was three separate statements with no transaction around
+        // them, unlike every other multi-statement write in this file
+        // (audit finding: 0 BEGIN IMMEDIATE occurrences across
+        // Facts/Feedback/Transcript vs 5 in MemoryStore). A crash or
+        // concurrent writer between the UPDATE and the INSERT could leave
+        // the entity/key with no active fact at all.
+        self.conn
+            .execute_batch("BEGIN IMMEDIATE;")
+            .map_err(db_err)?;
+        match self.set_fact_inner(entity, key, value, source) {
+            Ok(id) => {
+                self.conn.execute_batch("COMMIT;").map_err(db_err)?;
+                Ok(id)
+            }
+            Err(e) => {
+                let _ = self.conn.execute_batch("ROLLBACK;");
+                Err(e)
+            }
+        }
     }
 
     fn get_fact(&self, entity: &str, key: &str) -> IcmResult<Option<Fact>> {
@@ -3070,6 +3362,7 @@ impl TranscriptStore for SqliteStore {
         project: Option<&str>,
         metadata: Option<&str>,
     ) -> IcmResult<String> {
+        let metadata = metadata.map(|s| truncate_at_char_boundary(s, MAX_METADATA_BYTES));
         let session = Session::new(
             agent.to_string(),
             project.map(|s| s.to_string()),
@@ -3118,6 +3411,7 @@ impl TranscriptStore for SqliteStore {
     ) -> IcmResult<String> {
         let conn = &self.conn;
         let now = chrono::Utc::now().to_rfc3339();
+        let metadata = metadata.map(|s| truncate_at_char_boundary(s, MAX_METADATA_BYTES));
         // INSERT OR IGNORE keeps the first row stable across re-fires.
         // The `id` is the host agent's session id (Claude Code, Codex,
         // Gemini, etc.) so repeated hook posts route to the same row.
@@ -3174,6 +3468,21 @@ impl TranscriptStore for SqliteStore {
         tokens: Option<i64>,
         metadata: Option<&str>,
     ) -> IcmResult<String> {
+        /// Cap on a single transcript message. Unlike memory writes (which
+        /// reject oversized input), transcripts are best-effort logs — a
+        /// multi-MB tool dump is truncated rather than lost entirely. The
+        /// MCP `icm_transcript_record` path previously had no bound at all
+        /// (audit finding).
+        const MAX_MESSAGE_BYTES: usize = 256 * 1024;
+        // metadata/tool_name got no cap at all even after content was capped
+        // in round 2 (audit finding) - same best-effort-truncate rationale,
+        // just smaller since they're auxiliary, not the main payload.
+        const MAX_TOOL_NAME_BYTES: usize = 512;
+
+        let content = truncate_at_char_boundary(content, MAX_MESSAGE_BYTES);
+        let tool_name = tool_name.map(|s| truncate_at_char_boundary(s, MAX_TOOL_NAME_BYTES));
+        let metadata = metadata.map(|s| truncate_at_char_boundary(s, MAX_METADATA_BYTES));
+
         let msg = Message::new(
             session_id.to_string(),
             role,
@@ -3255,6 +3564,15 @@ impl TranscriptStore for SqliteStore {
         project: Option<&str>,
         limit: usize,
     ) -> IcmResult<Vec<TranscriptHit>> {
+        // Unlike search_feedback, raw query text is bound straight to
+        // `messages_fts MATCH ?1` — intentionally, since callers rely on
+        // real FTS5 syntax here (boolean OR, phrase quoting; see
+        // test_transcript_search_fts5_boolean_and_phrase). Sanitizing like
+        // search_feedback does would silently break that. Malformed syntax
+        // (e.g. "hello AND", "(hello") threw a raw sqlite error instead of
+        // degrading gracefully (audit finding) — that's handled below by
+        // treating an FTS5 syntax error as "no results" rather than
+        // propagating the sqlite internals to the caller.
         let conn = &self.conn;
         // Build dynamic WHERE filters. FTS MATCH comes first for index usage.
         let mut sql = String::from(
@@ -3289,127 +3607,129 @@ impl TranscriptStore for SqliteStore {
 
         let mut stmt = conn.prepare(&sql).map_err(db_err)?;
         let limit_i = limit as i64;
-        let rows: Vec<TranscriptHit> = match (session_id, project) {
-            (Some(sid), Some(p)) => stmt
-                .query_map(params![query, sid, p, limit_i], |row| {
-                    let msg = Message {
-                        id: row.get("id")?,
-                        session_id: row.get("session_id")?,
-                        role: Role::parse(&row.get::<_, String>("role")?).unwrap_or(Role::Tool),
-                        content: row.get("content")?,
-                        tool_name: row.get("tool_name")?,
-                        tokens: row.get("tokens")?,
-                        ts: parse_ts(&row.get::<_, String>("ts")?),
-                        metadata: row.get("metadata")?,
-                    };
-                    let sess = Session {
-                        id: row.get("s_id")?,
-                        agent: row.get("s_agent")?,
-                        project: row.get("s_project")?,
-                        started_at: parse_ts(&row.get::<_, String>("s_started_at")?),
-                        updated_at: parse_ts(&row.get::<_, String>("s_updated_at")?),
-                        metadata: row.get("s_metadata")?,
-                    };
-                    let raw_score: f64 = row.get("score")?;
-                    Ok(TranscriptHit {
-                        message: msg,
-                        session: sess,
-                        score: -raw_score, // FTS5 bm25 returns negative for better rank
-                    })
-                })
-                .map_err(db_err)?
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(db_err)?,
-            (Some(sid), None) => stmt
-                .query_map(params![query, sid, limit_i], |row| {
-                    let msg = Message {
-                        id: row.get("id")?,
-                        session_id: row.get("session_id")?,
-                        role: Role::parse(&row.get::<_, String>("role")?).unwrap_or(Role::Tool),
-                        content: row.get("content")?,
-                        tool_name: row.get("tool_name")?,
-                        tokens: row.get("tokens")?,
-                        ts: parse_ts(&row.get::<_, String>("ts")?),
-                        metadata: row.get("metadata")?,
-                    };
-                    let sess = Session {
-                        id: row.get("s_id")?,
-                        agent: row.get("s_agent")?,
-                        project: row.get("s_project")?,
-                        started_at: parse_ts(&row.get::<_, String>("s_started_at")?),
-                        updated_at: parse_ts(&row.get::<_, String>("s_updated_at")?),
-                        metadata: row.get("s_metadata")?,
-                    };
-                    let raw_score: f64 = row.get("score")?;
-                    Ok(TranscriptHit {
-                        message: msg,
-                        session: sess,
-                        score: -raw_score,
-                    })
-                })
-                .map_err(db_err)?
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(db_err)?,
-            (None, Some(p)) => stmt
-                .query_map(params![query, p, limit_i], |row| {
-                    let msg = Message {
-                        id: row.get("id")?,
-                        session_id: row.get("session_id")?,
-                        role: Role::parse(&row.get::<_, String>("role")?).unwrap_or(Role::Tool),
-                        content: row.get("content")?,
-                        tool_name: row.get("tool_name")?,
-                        tokens: row.get("tokens")?,
-                        ts: parse_ts(&row.get::<_, String>("ts")?),
-                        metadata: row.get("metadata")?,
-                    };
-                    let sess = Session {
-                        id: row.get("s_id")?,
-                        agent: row.get("s_agent")?,
-                        project: row.get("s_project")?,
-                        started_at: parse_ts(&row.get::<_, String>("s_started_at")?),
-                        updated_at: parse_ts(&row.get::<_, String>("s_updated_at")?),
-                        metadata: row.get("s_metadata")?,
-                    };
-                    let raw_score: f64 = row.get("score")?;
-                    Ok(TranscriptHit {
-                        message: msg,
-                        session: sess,
-                        score: -raw_score,
-                    })
-                })
-                .map_err(db_err)?
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(db_err)?,
-            (None, None) => stmt
-                .query_map(params![query, limit_i], |row| {
-                    let msg = Message {
-                        id: row.get("id")?,
-                        session_id: row.get("session_id")?,
-                        role: Role::parse(&row.get::<_, String>("role")?).unwrap_or(Role::Tool),
-                        content: row.get("content")?,
-                        tool_name: row.get("tool_name")?,
-                        tokens: row.get("tokens")?,
-                        ts: parse_ts(&row.get::<_, String>("ts")?),
-                        metadata: row.get("metadata")?,
-                    };
-                    let sess = Session {
-                        id: row.get("s_id")?,
-                        agent: row.get("s_agent")?,
-                        project: row.get("s_project")?,
-                        started_at: parse_ts(&row.get::<_, String>("s_started_at")?),
-                        updated_at: parse_ts(&row.get::<_, String>("s_updated_at")?),
-                        metadata: row.get("s_metadata")?,
-                    };
-                    let raw_score: f64 = row.get("score")?;
-                    Ok(TranscriptHit {
-                        message: msg,
-                        session: sess,
-                        score: -raw_score,
-                    })
-                })
-                .map_err(db_err)?
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(db_err)?,
+        // Compute against raw rusqlite errors so a malformed FTS5 query
+        // (syntax error) can be distinguished from a real db failure below,
+        // instead of eagerly converting to IcmError via `?`.
+        let mut compute = || -> rusqlite::Result<Vec<TranscriptHit>> {
+            Ok(match (session_id, project) {
+                (Some(sid), Some(p)) => stmt
+                    .query_map(params![query, sid, p, limit_i], |row| {
+                        let msg = Message {
+                            id: row.get("id")?,
+                            session_id: row.get("session_id")?,
+                            role: Role::parse(&row.get::<_, String>("role")?).unwrap_or(Role::Tool),
+                            content: row.get("content")?,
+                            tool_name: row.get("tool_name")?,
+                            tokens: row.get("tokens")?,
+                            ts: parse_ts(&row.get::<_, String>("ts")?),
+                            metadata: row.get("metadata")?,
+                        };
+                        let sess = Session {
+                            id: row.get("s_id")?,
+                            agent: row.get("s_agent")?,
+                            project: row.get("s_project")?,
+                            started_at: parse_ts(&row.get::<_, String>("s_started_at")?),
+                            updated_at: parse_ts(&row.get::<_, String>("s_updated_at")?),
+                            metadata: row.get("s_metadata")?,
+                        };
+                        let raw_score: f64 = row.get("score")?;
+                        Ok(TranscriptHit {
+                            message: msg,
+                            session: sess,
+                            score: -raw_score, // FTS5 bm25 returns negative for better rank
+                        })
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?,
+                (Some(sid), None) => stmt
+                    .query_map(params![query, sid, limit_i], |row| {
+                        let msg = Message {
+                            id: row.get("id")?,
+                            session_id: row.get("session_id")?,
+                            role: Role::parse(&row.get::<_, String>("role")?).unwrap_or(Role::Tool),
+                            content: row.get("content")?,
+                            tool_name: row.get("tool_name")?,
+                            tokens: row.get("tokens")?,
+                            ts: parse_ts(&row.get::<_, String>("ts")?),
+                            metadata: row.get("metadata")?,
+                        };
+                        let sess = Session {
+                            id: row.get("s_id")?,
+                            agent: row.get("s_agent")?,
+                            project: row.get("s_project")?,
+                            started_at: parse_ts(&row.get::<_, String>("s_started_at")?),
+                            updated_at: parse_ts(&row.get::<_, String>("s_updated_at")?),
+                            metadata: row.get("s_metadata")?,
+                        };
+                        let raw_score: f64 = row.get("score")?;
+                        Ok(TranscriptHit {
+                            message: msg,
+                            session: sess,
+                            score: -raw_score,
+                        })
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?,
+                (None, Some(p)) => stmt
+                    .query_map(params![query, p, limit_i], |row| {
+                        let msg = Message {
+                            id: row.get("id")?,
+                            session_id: row.get("session_id")?,
+                            role: Role::parse(&row.get::<_, String>("role")?).unwrap_or(Role::Tool),
+                            content: row.get("content")?,
+                            tool_name: row.get("tool_name")?,
+                            tokens: row.get("tokens")?,
+                            ts: parse_ts(&row.get::<_, String>("ts")?),
+                            metadata: row.get("metadata")?,
+                        };
+                        let sess = Session {
+                            id: row.get("s_id")?,
+                            agent: row.get("s_agent")?,
+                            project: row.get("s_project")?,
+                            started_at: parse_ts(&row.get::<_, String>("s_started_at")?),
+                            updated_at: parse_ts(&row.get::<_, String>("s_updated_at")?),
+                            metadata: row.get("s_metadata")?,
+                        };
+                        let raw_score: f64 = row.get("score")?;
+                        Ok(TranscriptHit {
+                            message: msg,
+                            session: sess,
+                            score: -raw_score,
+                        })
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?,
+                (None, None) => stmt
+                    .query_map(params![query, limit_i], |row| {
+                        let msg = Message {
+                            id: row.get("id")?,
+                            session_id: row.get("session_id")?,
+                            role: Role::parse(&row.get::<_, String>("role")?).unwrap_or(Role::Tool),
+                            content: row.get("content")?,
+                            tool_name: row.get("tool_name")?,
+                            tokens: row.get("tokens")?,
+                            ts: parse_ts(&row.get::<_, String>("ts")?),
+                            metadata: row.get("metadata")?,
+                        };
+                        let sess = Session {
+                            id: row.get("s_id")?,
+                            agent: row.get("s_agent")?,
+                            project: row.get("s_project")?,
+                            started_at: parse_ts(&row.get::<_, String>("s_started_at")?),
+                            updated_at: parse_ts(&row.get::<_, String>("s_updated_at")?),
+                            metadata: row.get("s_metadata")?,
+                        };
+                        let raw_score: f64 = row.get("score")?;
+                        Ok(TranscriptHit {
+                            message: msg,
+                            session: sess,
+                            score: -raw_score,
+                        })
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?,
+            })
+        };
+        let rows = match compute() {
+            Ok(rows) => rows,
+            Err(e) if is_fts5_syntax_error(&e) => Vec::new(),
+            Err(e) => return Err(db_err(e)),
         };
         Ok(rows)
     }
@@ -3582,7 +3902,12 @@ impl SqliteStore {
         }
 
         let mut memories = self.get_by_topic(topic)?;
-        if memories.is_empty() {
+        // `critical` memories are exempt from consolidation (consolidate_topic
+        // won't delete them), so they neither count toward the threshold nor
+        // feed the rollup summary — otherwise a topic holding >= threshold
+        // criticals would re-consolidate on every store, churning forever.
+        memories.retain(|m| !matches!(m.importance, Importance::Critical));
+        if memories.is_empty() || memories.len() < threshold {
             return Ok(false);
         }
 
@@ -3599,7 +3924,17 @@ impl SqliteStore {
             .take(3)
             .map(|m| m.summary.as_str())
             .collect();
-        let consolidated_summary = top_summaries.join(" | ");
+        let mut consolidated_summary = top_summaries.join(" | ");
+        // Three max-size summaries joined can exceed MAX_SUMMARY_BYTES, and
+        // consolidate_topic now validates its input — truncate on a char
+        // boundary so the rollup can't fail its own size check.
+        if consolidated_summary.len() > MAX_SUMMARY_BYTES {
+            let mut cut = MAX_SUMMARY_BYTES;
+            while !consolidated_summary.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            consolidated_summary.truncate(cut);
+        }
 
         // Merge all unique keywords
         let mut all_keywords: Vec<String> = Vec::new();
@@ -4471,6 +4806,50 @@ mod tests {
         assert!(matches!(result, Err(IcmError::NotFound(_))));
     }
 
+    /// Manual-testing finding: deleting a memory left it as a dangling
+    /// entry in every other memory's `related_ids` (auto-link
+    /// back-references) forever. `expand_with_neighbors` tolerates the
+    /// miss silently, but each stale id still spends a slot out of the
+    /// caller's `max_neighbors` budget instead of surfacing a real, live
+    /// neighbor, and any external consumer of the JSON export sees a
+    /// reference to nothing.
+    #[test]
+    fn test_delete_cleans_up_dangling_related_ids() {
+        let store = test_store();
+
+        let mut a = make_memory("t", "memory a");
+        let mut b = make_memory("t", "memory b");
+        let mut c = make_memory("t", "memory c");
+        let a_id = store.store(a.clone()).unwrap();
+        let b_id = store.store(b.clone()).unwrap();
+        let c_id = store.store(c.clone()).unwrap();
+
+        a.id = a_id.clone();
+        a.related_ids = vec![b_id.clone(), c_id.clone()];
+        store.update(&a).unwrap();
+        b.id = b_id.clone();
+        b.related_ids = vec![a_id.clone(), c_id.clone()];
+        store.update(&b).unwrap();
+        c.id = c_id.clone();
+        c.related_ids = vec![a_id.clone(), b_id.clone()];
+        store.update(&c).unwrap();
+
+        store.delete(&a_id).unwrap();
+
+        let b_after = store.get(&b_id).unwrap().unwrap();
+        assert_eq!(
+            b_after.related_ids,
+            vec![c_id.clone()],
+            "b's related_ids must no longer reference the deleted a"
+        );
+        let c_after = store.get(&c_id).unwrap().unwrap();
+        assert_eq!(
+            c_after.related_ids,
+            vec![b_id.clone()],
+            "c's related_ids must no longer reference the deleted a"
+        );
+    }
+
     #[test]
     fn test_search_fts() {
         let store = test_store();
@@ -4645,6 +5024,68 @@ mod tests {
         assert_eq!(affected, 1); // Only the non-critical one
     }
 
+    /// Audit regression: `apply_decay` must never drive weight negative.
+    /// Low importance (2x multiplier), zero access count, factor=0.4 (still
+    /// inside the CLI's own `[0.0, 1.0)` validation) makes the raw
+    /// multiplier `1.0 - (1.0-0.4)*2.0 = -0.2` — negative before the
+    /// `MAX(0.0, ...)` clamp.
+    #[test]
+    fn test_apply_decay_never_goes_negative() {
+        let store = test_store();
+        let mut low = make_memory("t", "low importance, never accessed");
+        low.importance = Importance::Low;
+        store.store(low).unwrap();
+
+        store.apply_decay(0.4).unwrap();
+
+        let mem = store.get_by_topic("t").unwrap().into_iter().next().unwrap();
+        assert!(
+            mem.weight >= 0.0,
+            "weight must never go negative, got {}",
+            mem.weight
+        );
+    }
+
+    /// Audit regression: `maybe_auto_decay` used to apply a flat 0.95 step
+    /// whenever >= 1 day had passed, regardless of how many days actually
+    /// elapsed. Simulate a 5-day gap (by backdating `last_decay_at`
+    /// directly) and assert the applied decay compounds to ~0.95^5, not a
+    /// single 0.95 step.
+    #[test]
+    fn test_maybe_auto_decay_scales_with_elapsed_days() {
+        let store = test_store();
+        let mut mem = make_memory("t", "elapsed-days probe");
+        mem.importance = Importance::Medium;
+        store.store(mem).unwrap();
+
+        let five_days_ago = (Utc::now() - chrono::Duration::days(5)).to_rfc3339();
+        store
+            .conn
+            .execute(
+                "INSERT INTO icm_metadata (key, value) VALUES ('last_decay_at', ?1)",
+                params![five_days_ago],
+            )
+            .unwrap();
+
+        store.maybe_auto_decay().unwrap();
+
+        let after = store.get_by_topic("t").unwrap().into_iter().next().unwrap();
+        // Medium importance, access_count=0 -> multiplier = factor directly.
+        let expected_single_step = 0.95_f32;
+        let expected_five_days = 0.95_f32.powi(5);
+        assert!(
+            (after.weight - expected_five_days).abs() < 0.01,
+            "expected weight ~{expected_five_days} (0.95^5) for a 5-day gap, got {}",
+            after.weight
+        );
+        assert!(
+            after.weight < expected_single_step - 0.05,
+            "a 5-day gap must decay more than a single flat 0.95 step \
+             (got {}, single-step would be {expected_single_step})",
+            after.weight
+        );
+    }
+
     #[test]
     fn test_apply_decay_caps_access_count_amplification() {
         // Audit #185 H7: the pre-fix decay formula had an uncapped
@@ -4767,6 +5208,150 @@ mod tests {
 
         // topic-b should be untouched
         assert_eq!(store.get_by_topic("topic-b").unwrap().len(), 1);
+    }
+
+    /// Audit regression: consolidation must honor the "critical = never
+    /// forget" contract that `apply_decay` and `prune` already respect.
+    #[test]
+    fn consolidate_topic_preserves_critical_memories() {
+        let store = test_store();
+        store.store(make_memory("t", "expendable 1")).unwrap();
+        store.store(make_memory("t", "expendable 2")).unwrap();
+        store
+            .store(Memory::new(
+                "t".into(),
+                "never forget this".into(),
+                Importance::Critical,
+            ))
+            .unwrap();
+
+        store
+            .consolidate_topic("t", make_memory("t", "rollup"))
+            .unwrap();
+
+        let after = store.get_by_topic("t").unwrap();
+        let summaries: Vec<&str> = after.iter().map(|m| m.summary.as_str()).collect();
+        assert_eq!(after.len(), 2, "critical + consolidated must both survive");
+        assert!(summaries.contains(&"never forget this"));
+        assert!(summaries.contains(&"rollup"));
+        assert!(!summaries.contains(&"expendable 1"));
+    }
+
+    /// Manual-testing finding: consolidate_topic bulk-deletes the topic's
+    /// non-critical memories and does its own DELETE, entirely separate
+    /// from the single-id `delete()` — so it had the same dangling
+    /// related_ids bug in a second place. An external memory (in a
+    /// different topic) that referenced one of the consolidated-away ids
+    /// must have that reference cleaned up too.
+    #[test]
+    fn consolidate_topic_cleans_up_dangling_related_ids_in_other_memories() {
+        let store = test_store();
+        let a_id = store.store(make_memory("t", "memory a")).unwrap();
+        let b_id = store.store(make_memory("t", "memory b")).unwrap();
+
+        let mut external = make_memory("other-topic", "external memory");
+        external.related_ids = vec![a_id.clone(), b_id.clone()];
+        let external_id = store.store(external).unwrap();
+
+        store
+            .consolidate_topic("t", make_memory("t", "rollup"))
+            .unwrap();
+
+        let external_after = store.get(&external_id).unwrap().unwrap();
+        assert!(
+            external_after.related_ids.is_empty(),
+            "external memory must no longer reference the consolidated-away ids: {:?}",
+            external_after.related_ids
+        );
+    }
+
+    /// Audit regression: critical memories are exempt from consolidation, so
+    /// they must not count toward the auto-consolidate threshold — otherwise
+    /// a topic full of criticals would churn a fresh rollup on every store.
+    #[test]
+    fn auto_consolidate_ignores_critical_for_threshold() {
+        let store = test_store();
+        for i in 0..3 {
+            store
+                .store(Memory::new(
+                    "t".into(),
+                    format!("critical {i}"),
+                    Importance::Critical,
+                ))
+                .unwrap();
+        }
+        store.store(make_memory("t", "one expendable")).unwrap();
+
+        // 4 total but only 1 consolidatable — below threshold 3.
+        assert!(!store.auto_consolidate("t", 3).unwrap());
+        assert_eq!(store.get_by_topic("t").unwrap().len(), 4);
+
+        store.store(make_memory("t", "expendable 2")).unwrap();
+        store.store(make_memory("t", "expendable 3")).unwrap();
+
+        // Now 3 consolidatable — rollup fires, criticals survive.
+        assert!(store.auto_consolidate("t", 3).unwrap());
+        let after = store.get_by_topic("t").unwrap();
+        let criticals = after
+            .iter()
+            .filter(|m| matches!(m.importance, Importance::Critical))
+            .count();
+        assert_eq!(criticals, 3, "all criticals must survive the rollup");
+        assert_eq!(after.len(), 4, "3 criticals + 1 consolidated");
+    }
+
+    /// Audit regression: `update()` previously bypassed all validation, so
+    /// oversized or NUL-carrying payloads could enter via store-small-then-
+    /// update-big.
+    #[test]
+    fn update_rejects_oversized_and_nul_payloads() {
+        let store = test_store();
+        let id = store.store(make_memory("t", "small")).unwrap();
+        let mut m = store.get(&id).unwrap().unwrap();
+
+        m.summary = "x".repeat(MAX_SUMMARY_BYTES + 1);
+        assert!(matches!(store.update(&m), Err(IcmError::InvalidInput(_))));
+
+        m.summary = "has a \0 NUL".into();
+        assert!(matches!(store.update(&m), Err(IcmError::InvalidInput(_))));
+
+        // The stored row is untouched by the rejected updates.
+        assert_eq!(store.get(&id).unwrap().unwrap().summary, "small");
+    }
+
+    /// Audit regression: the MCP consolidate path passes a caller-provided
+    /// summary that previously bypassed every size check.
+    #[test]
+    fn consolidate_topic_validates_consolidated_summary() {
+        let store = test_store();
+        store.store(make_memory("t", "entry")).unwrap();
+
+        let oversized = make_memory("t", &"x".repeat(MAX_SUMMARY_BYTES + 1));
+        assert!(matches!(
+            store.consolidate_topic("t", oversized),
+            Err(IcmError::InvalidInput(_))
+        ));
+        // Originals untouched on rejection.
+        assert_eq!(store.get_by_topic("t").unwrap().len(), 1);
+    }
+
+    /// Audit regression: transcript messages had no size bound at all; they
+    /// are best-effort logs, so oversized content is truncated, not lost.
+    #[test]
+    fn record_message_truncates_oversized_content() {
+        let store = test_store();
+        let sid = store.create_session("test-agent", None, None).unwrap();
+        let big = "é".repeat(200 * 1024); // 400 KB of two-byte chars
+        store
+            .record_message(&sid, Role::User, &big, None, None, None)
+            .unwrap();
+
+        let msgs = store.list_session_messages(&sid, 10, 0).unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert!(msgs[0].content.len() <= 256 * 1024);
+        assert!(!msgs[0].content.is_empty());
+        // Truncation must respect char boundaries (no broken UTF-8).
+        assert!(msgs[0].content.chars().all(|c| c == 'é'));
     }
 
     /// Reproduces issue #44: after consolidation, recall should only return the
@@ -5204,6 +5789,34 @@ mod tests {
         assert_eq!(results[0].name, "es");
     }
 
+    /// Audit regression: the label pattern built by `search_concepts_by_label`
+    /// interpolated `namespace`/`value` into a LIKE pattern unescaped, so a
+    /// literal `_` in a search value acted as a SQL "any single char"
+    /// wildcard instead of matching only that exact character.
+    #[test]
+    fn test_search_concepts_by_label_escapes_wildcards() {
+        let store = test_store();
+        let m_id = store.create_memoir(make_memoir("proj")).unwrap();
+
+        let mut c1 = make_concept(&m_id, "c1", "def1");
+        c1.labels = vec![Label::new("domain", "test")];
+        store.add_concept(c1).unwrap();
+
+        let mut c2 = make_concept(&m_id, "c2", "def2");
+        c2.labels = vec![Label::new("domain", "text")];
+        store.add_concept(c2).unwrap();
+
+        // "te_t" is not the literal value of either concept, but with an
+        // unescaped `_` it matches both "test" and "text" as a wildcard.
+        let results = store
+            .search_concepts_by_label(&m_id, &Label::new("domain", "te_t"), 10)
+            .unwrap();
+        assert!(
+            results.is_empty(),
+            "unescaped '_' wildcard matched unrelated label values: {results:?}"
+        );
+    }
+
     // === Vector search tests ===
 
     #[test]
@@ -5322,6 +5935,86 @@ mod tests {
         assert_eq!(results[0].0.topic, "rust");
         // Score should be > 0
         assert!(results[0].1 > 0.0);
+    }
+
+    /// Audit regression: `1.0 / (1.0 + rank.abs())` inverted FTS relevance —
+    /// a stronger bm25 match (more negative rank) scored LOWER than a weak
+    /// one. Neither memory has an embedding, which isolates the FTS
+    /// component of the hybrid score (vector side is 0.0 for both).
+    #[test]
+    fn test_search_hybrid_ranks_strong_fts_match_above_weak_one() {
+        let store = test_store();
+
+        // Strong match: the query term repeated, short document — bm25
+        // favors high term frequency in a short field.
+        store
+            .store(make_memory(
+                "t",
+                "database database database database database",
+            ))
+            .unwrap();
+        // Weak match: the query term appears once, diluted by many other
+        // unrelated terms — bm25 penalizes this relative to the strong doc.
+        store
+            .store(make_memory(
+                "t",
+                "we briefly touched on a database as one topic among many \
+                 entirely unrelated software engineering concerns discussed today",
+            ))
+            .unwrap();
+
+        let no_embedding = vec![0.0; 384];
+        let results = store.search_hybrid("database", &no_embedding, 5).unwrap();
+        assert_eq!(results.len(), 2);
+        let strong = results
+            .iter()
+            .find(|(m, _)| m.summary.starts_with("database database"))
+            .expect("strong match must be present");
+        let weak = results
+            .iter()
+            .find(|(m, _)| m.summary.starts_with("we briefly"))
+            .expect("weak match must be present");
+        assert!(
+            strong.1 > weak.1,
+            "strong FTS match ({}) must outscore weak match ({})",
+            strong.1,
+            weak.1
+        );
+    }
+
+    /// Audit regression: `find_similar_memory` used to compare
+    /// `DEDUP_SIMILARITY_THRESHOLD` (0.85) against the hybrid
+    /// `0.3*fts + 0.7*cosine` score. A memory found ONLY via the vector
+    /// side (no shared keywords, so fts=0) could score at most
+    /// `0.3*0 + 0.7*1.0 = 0.70` even for a byte-identical embedding —
+    /// always below 0.85, so semantic-only duplicates were never caught.
+    /// Switching to pure `search_by_embedding` (cosine) fixes this: an
+    /// identical embedding now scores ~1.0, comfortably above threshold,
+    /// regardless of keyword overlap.
+    #[test]
+    fn test_find_similar_memory_detects_purely_semantic_duplicate() {
+        let store = test_store();
+        let embedding = vec![0.42; 384];
+
+        let mut original = make_memory("t", "the quick brown fox jumps over the lazy dog");
+        original.embedding = Some(embedding.clone());
+        store.store(original).unwrap();
+
+        // Shares literally no keywords with the stored summary — the FTS
+        // component of the old hybrid comparison would be exactly 0.0.
+        let found = icm_core::find_similar_memory(
+            &store,
+            "a fast animal leaping above a sleepy canine",
+            &embedding,
+            "t",
+            icm_core::DEDUP_SIMILARITY_THRESHOLD,
+        )
+        .unwrap();
+        assert!(
+            found.is_some(),
+            "an identical embedding must be detected as a duplicate even with zero keyword overlap"
+        );
+        assert!(found.unwrap().1 > 0.99);
     }
 
     #[test]
@@ -6489,6 +7182,62 @@ mod tests {
         assert!(results.is_empty());
     }
 
+    /// Audit regression: an unescaped `%` keyword degenerates into a
+    /// match-everything LIKE pattern instead of matching literal `%`.
+    #[test]
+    fn test_search_by_keywords_escapes_percent_wildcard() {
+        let store = test_store();
+        // Contains the literal substring "100%" — the only row that should
+        // match a properly-escaped '100%' keyword.
+        store
+            .store(make_memory("t", "revenue grew by 100% year over year"))
+            .unwrap();
+        // Decoy: contains "100" but NOT the literal "100%". An unescaped
+        // '%' in the keyword makes the LIKE pattern `%100%%`, which SQLite
+        // collapses to `%100%` ("contains 100 anywhere") — this row would
+        // wrongly match under that bug, since it's the difference between
+        // "contains the substring 100%" and "contains 100".
+        store
+            .store(make_memory("t", "the report has exactly 100 lines total"))
+            .unwrap();
+
+        let results = store.search_by_keywords(&["100%"], 10).unwrap();
+        assert_eq!(
+            results.len(),
+            1,
+            "a literal '100%' keyword must match only rows containing that exact \
+             substring, not any row containing '100', got {} hits",
+            results.len()
+        );
+        assert!(results[0].summary.contains("100%"));
+    }
+
+    /// Audit regression: an unescaped `_` keyword matches any single
+    /// character in that position, so "snake_case" would also match
+    /// "snakeXcase" for any X.
+    #[test]
+    fn test_search_by_keywords_escapes_underscore_wildcard() {
+        let store = test_store();
+        store
+            .store(make_memory("t", "uses snake_case naming"))
+            .unwrap();
+        store
+            .store(make_memory(
+                "t",
+                "uses snakeXcase naming (not the real word)",
+            ))
+            .unwrap();
+
+        let results = store.search_by_keywords(&["snake_case"], 10).unwrap();
+        assert_eq!(
+            results.len(),
+            1,
+            "'_' in a keyword must be literal, not a single-char wildcard, got {} hits",
+            results.len()
+        );
+        assert!(results[0].summary.contains("snake_case"));
+    }
+
     #[test]
     fn test_update_nonexistent_memory() {
         let store = test_store();
@@ -6999,6 +7748,26 @@ mod tests {
         assert_eq!(store.count().unwrap(), 1);
     }
 
+    /// Audit regression: SQLite's built-in `LOWER()` is ASCII-only and does
+    /// not fold 'É' → 'é', while `summary_hash` uses Rust's Unicode-correct
+    /// `to_lowercase()`. Two topics that differ only in the case of an
+    /// accented letter must still dedup — this used to fail because the
+    /// (now-removed) `LOWER(topic)` index column and SELECT comparison
+    /// disagreed with the hash's own case-folding.
+    #[test]
+    fn test_dedup_normalizes_accented_case() {
+        let store = test_store();
+        let m1 = make_memory("Décisions", "on utilise Turso pour la synchro");
+        let m2 = make_memory("DÉCISIONS", "on utilise Turso pour la synchro");
+        let id1 = store.store(m1).unwrap();
+        let id2 = store.store(m2).unwrap();
+        assert_eq!(
+            id1, id2,
+            "accented topics differing only in case must dedup to the same row"
+        );
+        assert_eq!(store.count().unwrap(), 1);
+    }
+
     #[test]
     fn test_dedup_different_topic_keeps_both() {
         let store = test_store();
@@ -7409,6 +8178,30 @@ mod tests {
             .unwrap();
         assert_eq!(phrase_hits.len(), 1);
         assert!(phrase_hits[0].message.content.contains("Postgres"));
+    }
+
+    /// Audit regression: `search_transcripts` bound the raw query straight
+    /// to `messages_fts MATCH ?1` with no handling for malformed FTS5
+    /// syntax. A trailing boolean operator or an unbalanced paren threw a
+    /// raw sqlite error instead of degrading gracefully to "no results" —
+    /// while still preserving valid FTS5 syntax (see the OR/phrase test
+    /// above), which a blanket `sanitize_fts_query` call would have broken.
+    #[test]
+    fn test_transcript_search_malformed_fts5_query_degrades_gracefully() {
+        let store = test_store();
+        let sid = store.create_session("cli", None, None).unwrap();
+        store
+            .record_message(&sid, Role::User, "hello world", None, None, None)
+            .unwrap();
+
+        for bad_query in ["hello AND", "(hello", "hello OR OR"] {
+            let result = store.search_transcripts(bad_query, None, None, 10);
+            assert!(
+                result.is_ok(),
+                "malformed FTS5 query {bad_query:?} must not error: {result:?}"
+            );
+            assert!(result.unwrap().is_empty());
+        }
     }
 
     #[test]

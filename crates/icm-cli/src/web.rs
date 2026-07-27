@@ -6,7 +6,7 @@ use anyhow::Result;
 use axum::{
     body::Body,
     extract::{Path, Query, State},
-    http::{header, Request, StatusCode},
+    http::{header, Method, Request, StatusCode},
     middleware::{self, Next},
     response::{Html, IntoResponse, Json, Response},
     routing::{delete, get, post},
@@ -17,6 +17,8 @@ use serde::{Deserialize, Serialize};
 
 use icm_core::{FeedbackStore, MemoirStore, MemoryStore};
 use icm_store::Store;
+
+use crate::cloud::write_secret_file;
 
 use crate::config::WebConfig;
 use crate::truncate_at_char_boundary;
@@ -81,19 +83,17 @@ pub fn resolve_password(cfg: &WebConfig) -> Result<String> {
         .map_err(|e| anyhow::anyhow!("failed to generate password: {e}"))?;
     let generated: String = buf.iter().map(|b| format!("{b:02x}")).collect();
 
-    // Save to credentials file
+    // Save to credentials file. Owner-only (0600) from the moment the file
+    // is created on Unix — the prior fs::write-then-set_permissions left a
+    // window where the freshly-generated dashboard password was readable
+    // under the process umask (often world-readable) before the chmod ran
+    // (audit finding, same TOCTOU class already fixed in cloud.rs).
     if let Some(ref path) = cred_path {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).ok();
         }
         let entry = format!("ICM_WEB_PASSWORD={generated}\n");
-        std::fs::write(path, &entry).ok();
-        // Restrict permissions on Unix
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).ok();
-        }
+        let _ = write_secret_file(path, &entry);
     }
 
     // Don't print the password to stderr — it would land in CI logs, shell
@@ -122,6 +122,63 @@ fn credentials_path() -> Option<std::path::PathBuf> {
 // Basic Auth middleware
 // ---------------------------------------------------------------------------
 
+/// Mutating dashboard routes that take no request body: `/api/health/decay`,
+/// `/api/health/prune`, `/api/topics/{name}/consolidate`. Basic Auth
+/// credentials are auto-reattached by the browser cross-origin (unlike a
+/// Bearer token, which JS must explicitly set), so a plain HTML form on
+/// another origin can POST to these without any preflight and ride the
+/// victim's cached credentials — CSRF (audit finding). `DELETE
+/// /api/memories/{id}` isn't exploitable this way: a non-simple method
+/// triggers a CORS preflight, which fails here since no CorsLayer is
+/// mounted.
+fn is_csrf_sensitive_post(method: &Method, path: &str) -> bool {
+    if method != Method::POST {
+        return false;
+    }
+    path == "/api/health/decay"
+        || path == "/api/health/prune"
+        || (path.starts_with("/api/topics/") && path.ends_with("/consolidate"))
+}
+
+/// Host portion of an `Origin`/`Referer` header value (strips scheme and
+/// any path/port-following segments left by a naive strip).
+fn header_host(v: &str) -> Option<&str> {
+    v.strip_prefix("http://")
+        .or_else(|| v.strip_prefix("https://"))
+        .map(|rest| rest.split(['/', '?', '#']).next().unwrap_or(rest))
+}
+
+/// Whether this request is same-origin, judged from `Origin` (preferred) or
+/// `Referer` (fallback — some browsers omit `Origin` on same-origin POSTs).
+/// Browsers always attach at least one of these on a cross-origin POST, so
+/// requests carrying neither are treated as a non-browser client (curl,
+/// scripts) using Basic Auth directly, not a forged browser request, and are
+/// allowed through.
+fn is_same_origin(req: &Request<Body>) -> bool {
+    let Some(host) = req
+        .headers()
+        .get(header::HOST)
+        .and_then(|v| v.to_str().ok())
+    else {
+        return false;
+    };
+    if let Some(origin) = req
+        .headers()
+        .get(header::ORIGIN)
+        .and_then(|v| v.to_str().ok())
+    {
+        return header_host(origin) == Some(host);
+    }
+    if let Some(referer) = req
+        .headers()
+        .get(header::REFERER)
+        .and_then(|v| v.to_str().ok())
+    {
+        return header_host(referer) == Some(host);
+    }
+    true
+}
+
 async fn auth_middleware(
     State(state): State<AppState>,
     req: Request<Body>,
@@ -130,6 +187,17 @@ async fn auth_middleware(
     // /health is public
     if req.uri().path() == "/health" {
         return next.run(req).await;
+    }
+
+    // Basic Auth credentials are auto-reattached by the browser cross-origin
+    // (unlike a Bearer token, which JS must explicitly set), so a plain HTML
+    // form on another origin can POST to these mutating, bodyless endpoints
+    // without any preflight and ride the victim's cached credentials — CSRF
+    // (audit finding). `DELETE /api/memories/{id}` isn't exploitable this
+    // way: a non-simple method triggers a CORS preflight, which fails here
+    // since no CorsLayer is mounted.
+    if is_csrf_sensitive_post(req.method(), req.uri().path()) && !is_same_origin(&req) {
+        return (StatusCode::FORBIDDEN, "cross-origin request rejected").into_response();
     }
 
     let authorized = req
@@ -141,7 +209,13 @@ async fn auth_middleware(
             let decoded = base64_decode(b64)?;
             let s = String::from_utf8(decoded).ok()?;
             let (user, pass) = s.split_once(':')?;
-            Some(user == state.username && pass == state.password)
+            // Constant-time compare — a naive `==` leaks a timing
+            // side-channel for brute-forcing the dashboard password
+            // (audit finding).
+            Some(
+                constant_time_eq(user.as_bytes(), state.username.as_bytes())
+                    && constant_time_eq(pass.as_bytes(), state.password.as_bytes()),
+            )
         })
         .unwrap_or(false);
 
@@ -155,6 +229,15 @@ async fn auth_middleware(
         )
             .into_response()
     }
+}
+
+/// Compare two byte strings in time independent of where they first differ.
+/// Still short-circuits on length (safe: lengths aren't secret here).
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
 /// Simple base64 decode (avoid pulling in a full crate).
@@ -352,6 +435,19 @@ struct ActionResult {
     message: String,
 }
 
+/// Lock the store, recovering from a poisoned mutex. The store keeps its own
+/// consistency through SQLite transactions, so a panic in one handler must
+/// not permanently kill every subsequent request — with a plain `unwrap()`,
+/// one poisoned lock cascaded panics across all handlers for the lifetime of
+/// the process (audit finding; also the largest cluster of forbidden
+/// `unwrap()` calls in the repo).
+fn lock_store(state: &AppState) -> std::sync::MutexGuard<'_, Store> {
+    state
+        .store
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 // ---------------------------------------------------------------------------
 // API handlers
 // ---------------------------------------------------------------------------
@@ -361,7 +457,7 @@ async fn api_health_check() -> impl IntoResponse {
 }
 
 async fn api_stats(State(state): State<AppState>) -> impl IntoResponse {
-    let store = state.store.lock().unwrap();
+    let store = lock_store(&state);
     let stats = match store.stats() {
         Ok(s) => s,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
@@ -394,7 +490,7 @@ async fn api_stats(State(state): State<AppState>) -> impl IntoResponse {
 }
 
 async fn api_topics(State(state): State<AppState>) -> impl IntoResponse {
-    let store = state.store.lock().unwrap();
+    let store = lock_store(&state);
     match store.list_topics() {
         Ok(topics) => Json(
             topics
@@ -411,7 +507,7 @@ async fn api_topic_detail(
     State(state): State<AppState>,
     Path(name): Path<String>,
 ) -> impl IntoResponse {
-    let store = state.store.lock().unwrap();
+    let store = lock_store(&state);
     match store.get_by_topic(&name) {
         Ok(memories) => Json(memories).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
@@ -422,7 +518,7 @@ async fn api_topic_health(
     State(state): State<AppState>,
     Path(name): Path<String>,
 ) -> impl IntoResponse {
-    let store = state.store.lock().unwrap();
+    let store = lock_store(&state);
     match store.topic_health(&name) {
         Ok(health) => Json(health).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
@@ -433,7 +529,7 @@ async fn api_topic_consolidate(
     State(state): State<AppState>,
     Path(name): Path<String>,
 ) -> impl IntoResponse {
-    let store = state.store.lock().unwrap();
+    let store = lock_store(&state);
     let memories = match store.get_by_topic(&name) {
         Ok(m) => m,
         Err(e) => {
@@ -495,7 +591,7 @@ async fn api_memories(
     State(state): State<AppState>,
     Query(params): Query<PaginationParams>,
 ) -> impl IntoResponse {
-    let store = state.store.lock().unwrap();
+    let store = lock_store(&state);
     match store.list_all() {
         Ok(mut memories) => {
             memories.sort_by(|a, b| {
@@ -518,7 +614,7 @@ async fn api_memories_search(
     State(state): State<AppState>,
     Query(params): Query<SearchParams>,
 ) -> impl IntoResponse {
-    let store = state.store.lock().unwrap();
+    let store = lock_store(&state);
     match store.search_fts(&params.q, params.limit) {
         Ok(memories) => Json(memories).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
@@ -529,7 +625,7 @@ async fn api_memory_delete(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    let store = state.store.lock().unwrap();
+    let store = lock_store(&state);
     match store.delete(&id) {
         Ok(_) => Json(ActionResult {
             ok: true,
@@ -545,7 +641,7 @@ async fn api_memory_delete(
 }
 
 async fn api_health_all(State(state): State<AppState>) -> impl IntoResponse {
-    let store = state.store.lock().unwrap();
+    let store = lock_store(&state);
     let topics = match store.list_topics() {
         Ok(t) => t,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
@@ -562,7 +658,7 @@ async fn api_health_all(State(state): State<AppState>) -> impl IntoResponse {
 }
 
 async fn api_decay(State(state): State<AppState>) -> impl IntoResponse {
-    let store = state.store.lock().unwrap();
+    let store = lock_store(&state);
     match store.apply_decay(0.95) {
         Ok(n) => Json(ActionResult {
             ok: true,
@@ -576,7 +672,7 @@ async fn api_decay(State(state): State<AppState>) -> impl IntoResponse {
 }
 
 async fn api_prune(State(state): State<AppState>) -> impl IntoResponse {
-    let store = state.store.lock().unwrap();
+    let store = lock_store(&state);
     match store.prune(0.1) {
         Ok(n) => Json(ActionResult {
             ok: true,
@@ -590,7 +686,7 @@ async fn api_prune(State(state): State<AppState>) -> impl IntoResponse {
 }
 
 async fn api_memoirs(State(state): State<AppState>) -> impl IntoResponse {
-    let store = state.store.lock().unwrap();
+    let store = lock_store(&state);
     let memoirs = match store.list_memoirs() {
         Ok(m) => m,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
@@ -620,7 +716,7 @@ async fn api_memoir_detail(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    let store = state.store.lock().unwrap();
+    let store = lock_store(&state);
     let memoir = match store.get_memoir(&id) {
         Ok(Some(m)) => m,
         Ok(None) => return (StatusCode::NOT_FOUND, "Memoir not found").into_response(),
@@ -636,4 +732,94 @@ async fn api_memoir_detail(
         "links": links,
     }))
     .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Audit regression: a panic inside one handler used to poison the store
+    /// mutex, making every subsequent `lock().unwrap()` panic in cascade for
+    /// the lifetime of the process. `lock_store` must recover the guard.
+    #[test]
+    fn lock_store_recovers_from_a_poisoned_mutex() {
+        let state = AppState {
+            store: Arc::new(Mutex::new(Store::in_memory().unwrap())),
+            username: "u".into(),
+            password: "p".into(),
+        };
+
+        // Poison the mutex: panic while holding the guard on another thread.
+        let poisoner = state.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoner.store.lock().unwrap();
+            panic!("intentional poison");
+        })
+        .join();
+        assert!(state.store.is_poisoned(), "setup: mutex must be poisoned");
+
+        // The recovering lock still yields a working store.
+        let store = lock_store(&state);
+        assert!(
+            store.stats().is_ok(),
+            "store must remain usable after poison"
+        );
+    }
+
+    #[test]
+    fn is_csrf_sensitive_post_matches_only_the_mutating_bodyless_routes() {
+        assert!(is_csrf_sensitive_post(&Method::POST, "/api/health/decay"));
+        assert!(is_csrf_sensitive_post(&Method::POST, "/api/health/prune"));
+        assert!(is_csrf_sensitive_post(
+            &Method::POST,
+            "/api/topics/my-topic/consolidate"
+        ));
+        // Different method or path: not covered by this check.
+        assert!(!is_csrf_sensitive_post(&Method::GET, "/api/health/decay"));
+        assert!(!is_csrf_sensitive_post(&Method::POST, "/api/memories"));
+        assert!(!is_csrf_sensitive_post(
+            &Method::DELETE,
+            "/api/memories/abc"
+        ));
+    }
+
+    /// Audit regression: `api_topic_consolidate`/`api_decay`/`api_prune`
+    /// took no request body, so Basic Auth's browser-side credential
+    /// auto-reattachment let a plain cross-origin HTML form POST to them
+    /// and ride the victim's cached credentials (CSRF) — these three POSTs
+    /// don't trigger a CORS preflight, unlike the DELETE route.
+    #[test]
+    fn is_same_origin_rejects_cross_origin_and_accepts_matching_or_absent() {
+        let req = |origin: Option<&str>, referer: Option<&str>| {
+            let mut b = Request::builder()
+                .method(Method::POST)
+                .header(header::HOST, "127.0.0.1:8787");
+            if let Some(o) = origin {
+                b = b.header(header::ORIGIN, o);
+            }
+            if let Some(r) = referer {
+                b = b.header(header::REFERER, r);
+            }
+            b.body(Body::empty()).unwrap()
+        };
+
+        // A forged cross-origin form POST carries an Origin that doesn't
+        // match Host — must be rejected.
+        assert!(!is_same_origin(&req(Some("http://evil.example"), None)));
+        // Legit same-origin fetch() from the dashboard itself.
+        assert!(is_same_origin(&req(Some("http://127.0.0.1:8787"), None)));
+        // Some browsers omit Origin on same-origin POSTs; Referer must
+        // still be checked and matched.
+        assert!(is_same_origin(&req(
+            None,
+            Some("http://127.0.0.1:8787/dashboard")
+        )));
+        assert!(!is_same_origin(&req(
+            None,
+            Some("http://evil.example/lure")
+        )));
+        // Neither header: a non-browser client (curl/scripts) using Basic
+        // Auth directly, not a forged browser request — allowed.
+        assert!(is_same_origin(&req(None, None)));
+    }
 }

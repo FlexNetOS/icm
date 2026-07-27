@@ -35,6 +35,11 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --workspace --all-targets -- -D warnings
+      # The `web` and `bench` features are off by default and would otherwise
+      # never be compiled in CI — a breakage would ship unnoticed (audit
+      # finding).
+      - name: Check non-default `web` + `bench` features compile
+        run: cargo clippy -p icm-cli --features web,bench --all-targets -- -D warnings
 
   # ─── Parallel gates (require code to compile) ───
 
@@ -138,6 +143,123 @@ jobs:
           ICM_CONFIG="$cfg" "$bin" --db "$db" recall "a fast animal leaping above a sleepy canine" | grep -qi fox \
             && echo "OK: downloaded onnxruntime loads under ort and embeds" \
             || { echo "FAIL: semantic search did not work with the downloaded runtime"; exit 1; }
+      - name: Lifecycle e2e (store → recall → decay → prune)
+        # The full memory lifecycle was only covered by unit tests — nothing
+        # proved the shipped binary chains it end-to-end (audit finding). A
+        # medium-importance memory decayed to 0.05 must fall to prune at 0.5,
+        # and recall must no longer return it.
+        run: |
+          bin=target/debug/icm
+          db="$RUNNER_TEMP/life.db"
+          "$bin" --no-embeddings --db "$db" store -t lifecycle -c "lifecycle probe alpha"
+          "$bin" --no-embeddings --db "$db" recall alpha | grep -qi "lifecycle probe alpha" \
+            || { echo "FAIL: stored memory not recalled"; exit 1; }
+          "$bin" --no-embeddings --db "$db" decay -f 0.05
+          "$bin" --no-embeddings --db "$db" prune -t 0.5
+          if "$bin" --no-embeddings --db "$db" recall alpha | grep -qi "lifecycle probe alpha"; then
+            echo "FAIL: memory survived decay+prune"; exit 1
+          else
+            echo "OK: lifecycle store → recall → decay → prune verified end-to-end"
+          fi
+
+  # Same load-dynamic variant on Windows (issue #345): the onnxruntime asset is a
+  # `.zip` (not the unix `.tgz`) and the runtime is `onnxruntime.dll`, so this
+  # exercises the zip extractor and the `LoadLibraryW` pre-flight. It's the only
+  # real proof that the pinned onnxruntime loads under ort's ABI on Windows.
+  embeddings-dynamic-windows:
+    name: load-dynamic embeddings (windows)
+    needs: clippy
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build load-dynamic variant (no build-time onnxruntime)
+        run: >-
+          cargo build -p icm-cli --no-default-features
+          --features "embeddings-dynamic,backend-sqlite,tui,http-api"
+      - name: Unit-test the dll pre-flight + ort_runtime helpers
+        run: |
+          cargo test -p icm-core --features embeddings-dynamic
+          cargo test -p icm-cli --no-default-features \
+            --features "embeddings-dynamic,backend-sqlite,tui,http-api" ort_runtime
+      - name: Graceful degradation when onnxruntime is absent
+        # A bogus ORT_DYLIB_PATH must degrade to keyword-only, never abort.
+        env:
+          ORT_DYLIB_PATH: C:\nonexistent\onnxruntime.dll
+        run: |
+          bin=target/debug/icm.exe
+          "$bin" --version  # smoke: the binary must launch (8 MiB stack, see .cargo/config.toml)
+          db="$RUNNER_TEMP/dyn.db"
+          "$bin" --db "$db" store -t t -c "ci dynamic graceful delta"
+          "$bin" --no-embeddings --db "$db" recall delta | grep -qi delta \
+            && echo "OK: degraded to keyword-only without crashing" \
+            || { echo "FAIL: memory not stored / recall failed"; exit 1; }
+      - name: Opt-in download + semantic search (onnxruntime 1.20.1 ↔ ort ABI)
+        # Highest-risk regression on Windows: the pinned onnxruntime.dll must load
+        # under the `ort` version fastembed uses, or ort's version assertion
+        # aborts. Prove it end-to-end with a purely semantic recall.
+        run: |
+          bin=target/debug/icm.exe
+          "$bin" embeddings download
+          "$bin" embeddings status | grep -qi "installed" \
+            || { echo "FAIL: runtime not reported installed"; exit 1; }
+          cfg="$RUNNER_TEMP/icm.toml"
+          printf '[embeddings]\nmodel = "Qdrant/all-MiniLM-L6-v2-onnx"\n' > "$cfg"
+          db="$RUNNER_TEMP/sem.db"
+          ICM_CONFIG="$cfg" "$bin" --db "$db" store -t t -c "the quick brown fox jumps over the lazy dog"
+          ICM_CONFIG="$cfg" "$bin" --db "$db" recall "a fast animal leaping above a sleepy canine" | grep -qi fox \
+            && echo "OK: downloaded onnxruntime.dll loads under ort and embeds" \
+            || { echo "FAIL: semantic search did not work with the downloaded runtime"; exit 1; }
+
+  # The postgres backend ships in the DEFAULT binary but its integration
+  # tests skip without ICM_POSTGRES_URL, which no workflow ever set — the
+  # backend had zero CI execution (audit finding). pgvector/pgvector matches
+  # the image the test header documents. (opensearch: same gap, heavier
+  # container — tracked separately.)
+  postgres-backend:
+    name: postgres backend tests
+    needs: clippy
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: icm
+          POSTGRES_PASSWORD: icm
+          POSTGRES_DB: icm
+        ports:
+          - 55432:5432
+        options: >-
+          --health-cmd "pg_isready -U icm"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run postgres integration tests
+        env:
+          ICM_POSTGRES_URL: postgres://icm:icm@127.0.0.1:55432/icm
+          # Backend selection is a RUNTIME switch (default: sqlite). Without
+          # this the no-default-features build errors out asking for the
+          # sqlite feature before ever touching postgres.
+          ICM_DB_BACKEND: postgres
+        run: |
+          # --test-threads=1: both tests migrate the same shared database, and
+          # concurrent `CREATE EXTENSION IF NOT EXISTS vector` races in
+          # Postgres (duplicate-key on the catalog) — seen flaking in CI.
+          cargo test -p icm-store --no-default-features --features postgres \
+            --test postgres_backend -- --nocapture --test-threads=1 2>&1 | tee pg.log
+          test "${PIPESTATUS[0]}" -eq 0 || exit 1
+          # The skip guard must NOT have fired — prove the tests actually ran.
+          if grep -q "skipping: ICM_POSTGRES_URL not set" pg.log; then
+            echo "FAIL: tests skipped despite the service container"; exit 1
+          fi
 
   security:
     name: security scan

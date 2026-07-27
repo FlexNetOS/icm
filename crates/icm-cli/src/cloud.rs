@@ -76,14 +76,29 @@ pub fn save_credentials(creds: &Credentials) -> Result<()> {
         std::fs::create_dir_all(parent)?;
     }
     let json = serde_json::to_string_pretty(creds)?;
-    std::fs::write(&path, json)?;
+    write_secret_file(&path, &json)
+}
 
-    // Restrict file permissions to owner-only on Unix (0o600)
+/// Write `content` to `path`, owner-only (0600) from the moment the file is
+/// created on Unix. Security audit finding (TOCTOU): a prior `fs::write`
+/// then `set_permissions` left a window — created with the process umask
+/// (often world-readable) — where a crash between the two calls leaves the
+/// bearer token durably readable by other local users.
+pub(crate) fn write_secret_file(path: &std::path::Path, content: &str) -> Result<()> {
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        f.write_all(content.as_bytes())?;
     }
+    #[cfg(not(unix))]
+    std::fs::write(path, content)?;
 
     Ok(())
 }
@@ -94,6 +109,50 @@ pub fn clear_credentials() -> Result<()> {
         std::fs::remove_file(&path)?;
     }
     Ok(())
+}
+
+/// Refuse a non-HTTPS endpoint unless it's localhost/loopback (audit
+/// finding: the endpoint scheme was never validated, so a plain-`http://`
+/// custom endpoint — `--endpoint` is a documented flag for self-hosting —
+/// would send the login password and every bearer-token request in
+/// cleartext to any network observer). `--endpoint` itself stays fully
+/// user-configurable; only the scheme is gated, so self-hosted deployments
+/// on a real domain are unaffected as long as they run behind TLS.
+fn require_secure_endpoint(endpoint: &str) -> Result<()> {
+    if endpoint.starts_with("https://") {
+        return Ok(());
+    }
+    let host = endpoint
+        .strip_prefix("http://")
+        .and_then(|rest| rest.split(['/', ':']).next())
+        .unwrap_or("");
+    if host == "localhost" || host == "127.0.0.1" || host == "::1" {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "refusing to use non-HTTPS endpoint {endpoint:?}: your password/token would be sent \
+         in cleartext. Use an https:// endpoint, or http://localhost for local testing."
+    );
+}
+
+// ── OAuth state nonce ────────────────────────────────────────────────────────
+
+/// A one-off, hard-to-guess token for the OAuth callback's CSRF check.
+/// `RandomState`'s keys are seeded from the OS's secure random source (std
+/// uses it to defend `HashMap` against HashDoS) — reusing it here avoids
+/// pulling in a new RNG dependency for a single nonce. Good enough for this
+/// threat model (a local process racing our callback without access to our
+/// process' random seed), not meant as a general-purpose CSPRNG API.
+fn random_nonce() -> String {
+    use std::collections::hash_map::RandomState;
+    use std::hash::{BuildHasher, Hasher};
+    let mut bytes = Vec::with_capacity(32);
+    for i in 0..4u64 {
+        let mut h = RandomState::new().build_hasher();
+        h.write_u64(i);
+        bytes.extend_from_slice(&h.finish().to_le_bytes());
+    }
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 // ── URL decode ──────────────────────────────────────────────────────────────
@@ -117,6 +176,27 @@ fn url_decode(s: &str) -> String {
     String::from_utf8_lossy(&result).to_string()
 }
 
+/// Percent-encode a value for safe use in a URL query string. Unreserved
+/// per RFC 3986 (`A-Za-z0-9-._~`) pass through; everything else — notably
+/// `+` (decoded as a literal space by `url_decode` above and most
+/// form-urlencoded parsers) and `:` (reserved in a query component) — is
+/// percent-encoded. Audit finding: `pull_memories`'s `since` RFC3339
+/// timestamp (e.g. "2026-07-25T10:00:00+02:00") was pushed into the query
+/// string unencoded, silently corrupting the filter on any backend that
+/// applies form-urlencoded decoding to query values.
+fn url_encode_query_value(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(b as char);
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
 // ── Login (browser OAuth) ───────────────────────────────────────────────────
 
 /// Browser-based OAuth login: opens browser, listens for callback on localhost.
@@ -126,13 +206,24 @@ pub fn login_browser(endpoint: &str) -> Result<Credentials> {
     use std::io::{Read, Write};
     use std::net::TcpListener;
 
+    require_secure_endpoint(endpoint)?;
+
     let listener = TcpListener::bind("127.0.0.1:0").context("Failed to start local server")?;
     let port = listener.local_addr()?.port();
 
+    // Security audit finding: without a `state` nonce, ANY local process
+    // that learns the listening port (visible in the auth URL printed
+    // above) can complete the callback with its own token before the real
+    // browser response arrives, hijacking the CLI's cloud login onto an
+    // attacker-controlled account. Generate a random nonce, pass it to the
+    // server, and require it back on the callback.
+    let state = random_nonce();
+
     let auth_url = format!(
-        "{}/api/auth/oauth/google?cli_port={}&app=icm",
+        "{}/api/auth/oauth/google?cli_port={}&app=icm&state={}",
         endpoint.trim_end_matches('/'),
-        port
+        port,
+        state
     );
 
     eprintln!("Opening browser for authentication...");
@@ -189,6 +280,24 @@ pub fn login_browser(endpoint: &str) -> Result<Credentials> {
                         })
                         .collect();
 
+                    // Reject a callback that presents a WRONG `state` — a
+                    // local process racing the real browser response with
+                    // its own token would need to guess this nonce (audit
+                    // finding: previously no correlation at all existed
+                    // between the callback and the login attempt that
+                    // opened it). We only reject on an explicit mismatch,
+                    // not on a missing param: the RTK Cloud backend may not
+                    // echo `state` back yet, and failing open here would
+                    // just mean every real login times out. Once the
+                    // backend round-trips `state`, this becomes a full
+                    // CSRF defense with no client-side change needed.
+                    let presented_state = params.get("state").cloned();
+                    if presented_state.as_deref().is_some_and(|s| s != state) {
+                        let response = "HTTP/1.1 400 Bad Request\r\nContent-Type: text/html\r\n\r\n<html><body><h2>Login failed</h2><p>Invalid state.</p></body></html>";
+                        let _ = stream.write_all(response.as_bytes());
+                        continue;
+                    }
+
                     let token = params.get("token").cloned().unwrap_or_default();
                     let org_id = params.get("org_id").cloned().unwrap_or_default();
                     let email = params.get("email").cloned().unwrap_or_default();
@@ -230,6 +339,8 @@ pub fn login_browser(endpoint: &str) -> Result<Credentials> {
 /// Email/password login for orgs without OAuth (generic email, self-hosted, etc.)
 /// POST {endpoint}/api/auth/login
 pub fn login_password(endpoint: &str, email: &str, password: &str) -> Result<Credentials> {
+    require_secure_endpoint(endpoint)?;
+
     let url = format!("{}/api/auth/login", endpoint.trim_end_matches('/'));
 
     let resp = ureq::post(&url)
@@ -361,7 +472,14 @@ pub fn pull_memories(
     );
 
     if let Some(ts) = since {
-        url.push_str(&format!("&since={}", ts));
+        // Audit finding: `since` is a raw user-supplied --since CLI value
+        // (RFC3339), pushed into the query string unencoded. RFC3339
+        // timestamps with a timezone offset contain `+` (e.g.
+        // "2026-07-25T10:00:00+02:00"), which a form-urlencoded-convention
+        // parser on the backend decodes as a literal space — silently
+        // corrupting or dropping the filter. `:` is also reserved in a
+        // query component per RFC 3986. Percent-encode it properly.
+        url.push_str(&format!("&since={}", url_encode_query_value(ts)));
     }
 
     let resp = ureq::get(&url)
@@ -393,7 +511,12 @@ pub fn pull_memories(
         importance: String,
         #[serde(default = "default_scope_str")]
         scope: String,
-        #[serde(default)]
+        // Audit finding: `#[serde(default)]` on f32 is 0.0, which is below
+        // the prune threshold — a memory pulled without a `weight` field
+        // (the push side never sends one) would be eligible for immediate
+        // deletion by the next `prune`. Default to 1.0, matching
+        // `Memory::new()`'s baseline for a fresh memory.
+        #[serde(default = "default_weight")]
         weight: f32,
         #[serde(default)]
         access_count: u32,
@@ -411,6 +534,9 @@ pub fn pull_memories(
     }
     fn default_scope_str() -> String {
         "user".to_string()
+    }
+    fn default_weight() -> f32 {
+        1.0
     }
 
     #[derive(Deserialize)]
@@ -496,6 +622,45 @@ pub fn require_credentials_for_scope(scope: Scope) -> Option<Credentials> {
 mod tests {
     use super::*;
 
+    /// Audit regression: writing a credentials file must never pass through
+    /// a world-readable intermediate state (TOCTOU) — verified by checking
+    /// the mode immediately after `write_secret_file` returns.
+    #[cfg(unix)]
+    #[test]
+    fn test_write_secret_file_is_0600_from_creation() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("icm-test-secret-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("secret.json");
+
+        write_secret_file(&path, "{\"token\":\"x\"}").unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn test_require_secure_endpoint() {
+        assert!(require_secure_endpoint("https://cloud.rtk-ai.app").is_ok());
+        assert!(require_secure_endpoint("https://my-company.example.com").is_ok());
+        assert!(require_secure_endpoint("http://localhost:8080").is_ok());
+        assert!(require_secure_endpoint("http://127.0.0.1:8080").is_ok());
+
+        assert!(require_secure_endpoint("http://cloud.rtk-ai.app").is_err());
+        assert!(require_secure_endpoint("http://evil.example.com").is_err());
+    }
+
+    #[test]
+    fn test_random_nonce_is_nonempty_and_varies() {
+        let a = random_nonce();
+        let b = random_nonce();
+        assert!(!a.is_empty());
+        assert_ne!(a, b, "two nonces should not collide in practice");
+    }
+
     #[test]
     fn test_url_decode() {
         assert_eq!(url_decode("hello%20world"), "hello world");
@@ -531,5 +696,23 @@ mod tests {
         assert!(!requires_cloud(Scope::User));
         assert!(requires_cloud(Scope::Project));
         assert!(requires_cloud(Scope::Org));
+    }
+
+    /// Audit regression: an RFC3339 `since` timestamp with a `+HH:MM` offset
+    /// must survive round-tripping through the query string. `+` is decoded
+    /// as a literal space by form-urlencoded convention, so an unencoded
+    /// `+` silently corrupts the offset (and thus the filter).
+    #[test]
+    fn test_url_encode_query_value_escapes_reserved_chars() {
+        let encoded = url_encode_query_value("2026-07-25T10:00:00+02:00");
+        assert_eq!(encoded, "2026-07-25T10%3A00%3A00%2B02%3A00");
+        assert!(!encoded.contains('+'));
+        assert!(!encoded.contains(':'));
+    }
+
+    #[test]
+    fn test_url_encode_query_value_leaves_unreserved_chars_untouched() {
+        let unreserved = "AZaz09-._~";
+        assert_eq!(url_encode_query_value(unreserved), unreserved);
     }
 }

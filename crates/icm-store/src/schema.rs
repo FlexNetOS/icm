@@ -1,4 +1,4 @@
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 
 use icm_core::{IcmError, IcmResult};
 
@@ -135,11 +135,51 @@ pub fn init_db_with_dims(conn: &Connection, embedding_dims: usize) -> Result<(),
             return Err(db_err(e));
         }
     }
-    // Ensure the partial unique index exists even on DBs that ran an old
-    // CREATE TABLE (which had no summary_hash column to index against).
+    // Migration: the index used to be `(LOWER(topic), summary_hash)`, but
+    // `summary_hash` already encodes the topic via Rust's Unicode-correct
+    // `to_lowercase()`, while SQLite's built-in `LOWER()` is ASCII-only
+    // (doesn't fold 'É' → 'é') — the composite key let two rows with an
+    // identical `summary_hash` coexist whenever their topic's SQL-LOWER()
+    // forms differed (e.g. "Décisions" vs "DÉCISIONS"), defeating dedup
+    // for accented topics (audit finding). `summary_hash` alone is
+    // sufficient. `CREATE INDEX IF NOT EXISTS` would silently keep the old
+    // definition on an already-migrated DB (same index name), so drop it
+    // first if it still has the old column list.
+    let old_index_sql: Option<String> = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type='index' AND name='idx_memories_topic_hash'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(db_err)?;
+    if let Some(sql) = old_index_sql {
+        if sql.contains("LOWER(topic)") {
+            conn.execute_batch("DROP INDEX idx_memories_topic_hash;")
+                .map_err(db_err)?;
+        }
+    }
+    // Audit finding: any DB that hit the accented-topic dedup bug the old
+    // composite index let through (see comment above) already has two or
+    // more rows sharing one non-null `summary_hash`. `CREATE UNIQUE INDEX`
+    // below would then fail outright with a UNIQUE constraint error,
+    // propagating up through `init_db_with_dims` and bricking exactly the
+    // DBs this fix was meant to repair. Deduplicate first — keep the
+    // earliest-inserted row per `summary_hash` group (lowest rowid), drop
+    // the rest. A no-op (empty scan) on any DB that never hit the bug.
+    conn.execute_batch(
+        "DELETE FROM memories
+            WHERE summary_hash IS NOT NULL
+              AND rowid NOT IN (
+                SELECT MIN(rowid) FROM memories
+                WHERE summary_hash IS NOT NULL
+                GROUP BY summary_hash
+              );",
+    )
+    .map_err(db_err)?;
     conn.execute_batch(
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_memories_topic_hash
-            ON memories(LOWER(topic), summary_hash) WHERE summary_hash IS NOT NULL;",
+            ON memories(summary_hash) WHERE summary_hash IS NOT NULL;",
     )
     .map_err(db_err)?;
 
@@ -656,6 +696,128 @@ mod tests {
 
         // Re-running the migration is idempotent.
         init_db(&conn).expect("re-running migration must be a no-op");
+    }
+
+    /// Audit regression: a DB created under the old schema has the index as
+    /// `(LOWER(topic), summary_hash)`. `CREATE INDEX IF NOT EXISTS` alone
+    /// would silently keep that old (buggy, ASCII-only LOWER) definition
+    /// forever since the index NAME already exists — the migration must
+    /// detect and replace it.
+    #[test]
+    fn test_migration_replaces_old_composite_topic_hash_index() {
+        ensure_vec_init();
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).expect("fresh init must succeed");
+
+        // Force the DB back to the OLD index definition, as if it had been
+        // created before this fix.
+        conn.execute_batch("DROP INDEX idx_memories_topic_hash;")
+            .unwrap();
+        conn.execute_batch(
+            "CREATE UNIQUE INDEX idx_memories_topic_hash
+                ON memories(LOWER(topic), summary_hash) WHERE summary_hash IS NOT NULL;",
+        )
+        .unwrap();
+
+        // Re-running init_db must detect and replace the old definition.
+        init_db(&conn).expect("migration must succeed");
+
+        let sql: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='index' AND name='idx_memories_topic_hash'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            !sql.contains("LOWER(topic)"),
+            "old composite index definition must be replaced, got: {sql}"
+        );
+    }
+
+    /// Audit regression: a DB that hit the accented-topic dedup bug (the old
+    /// composite `(LOWER(topic), summary_hash)` index let two rows share one
+    /// `summary_hash` whenever their topics' SQL-LOWER() forms differed)
+    /// already has duplicate `summary_hash` rows on disk. `CREATE UNIQUE
+    /// INDEX idx_memories_topic_hash ON memories(summary_hash)` must not
+    /// simply fail on that pre-existing duplicate — it must deduplicate
+    /// first, or the fix for the accented-dedup bug bricks exactly the DBs
+    /// it was meant to repair.
+    #[test]
+    fn test_migration_dedupes_existing_duplicate_summary_hash_before_unique_index() {
+        ensure_vec_init();
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).expect("fresh init must succeed");
+
+        // Force the DB back to the OLD composite index, as if created
+        // before the accented-dedup fix.
+        conn.execute_batch("DROP INDEX idx_memories_topic_hash;")
+            .unwrap();
+        conn.execute_batch(
+            "CREATE UNIQUE INDEX idx_memories_topic_hash
+                ON memories(LOWER(topic), summary_hash) WHERE summary_hash IS NOT NULL;",
+        )
+        .unwrap();
+
+        // Two rows whose topics differ only by the accented-letter casing
+        // SQLite's ASCII-only LOWER() doesn't fold (LOWER("Décisions") =
+        // "décisions" but LOWER("DÉCISIONS") = "dÉcisions" — the 'É' stays
+        // uppercase) — so the old composite index treats them as distinct,
+        // even though they share the SAME summary_hash (Rust's
+        // Unicode-correct to_lowercase() folds both to "décisions").
+        conn.execute(
+            "INSERT INTO memories \
+             (id, created_at, last_accessed, topic, summary, importance, source_type, summary_hash) \
+             VALUES ('older-row', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', \
+                     'Décisions', 'we picked postgres', 'medium', 'manual', 'dup-hash-1')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO memories \
+             (id, created_at, last_accessed, topic, summary, importance, source_type, summary_hash) \
+             VALUES ('newer-row', '2026-02-01T00:00:00Z', '2026-02-01T00:00:00Z', \
+                     'DÉCISIONS', 'we picked postgres', 'medium', 'manual', 'dup-hash-1')",
+            [],
+        )
+        .unwrap();
+
+        // Re-running init_db must NOT error out — it must dedupe first.
+        init_db(&conn).expect("migration must survive pre-existing duplicate summary_hash rows");
+
+        let remaining: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM memories WHERE summary_hash = 'dup-hash-1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(remaining, 1, "exactly one duplicate row must survive");
+
+        let surviving_id: String = conn
+            .query_row(
+                "SELECT id FROM memories WHERE summary_hash = 'dup-hash-1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            surviving_id, "older-row",
+            "the earliest-inserted duplicate should survive, not be arbitrarily chosen"
+        );
+
+        // The new unique index must be in place and enforced going forward.
+        let sql: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='index' AND name='idx_memories_topic_hash'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            !sql.contains("LOWER(topic)"),
+            "must be on the new definition: {sql}"
+        );
     }
 
     #[test]

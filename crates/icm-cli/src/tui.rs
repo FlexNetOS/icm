@@ -165,17 +165,27 @@ impl App {
     }
 
     fn refresh(&mut self, store: &Store, db_path: Option<&str>) {
-        if let Ok(s) = store.stats() {
-            self.stats = s;
+        // Audit finding: silently keeping stale data on a failed reload gave
+        // the user zero indication anything went wrong (unlike the explicit
+        // action handlers in execute_confirm, which do call set_status on
+        // error). Track what failed and surface it once, instead of
+        // swallowing every Err via `if let Ok(...)`.
+        let mut failed = Vec::new();
+        match store.stats() {
+            Ok(s) => self.stats = s,
+            Err(_) => failed.push("stats"),
         }
-        if let Ok(t) = store.list_topics() {
-            self.topics = t;
+        match store.list_topics() {
+            Ok(t) => self.topics = t,
+            Err(_) => failed.push("topics"),
         }
-        if let Ok(h) = Self::load_health(store, &self.topics) {
-            self.health = h;
+        match Self::load_health(store, &self.topics) {
+            Ok(h) => self.health = h,
+            Err(_) => failed.push("health"),
         }
-        if let Ok(m) = Self::load_memoirs(store) {
-            self.memoirs = m;
+        match Self::load_memoirs(store) {
+            Ok(m) => self.memoirs = m,
+            Err(_) => failed.push("memoirs"),
         }
         self.feedback_count = store.feedback_stats().map(|s| s.total).unwrap_or(0);
         self.db_size = db_path
@@ -183,6 +193,20 @@ impl App {
             .map(|m| m.len())
             .unwrap_or(0);
         self.last_refresh = Instant::now();
+
+        // Audit finding: refresh() never reloaded the open Memories list, so
+        // it went stale versus the store after any action (decay, delete,
+        // consolidate) applied elsewhere. Reload it if a topic is open.
+        if self.topic_state.selected().is_some() {
+            self.load_topic_memories(store);
+        }
+
+        if !failed.is_empty() {
+            self.set_status(
+                format!("Refresh incomplete: {} failed to reload", failed.join(", ")),
+                Color::Red,
+            );
+        }
     }
 
     fn load_topic_memories(&mut self, store: &Store) {
@@ -199,6 +223,12 @@ impl App {
                     if !self.memories.is_empty() {
                         self.memory_state.select(Some(0));
                     }
+                    // Audit finding: the Topics-tab j/k handlers call this
+                    // to reload the Memories list for the newly-selected
+                    // topic but never reset the scroll offset, so an old
+                    // scroll position could land past the end of the new
+                    // (possibly shorter) memory's detail text.
+                    self.memory_scroll = 0;
                 }
             }
         }
@@ -209,6 +239,17 @@ impl App {
             .selected()
             .and_then(|i| self.topics.get(i))
             .map(|(name, _)| name.as_str())
+    }
+
+    /// Audit finding: `app.health` is built by silently dropping any topic
+    /// whose `topic_health()` call failed (see `load_health`), so if that
+    /// happens `app.health` is shorter than `app.topics` and every entry
+    /// after the failure shifts left. The Topic Detail panel used to index
+    /// `app.health` by the same position as `app.topic_state` — matching
+    /// by topic name instead is correct regardless of any dropped entries.
+    fn selected_topic_health(&self) -> Option<&TopicHealth> {
+        let name = self.selected_topic_name()?;
+        self.health.iter().find(|h| h.topic == name)
     }
 
     fn next_tab(&mut self) {
@@ -256,8 +297,52 @@ fn is_actionable_key(kind: KeyEventKind) -> bool {
     matches!(kind, KeyEventKind::Press | KeyEventKind::Repeat)
 }
 
+/// Best-effort terminal restoration — disable raw mode, leave the alternate
+/// screen, show the cursor. Errors are ignored: this only ever runs on an
+/// error/panic path where there's nothing more useful to do than try. Safe
+/// to call more than once (each step is idempotent when already undone).
+fn restore_terminal() {
+    let _ = disable_raw_mode();
+    let _ = execute!(io::stdout(), LeaveAlternateScreen);
+    let _ = execute!(io::stdout(), crossterm::cursor::Show);
+}
+
+/// Restores the terminal when dropped — covers every early-`?` return below
+/// (e.g. `App::new` failing on a DB error, the exact scenario the audit
+/// reproduced), which is normal unwinding and unaffected by `panic = "abort"`.
+struct TerminalRestoreGuard;
+impl Drop for TerminalRestoreGuard {
+    fn drop(&mut self) {
+        restore_terminal();
+    }
+}
+
 pub fn run_dashboard(store: &Store, db_path: Option<&str>) -> Result<()> {
+    // Audit finding: nothing in icm-cli ever restored the terminal on a
+    // panic or an early error return. Two distinct mechanisms are needed:
+    //
+    // 1. A panic hook, because the release profile is `panic = "abort"` —
+    //    the process aborts before any unwinding (and thus any `Drop`)
+    //    would run. A panic hook DOES run before the abort, so it's the
+    //    only way to restore the shell after an actual panic (e.g. the
+    //    overlay underflow bugs fixed above, or any future one).
+    // 2. The `TerminalRestoreGuard` below, because a plain `Result::Err`
+    //    propagated via `?` (e.g. `App::new` failing on a DB error — the
+    //    scenario the audit reproduced) is normal unwinding, not a panic;
+    //    the panic hook never fires for it, but `Drop` does.
+    //
+    // `run_dashboard` is always the terminal arm of `main`'s dispatch (the
+    // process exits right after), so the previous panic hook is
+    // deliberately not restored — there's nothing left in-process to run
+    // under it.
+    let previous_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        restore_terminal();
+        previous_hook(info);
+    }));
+
     enable_raw_mode()?;
+    let _guard = TerminalRestoreGuard;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
     let backend = CrosstermBackend::new(stdout);
@@ -270,12 +355,9 @@ pub fn run_dashboard(store: &Store, db_path: Option<&str>) -> Result<()> {
     if let Ok(cfg) = crate::config::load_config() {
         app.summarizer_cfg = cfg.consolidate.summarizer;
     }
-    let result = run_loop(&mut terminal, &mut app, store, db_path);
-
-    disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-    terminal.show_cursor()?;
-    result
+    run_loop(&mut terminal, &mut app, store, db_path)
+    // `_guard` drops here (or at any earlier `?` above), restoring the
+    // terminal exactly once on every path.
 }
 
 fn run_loop(
@@ -537,13 +619,19 @@ fn execute_confirm(app: &mut App, store: &Store, db_path: Option<&str>) {
             Ok(()) => {
                 let id_short: String = id.chars().take(8).collect();
                 app.set_status(format!("Deleted memory {id_short}"), Color::Green);
-                app.load_topic_memories(store);
-                // Adjust selection after deletion
-                if let Some(sel) = app.memory_state.selected() {
-                    if sel >= app.memories.len() && !app.memories.is_empty() {
-                        app.memory_state.select(Some(app.memories.len() - 1));
-                    } else if app.memories.is_empty() {
-                        app.memory_state.select(None);
+                // Audit finding: deleting a memory selected from the Search
+                // overlay only reloaded the Memories tab's list — the
+                // now-stale entry stayed visible (and re-selectable, hitting
+                // a confusing "not found" on a second delete) in the still-
+                // open search overlay. Purge it there too and keep the
+                // selection in bounds, mirroring load_topic_memories' own
+                // out-of-bounds handling.
+                app.search_results.retain(|m| m.id != id);
+                if let Some(sel) = app.search_state.selected() {
+                    if app.search_results.is_empty() {
+                        app.search_state.select(None);
+                    } else if sel >= app.search_results.len() {
+                        app.search_state.select(Some(app.search_results.len() - 1));
                     }
                 }
                 app.refresh(store, db_path);
@@ -875,14 +963,10 @@ fn draw_topics(f: &mut Frame, app: &mut App, area: Rect) {
         .highlight_symbol("▶ ");
     f.render_stateful_widget(list, chunks[0], &mut app.topic_state);
 
-    let detail = if let Some(idx) = app.topic_state.selected() {
-        if let Some(health) = app.health.get(idx) {
-            topic_detail_text(health)
-        } else {
-            vec![Line::from("  No health data")]
-        }
-    } else {
-        vec![Line::from("  Select a topic")]
+    let detail = match app.selected_topic_health() {
+        Some(health) => topic_detail_text(health),
+        None if app.topic_state.selected().is_some() => vec![Line::from("  No health data")],
+        None => vec![Line::from("  Select a topic")],
     };
 
     let detail_block = Paragraph::new(detail).block(
@@ -1094,12 +1178,18 @@ fn draw_memoirs(f: &mut Frame, app: &mut App, area: Rect) {
 fn draw_search_overlay(f: &mut Frame, app: &mut App) {
     let area = f.area();
     let overlay_height = (area.height / 2).max(10);
+    // Audit finding: on a terminal shorter than ~14 rows, `y + height`
+    // exceeded `area.height` — out-of-buffer render that panics inside
+    // ratatui (and with no panic hook anywhere in icm-cli, left the
+    // terminal stuck in raw mode / alternate screen). `.intersection`
+    // clips the overlay to what actually fits instead of overflowing it.
     let overlay = Rect {
         x: area.width / 6,
         y: area.height / 4,
         width: area.width * 2 / 3,
         height: overlay_height,
-    };
+    }
+    .intersection(area);
 
     f.render_widget(Clear, overlay);
 
@@ -1150,14 +1240,21 @@ fn draw_search_overlay(f: &mut Frame, app: &mut App) {
 
 fn draw_help_overlay(f: &mut Frame) {
     let area = f.area();
-    let w = 60u16.min(area.width - 4);
-    let h = 29u16.min(area.height - 4);
+    // Audit finding: `area.width - 4` / `area.height - 4` underflowed
+    // (u16 panic) on a terminal narrower/shorter than 4 cells, and even
+    // when that held, `(area.width - w) / 2` could still overflow the
+    // frame on a small-but->4 terminal. `saturating_sub` avoids the
+    // arithmetic panic; `.intersection` clips the final rect to the
+    // frame regardless.
+    let w = 60u16.min(area.width.saturating_sub(4));
+    let h = 29u16.min(area.height.saturating_sub(4));
     let overlay = Rect {
-        x: (area.width - w) / 2,
-        y: (area.height - h) / 2,
+        x: area.width.saturating_sub(w) / 2,
+        y: area.height.saturating_sub(h) / 2,
         width: w,
         height: h,
-    };
+    }
+    .intersection(area);
 
     f.render_widget(Clear, overlay);
 
@@ -1216,14 +1313,18 @@ fn draw_help_overlay(f: &mut Frame) {
 
 fn draw_confirm_overlay(f: &mut Frame, app: &App) {
     let area = f.area();
-    let w = 60u16.min(area.width - 4);
-    let h = 7u16;
+    // Audit finding: same underflow class as draw_help_overlay — `h` was
+    // a fixed 7 with no clamp to `area.height`, so a terminal shorter than
+    // 7 rows panicked on `area.height - h`.
+    let w = 60u16.min(area.width.saturating_sub(4));
+    let h = 7u16.min(area.height);
     let overlay = Rect {
-        x: (area.width - w) / 2,
-        y: (area.height - h) / 2,
+        x: area.width.saturating_sub(w) / 2,
+        y: area.height.saturating_sub(h) / 2,
         width: w,
         height: h,
-    };
+    }
+    .intersection(area);
 
     f.render_widget(Clear, overlay);
 
@@ -1550,5 +1651,153 @@ mod tests {
     #[test]
     fn is_actionable_key_accepts_repeat() {
         assert!(is_actionable_key(KeyEventKind::Repeat));
+    }
+
+    /// Audit regression: the three overlay-drawing functions computed their
+    /// centered `Rect` with raw `area.width - N` / `area.height - N`
+    /// subtraction (panics on underflow below N cells) and, even where that
+    /// held, could still produce a rect extending past the frame on a small
+    /// terminal (panics inside ratatui's buffer indexing). A 3x3 terminal is
+    /// smaller than every hardcoded margin/height in all three functions.
+    #[test]
+    fn overlays_do_not_panic_on_a_tiny_terminal() {
+        use ratatui::backend::TestBackend;
+        let backend = TestBackend::new(3, 3);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        let store = Store::in_memory().unwrap();
+        let mut app = App::new(&store, None).unwrap();
+        // draw_confirm_overlay early-returns on Confirm::None (App::new's
+        // default) — set a real variant so the Rect computation actually
+        // runs and the underflow bug would actually be exercised.
+        app.confirm = Confirm::PruneStale;
+
+        terminal.draw(draw_help_overlay).unwrap();
+        terminal.draw(|f| draw_confirm_overlay(f, &app)).unwrap();
+        terminal.draw(|f| draw_search_overlay(f, &mut app)).unwrap();
+    }
+
+    /// Same as above but at 0x0 — the degenerate extreme (`area.width - 4`
+    /// underflows immediately with no room to spare at all).
+    #[test]
+    fn overlays_do_not_panic_on_a_zero_sized_terminal() {
+        use ratatui::backend::TestBackend;
+        let backend = TestBackend::new(0, 0);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        let store = Store::in_memory().unwrap();
+        let mut app = App::new(&store, None).unwrap();
+        app.confirm = Confirm::PruneStale;
+
+        terminal.draw(draw_help_overlay).unwrap();
+        terminal.draw(|f| draw_confirm_overlay(f, &app)).unwrap();
+        terminal.draw(|f| draw_search_overlay(f, &mut app)).unwrap();
+    }
+
+    /// Audit regression: `refresh()` updated stats/topics/health/memoirs but
+    /// never reloaded the currently-open Memories list, so applying an
+    /// action (decay, delete, consolidate) while a topic was open left the
+    /// displayed memories stale versus the store until the user switched
+    /// topics and back.
+    #[test]
+    fn refresh_reloads_the_open_topic_memories_list() {
+        let store = Store::in_memory().unwrap();
+        store
+            .store(Memory::new(
+                "smoke".into(),
+                "first".into(),
+                Importance::Medium,
+            ))
+            .unwrap();
+        let mut app = App::new(&store, None).unwrap();
+        app.topic_state.select(Some(0));
+        app.load_topic_memories(&store);
+        assert_eq!(app.memories.len(), 1);
+
+        store
+            .store(Memory::new(
+                "smoke".into(),
+                "second".into(),
+                Importance::Medium,
+            ))
+            .unwrap();
+        app.refresh(&store, None);
+        assert_eq!(
+            app.memories.len(),
+            2,
+            "refresh() must reload the open topic's memories, not just stats/topics/health"
+        );
+    }
+
+    /// Audit regression: deleting a memory selected from the Search overlay
+    /// only reloaded the Memories tab's list — the deleted entry stayed
+    /// visible (and re-selectable) in the still-open search overlay.
+    #[test]
+    fn deleting_a_memory_removes_it_from_search_results_too() {
+        let store = Store::in_memory().unwrap();
+        let id = store
+            .store(Memory::new(
+                "smoke".into(),
+                "to be deleted".into(),
+                Importance::Medium,
+            ))
+            .unwrap();
+        let mut app = App::new(&store, None).unwrap();
+        app.search_results = vec![store.get(&id).unwrap().unwrap()];
+        app.search_state.select(Some(0));
+
+        app.confirm = Confirm::DeleteMemory {
+            id: id.clone(),
+            summary: "to be deleted".into(),
+        };
+        execute_confirm(&mut app, &store, None);
+
+        assert!(
+            app.search_results.iter().all(|m| m.id != id),
+            "deleted memory must be purged from search_results, not just the Memories list"
+        );
+        assert_eq!(app.search_state.selected(), None);
+    }
+
+    /// Audit regression: the Topic Detail panel indexed `app.health` by the
+    /// same position as `app.topic_state`, but `load_health` silently drops
+    /// any topic whose `topic_health()` call failed — shifting every later
+    /// entry left by one and showing the wrong topic's stats. Matching by
+    /// topic name (as done in draw_topics) is correct regardless of gaps.
+    #[test]
+    fn topic_health_lookup_is_by_name_not_position() {
+        let store = Store::in_memory().unwrap();
+        store
+            .store(Memory::new("alpha".into(), "a".into(), Importance::Medium))
+            .unwrap();
+        store
+            .store(Memory::new("beta".into(), "b".into(), Importance::Medium))
+            .unwrap();
+        let mut app = App::new(&store, None).unwrap();
+        // topics is alpha-sorted by list_topics; simulate load_health having
+        // dropped the first entry (as it would on a failed topic_health call)
+        // by removing it directly, so `health[0]` is now "beta"'s data at
+        // the position where "alpha"'s data used to be.
+        app.health.retain(|h| h.topic != "alpha");
+        assert_eq!(app.health.len(), 1);
+        assert_eq!(app.health[0].topic, "beta");
+
+        // Select whichever topic is "alpha" and confirm the *actual*
+        // lookup method draw_topics calls resolves to no data (not "beta"'s
+        // data at index 0).
+        let alpha_idx = app.topics.iter().position(|(t, _)| t == "alpha").unwrap();
+        app.topic_state.select(Some(alpha_idx));
+        assert!(
+            app.selected_topic_health().is_none(),
+            "must not resolve alpha's slot to beta's health data by position"
+        );
+
+        // Sanity: a topic whose health *is* present still resolves.
+        let beta_idx = app.topics.iter().position(|(t, _)| t == "beta").unwrap();
+        app.topic_state.select(Some(beta_idx));
+        assert_eq!(
+            app.selected_topic_health().map(|h| h.topic.as_str()),
+            Some("beta")
+        );
     }
 }

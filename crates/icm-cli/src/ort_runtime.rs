@@ -18,7 +18,7 @@
 //! (or an explicit user `ORT_DYLIB_PATH`) — never an ambient system library.
 
 use std::io::{Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context, Result};
 use sha2::{Digest, Sha256};
@@ -29,47 +29,71 @@ const ORT_VERSION: &str = "1.20.1";
 
 const ORT_DYLIB_ENV: &str = "ORT_DYLIB_PATH";
 
-/// A supported download target: the Microsoft asset infix, the pinned SHA256 of
-/// `onnxruntime-<asset>-<ver>.tgz`, and the canonical shared-library filename
-/// that ort's load-dynamic backend looks for.
+/// A supported download target: the Microsoft asset infix, the archive
+/// extension (`tgz` on unix, `zip` on Windows), the pinned SHA256 of
+/// `onnxruntime-<asset>-<ver>.<ext>`, the canonical shared-library filename that
+/// ort's load-dynamic backend looks for, and a human-readable download size for
+/// the first-launch prompt.
 struct Target {
     asset: &'static str,
+    archive_ext: &'static str,
     sha256: &'static str,
     lib_name: &'static str,
+    approx_size: &'static str,
 }
 
-/// Resolve the onnxruntime asset for this platform, or `None` if unsupported
-/// (Windows `.zip` and exotic arches are deferred — issue #345).
-fn detect_target() -> Option<Target> {
-    let lib_name = if cfg!(target_os = "macos") {
-        "libonnxruntime.dylib"
-    } else {
-        "libonnxruntime.so"
-    };
-    let (asset, sha256) = match (std::env::consts::OS, std::env::consts::ARCH) {
+/// Resolve the onnxruntime asset for a given `(os, arch)`, or `None` if
+/// unsupported (Windows-on-ARM and exotic arches are deferred — issue #345).
+/// Split out from [`detect_target`] so the target table is unit-testable across
+/// platforms from any host.
+fn target_for(os: &str, arch: &str) -> Option<Target> {
+    // (asset, sha256, approx_size) — the shared-library name and archive format
+    // are derived from `os` below.
+    let (asset, sha256, approx_size) = match (os, arch) {
         ("macos", "aarch64") => (
             "osx-arm64",
             "b678fc3c2354c771fea4fba420edeccfba205140088334df801e7fc40e83a57a",
+            "~7 MB",
         ),
         ("macos", "x86_64") => (
             "osx-x86_64",
             "0f73006813af2a1a5d1723ed7dfb694fc629d15037124081bb61b7bf7d99fc78",
+            "~7 MB",
         ),
         ("linux", "x86_64") => (
             "linux-x64",
             "67db4dc1561f1e3fd42e619575c82c601ef89849afc7ea85a003abbac1a1a105",
+            "~7 MB",
         ),
         ("linux", "aarch64") => (
             "linux-aarch64",
             "ae4fedbdc8c18d688c01306b4b50c63de3445cdf2dbd720e01a2fa3810b8106a",
+            "~7 MB",
+        ),
+        ("windows", "x86_64") => (
+            "win-x64",
+            "78d447051e48bd2e1e778bba378bec4ece11191c9e538cf7b2c4a4565e8f5581",
+            "~65 MB",
         ),
         _ => return None,
     };
+    let (archive_ext, lib_name) = match os {
+        "windows" => ("zip", "onnxruntime.dll"),
+        "macos" => ("tgz", "libonnxruntime.dylib"),
+        _ => ("tgz", "libonnxruntime.so"),
+    };
     Some(Target {
         asset,
+        archive_ext,
         sha256,
         lib_name,
+        approx_size,
     })
+}
+
+/// Resolve the onnxruntime asset for the host platform.
+fn detect_target() -> Option<Target> {
+    target_for(std::env::consts::OS, std::env::consts::ARCH)
 }
 
 fn onnxruntime_root() -> Option<PathBuf> {
@@ -141,13 +165,25 @@ fn verify_sha(bytes: &[u8], expected: &str, what: &str) -> Result<()> {
     Ok(())
 }
 
-/// Extract the real onnxruntime shared library from the downloaded `.tgz`.
+/// Does this archive entry's file name identify the onnxruntime library we want?
 ///
-/// The archive carries `.../lib/libonnxruntime.<ver>.{dylib,so}` as a regular
-/// file plus an unversioned symlink; we want the regular file's bytes and must
-/// avoid the `libonnxruntime_providers_*` siblings (they start with an
-/// underscore, so `"libonnxruntime."` prefix-matching excludes them).
-fn extract_lib(archive: &[u8]) -> Result<Vec<u8>> {
+/// - unix `.tgz`: `libonnxruntime.<ver>.{dylib,so}` (a regular file; the
+///   `libonnxruntime_providers_*` siblings start with an underscore, so the
+///   `"libonnxruntime."` prefix excludes them).
+/// - Windows `.zip`: `onnxruntime.dll` exactly (the `onnxruntime_providers_*.dll`
+///   siblings start with an underscore, so an exact match excludes them).
+fn is_onnxruntime_lib(name: &str) -> bool {
+    let unix =
+        name.starts_with("libonnxruntime.") && (name.contains(".dylib") || name.contains(".so"));
+    unix || name == "onnxruntime.dll"
+}
+
+/// Extract the real onnxruntime shared library from the downloaded archive,
+/// dispatching on `archive_ext` (`tgz` on unix, `zip` on Windows).
+fn extract_lib(archive: &[u8], archive_ext: &str) -> Result<Vec<u8>> {
+    if archive_ext == "zip" {
+        return extract_lib_zip(archive);
+    }
     use flate2::read::GzDecoder;
     let mut tar = tar::Archive::new(GzDecoder::new(archive));
     for entry in tar.entries().context("reading onnxruntime archive")? {
@@ -160,9 +196,7 @@ fn extract_lib(archive: &[u8]) -> Result<Vec<u8>> {
             .ok()
             .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
             .unwrap_or_default();
-        let is_lib = name.starts_with("libonnxruntime.")
-            && (name.contains(".dylib") || name.contains(".so"));
-        if is_lib {
+        if is_onnxruntime_lib(&name) {
             let mut buf = Vec::new();
             entry
                 .read_to_end(&mut buf)
@@ -173,6 +207,65 @@ fn extract_lib(archive: &[u8]) -> Result<Vec<u8>> {
         }
     }
     bail!("libonnxruntime not found in onnxruntime archive")
+}
+
+/// Extract `onnxruntime.dll` from the Windows `.zip` asset.
+fn extract_lib_zip(archive: &[u8]) -> Result<Vec<u8>> {
+    use std::io::Cursor;
+    let mut zip = zip::ZipArchive::new(Cursor::new(archive)).context("reading onnxruntime zip")?;
+    for i in 0..zip.len() {
+        let mut entry = zip.by_index(i).context("reading zip entry")?;
+        if !entry.is_file() {
+            continue;
+        }
+        let name = entry
+            .enclosed_name()
+            .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+            .unwrap_or_default();
+        if is_onnxruntime_lib(&name) {
+            let mut buf = Vec::new();
+            entry.read_to_end(&mut buf).context("reading dll bytes")?;
+            if !buf.is_empty() {
+                return Ok(buf);
+            }
+        }
+    }
+    bail!("onnxruntime.dll not found in onnxruntime archive")
+}
+
+/// Write the verified library bytes to `tmp`, refusing to follow a
+/// pre-existing symlink there.
+///
+/// Audit finding: `tmp` is a fixed, predictable path within the managed
+/// dir. Plain `fs::write` is `O_CREAT|O_TRUNC` with no `O_EXCL`, so a
+/// pre-planted symlink at `tmp` (another same-user process, shared
+/// CI/container) would get followed and its target clobbered with the
+/// verified library bytes — the same TOCTOU class already hardened in
+/// `cloud.rs::write_secret_file` and `upgrade.rs::write_new_binary`.
+/// Remove any existing entry first via `symlink_metadata` (reports the
+/// symlink itself, not its target), then open with `create_new`
+/// (`O_EXCL`) so even a fresh symlink racing into the gap fails the open
+/// rather than getting followed.
+fn write_lib_tmp(tmp: &Path, lib_bytes: &[u8]) -> Result<()> {
+    if std::fs::symlink_metadata(tmp).is_ok() {
+        std::fs::remove_file(tmp)
+            .with_context(|| format!("cannot remove stale {}", tmp.display()))?;
+    }
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(tmp)
+        .with_context(|| format!("cannot create {}", tmp.display()))?;
+    f.write_all(lib_bytes)
+        .with_context(|| format!("writing {}", tmp.display()))?;
+    drop(f);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(tmp, std::fs::Permissions::from_mode(0o755))
+            .context("setting permissions on onnxruntime library")?;
+    }
+    Ok(())
 }
 
 /// Download, verify, and install onnxruntime to the managed path, then point
@@ -189,28 +282,40 @@ pub fn download(progress: bool) -> Result<PathBuf> {
     let dir = managed_dir().ok_or_else(|| anyhow!("cannot resolve the icm data directory"))?;
     let lib_path = dir.join(target.lib_name);
 
-    let asset = format!("onnxruntime-{}-{ORT_VERSION}.tgz", target.asset);
+    let asset = format!(
+        "onnxruntime-{}-{ORT_VERSION}.{}",
+        target.asset, target.archive_ext
+    );
     let url = format!(
         "https://github.com/microsoft/onnxruntime/releases/download/v{ORT_VERSION}/{asset}"
     );
     if progress {
-        eprintln!("Downloading {asset} (~7 MB, one time)…");
+        eprintln!("Downloading {asset} ({}, one time)…", target.approx_size);
     }
     let bytes = download_bytes(&url)?;
     verify_sha(&bytes, target.sha256, &asset)?;
-    let lib_bytes = extract_lib(&bytes)?;
+    let lib_bytes = extract_lib(&bytes, target.archive_ext)?;
 
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     // Write to a temp sibling then rename, so a concurrent reader never sees a
     // half-written library.
+    //
+    // Audit finding: this path is fixed and predictable within the managed
+    // dir. Plain `fs::write` is `O_CREAT|O_TRUNC` with no `O_EXCL`, so a
+    // pre-planted symlink at `tmp` (another same-user process, shared
+    // CI/container) would get followed and its target clobbered with the
+    // verified library bytes — the same TOCTOU class already hardened in
+    // `cloud.rs::write_secret_file` and `upgrade.rs::write_new_binary`.
+    // Remove any existing entry first via `symlink_metadata` (reports the
+    // symlink itself, not its target), then open with `create_new`
+    // (`O_EXCL`) so even a fresh symlink racing into the gap fails the
+    // open rather than getting followed.
     let tmp = lib_path.with_extension("new");
-    std::fs::write(&tmp, &lib_bytes).with_context(|| format!("writing {}", tmp.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755))
-            .context("setting permissions on onnxruntime library")?;
-    }
+    write_lib_tmp(&tmp, &lib_bytes)?;
+    // On Windows `rename` fails if the destination already exists (e.g. a forced
+    // re-download), so clear it first. Unix `rename` replaces atomically.
+    #[cfg(windows)]
+    let _ = std::fs::remove_file(&lib_path);
     std::fs::rename(&tmp, &lib_path)
         .with_context(|| format!("installing {}", lib_path.display()))?;
 
@@ -247,7 +352,10 @@ pub fn ensure_for_run(interactive: bool) -> bool {
     if activate_if_present() {
         return true;
     }
-    if !interactive || detect_target().is_none() {
+    let Some(target) = detect_target() else {
+        return false;
+    };
+    if !interactive {
         return false;
     }
     // Respect a previous decline.
@@ -258,7 +366,8 @@ pub fn ensure_for_run(interactive: bool) -> bool {
     }
     let prompt = format!(
         "Enable semantic (vector) search? This downloads ONNX Runtime {ORT_VERSION} \
-         (~7 MB, one time). Download now?"
+         ({}, one time). Download now?",
+        target.approx_size
     );
     if confirm(&prompt) {
         match download(true) {
@@ -395,7 +504,125 @@ mod tests {
         gz.write_all(&tar_bytes).unwrap();
         let tgz = gz.finish().unwrap();
 
-        let extracted = extract_lib(&tgz).expect("should find the versioned library");
+        let extracted = extract_lib(&tgz, "tgz").expect("should find the versioned library");
         assert_eq!(extracted, b"REAL-LIBRARY-BYTES");
+    }
+
+    #[test]
+    fn target_table_covers_all_supported_platforms() {
+        // Every shipped target must have a 64-hex sha, a matching archive
+        // format, and the canonical lib name ort's load-dynamic backend expects.
+        let cases = [
+            (
+                "macos",
+                "aarch64",
+                "tgz",
+                "libonnxruntime.dylib",
+                "osx-arm64",
+            ),
+            (
+                "macos",
+                "x86_64",
+                "tgz",
+                "libonnxruntime.dylib",
+                "osx-x86_64",
+            ),
+            ("linux", "x86_64", "tgz", "libonnxruntime.so", "linux-x64"),
+            (
+                "linux",
+                "aarch64",
+                "tgz",
+                "libonnxruntime.so",
+                "linux-aarch64",
+            ),
+            ("windows", "x86_64", "zip", "onnxruntime.dll", "win-x64"),
+        ];
+        for (os, arch, ext, lib, asset) in cases {
+            let t = target_for(os, arch)
+                .unwrap_or_else(|| panic!("{os}/{arch} must be a supported target"));
+            assert_eq!(t.archive_ext, ext, "{os}/{arch} archive ext");
+            assert_eq!(t.lib_name, lib, "{os}/{arch} lib name");
+            assert_eq!(t.asset, asset, "{os}/{arch} asset infix");
+            assert_eq!(t.sha256.len(), 64, "{os}/{arch} sha must be 64 hex chars");
+        }
+        // Windows-on-ARM and exotic arches are deferred (issue #345).
+        assert!(target_for("windows", "aarch64").is_none());
+        assert!(target_for("freebsd", "x86_64").is_none());
+    }
+
+    #[test]
+    fn is_onnxruntime_lib_excludes_provider_siblings() {
+        assert!(is_onnxruntime_lib("libonnxruntime.1.20.1.dylib"));
+        assert!(is_onnxruntime_lib("libonnxruntime.so.1.20.1"));
+        assert!(is_onnxruntime_lib("onnxruntime.dll"));
+        // The providers siblings must never be picked.
+        assert!(!is_onnxruntime_lib("libonnxruntime_providers_shared.dylib"));
+        assert!(!is_onnxruntime_lib("onnxruntime_providers_shared.dll"));
+        assert!(!is_onnxruntime_lib("README.md"));
+    }
+
+    #[test]
+    fn extract_lib_zip_picks_the_dll() {
+        // Build a tiny .zip mirroring the Windows asset layout: a providers
+        // sibling (must be ignored) + the real onnxruntime.dll.
+        use std::io::Cursor;
+        use zip::write::SimpleFileOptions;
+
+        let mut buf = Vec::new();
+        {
+            let mut w = zip::ZipWriter::new(Cursor::new(&mut buf));
+            let opts = SimpleFileOptions::default();
+            w.start_file(
+                "onnxruntime-win-x64-1.20.1/lib/onnxruntime_providers_shared.dll",
+                opts,
+            )
+            .unwrap();
+            w.write_all(b"PROVIDER").unwrap();
+            w.start_file("onnxruntime-win-x64-1.20.1/lib/onnxruntime.dll", opts)
+                .unwrap();
+            w.write_all(b"REAL-DLL-BYTES").unwrap();
+            w.finish().unwrap();
+        }
+        let extracted = extract_lib(&buf, "zip").expect("should find onnxruntime.dll");
+        assert_eq!(extracted, b"REAL-DLL-BYTES");
+    }
+
+    /// Audit regression: `write_lib_tmp` must not follow a pre-existing
+    /// symlink at the fixed `tmp` path — a same-user process (or a
+    /// leftover from an interrupted previous download) planting a
+    /// symlink there must not have its target clobbered.
+    #[cfg(unix)]
+    #[test]
+    fn write_lib_tmp_does_not_follow_a_preexisting_symlink() {
+        let tmp_dir = tempfile::TempDir::new().unwrap();
+        let victim = tmp_dir.path().join("victim.txt");
+        std::fs::write(&victim, "untouched").unwrap();
+
+        let target = tmp_dir.path().join("libonnxruntime.1.20.1.dylib.new");
+        std::os::unix::fs::symlink(&victim, &target).unwrap();
+
+        write_lib_tmp(&target, b"verified library bytes").unwrap();
+
+        assert!(
+            std::fs::symlink_metadata(&target)
+                .unwrap()
+                .file_type()
+                .is_file(),
+            "target must be a regular file, not still a symlink"
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), b"verified library bytes");
+        assert_eq!(
+            std::fs::read_to_string(&victim).unwrap(),
+            "untouched",
+            "the symlink's old target must be untouched"
+        );
+    }
+
+    #[test]
+    fn write_lib_tmp_creates_a_fresh_file() {
+        let tmp_dir = tempfile::TempDir::new().unwrap();
+        let target = tmp_dir.path().join("libonnxruntime.1.20.1.dylib.new");
+        write_lib_tmp(&target, b"payload").unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"payload");
     }
 }
