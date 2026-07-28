@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.10.61](https://github.com/rtk-ai/icm/compare/icm-v0.10.60...icm-v0.10.61) (2026-07-28)
+
+
+### Features
+
+* **feedback:** add semantic search fallback (icm_feedback_search) ([#404](https://github.com/rtk-ai/icm/issues/404)) ([ca5af46](https://github.com/rtk-ai/icm/commit/ca5af46a64c3e10834278b53f75b59fc3f2dcdf2))
+
+
+### Bug Fixes
+
+* **consolidate:** attach embeddings to the merged memory, CLI + MCP ([#400](https://github.com/rtk-ai/icm/issues/400)) ([dc8fc4b](https://github.com/rtk-ai/icm/commit/dc8fc4b41c648bc9c38b4b2bea46fd18dc002307))
+* **http-api:** attach an embedding to /consolidate's merged memory ([#402](https://github.com/rtk-ai/icm/issues/402)) ([bd9de1a](https://github.com/rtk-ai/icm/commit/bd9de1a4fc509554e086a19be06113c1a9e7cd5f))
+* **tui:** attach an embedding to the consolidate action's merged memory ([#403](https://github.com/rtk-ai/icm/issues/403)) ([cc4f46d](https://github.com/rtk-ai/icm/commit/cc4f46d96426b947bd40cbe3fa839603fa8fef04))
+
 ## [0.10.60](https://github.com/rtk-ai/icm/compare/icm-v0.10.59...icm-v0.10.60) (2026-07-27)
 
 
