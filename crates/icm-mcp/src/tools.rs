@@ -788,7 +788,7 @@ pub fn call_tool_with_config(
         "icm_memory_forget" => tool_forget(store, args),
         "icm_memory_forget_topic" => tool_forget_topic(store, args),
         "icm_memory_update" => tool_update(store, embedder, args),
-        "icm_memory_consolidate" => tool_consolidate(store, args),
+        "icm_memory_consolidate" => tool_consolidate(store, embedder, args),
         "icm_memory_list_topics" => tool_list_topics(store),
         "icm_memory_stats" => tool_stats(store),
         "icm_memory_health" => tool_health(store, args),
@@ -808,8 +808,8 @@ pub fn call_tool_with_config(
         // Learn tool
         "icm_learn" => tool_learn(store, args),
         // Feedback tools
-        "icm_feedback_record" => tool_feedback_record(store, args, compact),
-        "icm_feedback_search" => tool_feedback_search(store, args),
+        "icm_feedback_record" => tool_feedback_record(store, embedder, args, compact),
+        "icm_feedback_search" => tool_feedback_search(store, embedder, args),
         "icm_feedback_stats" => tool_feedback_stats(store),
         // Transcript tools
         "icm_transcript_start_session" => tool_transcript_start_session(store, args),
@@ -1454,7 +1454,7 @@ fn tool_learn(store: &Store, args: &Value) -> ToolResult {
     }
 }
 
-fn tool_consolidate(store: &Store, args: &Value) -> ToolResult {
+fn tool_consolidate(store: &Store, embedder: Option<&dyn Embedder>, args: &Value) -> ToolResult {
     let topic = match get_str(args, "topic") {
         Some(t) => t,
         None => return ToolResult::error("missing required field: topic".into()),
@@ -1464,7 +1464,14 @@ fn tool_consolidate(store: &Store, args: &Value) -> ToolResult {
         None => return ToolResult::error("missing required field: summary".into()),
     };
 
-    let consolidated = Memory::new(topic.into(), summary.into(), icm_core::Importance::High);
+    let mut consolidated = Memory::new(topic.into(), summary.into(), icm_core::Importance::High);
+    // Same bug class as #394/#395/cmd_consolidate: this tool never attached
+    // an embedding to the merged memory it creates.
+    if let Some(emb) = embedder {
+        if let Ok(vec) = emb.embed(&consolidated.embed_text()) {
+            consolidated.embedding = Some(vec);
+        }
+    }
 
     match store.consolidate_topic(topic, consolidated) {
         Ok(()) => ToolResult::text(format!("Consolidated topic: {topic}")),
@@ -2083,7 +2090,10 @@ fn tool_memoir_link(store: &Store, args: &Value) -> ToolResult {
 
     let relation: Relation = match relation_str.parse() {
         Ok(r) => r,
-        Err(e) => return ToolResult::error(format!("invalid relation: {e}")),
+        // `Relation::from_str`'s error already reads "invalid relation:
+        // <value>" — re-prefixing here doubled it to "invalid relation:
+        // invalid relation: <value>".
+        Err(e) => return ToolResult::error(e),
     };
 
     let memoir = match resolve_memoir(store, memoir_name) {
@@ -2381,7 +2391,12 @@ fn tool_memoir_export(store: &Store, args: &Value) -> ToolResult {
     }
 }
 
-fn tool_feedback_record(store: &Store, args: &Value, compact: bool) -> ToolResult {
+fn tool_feedback_record(
+    store: &Store,
+    embedder: Option<&dyn Embedder>,
+    args: &Value,
+    compact: bool,
+) -> ToolResult {
     let topic = match get_str(args, "topic") {
         Some(t) => t,
         None => return ToolResult::error("missing required field: topic".into()),
@@ -2415,7 +2430,7 @@ fn tool_feedback_record(store: &Store, args: &Value, compact: bool) -> ToolResul
         }
     }
 
-    let feedback = Feedback::new(
+    let mut feedback = Feedback::new(
         topic.into(),
         context.into(),
         predicted.into(),
@@ -2423,6 +2438,15 @@ fn tool_feedback_record(store: &Store, args: &Value, compact: bool) -> ToolResul
         reason,
         source,
     );
+    // Manual-testing finding: feedback search had no semantic fallback at
+    // all — pure FTS5 with implicit AND, so a query missing even one exact
+    // token returned nothing. Attach an embedding here so search_feedback
+    // can blend semantic similarity in, mirroring icm_memory_store.
+    if let Some(emb) = embedder {
+        if let Ok(v) = emb.embed(&feedback.embed_text()) {
+            feedback.embedding = Some(v);
+        }
+    }
 
     let id = feedback.id.clone();
     match store.store_feedback(feedback) {
@@ -2437,15 +2461,20 @@ fn tool_feedback_record(store: &Store, args: &Value, compact: bool) -> ToolResul
     }
 }
 
-fn tool_feedback_search(store: &Store, args: &Value) -> ToolResult {
+fn tool_feedback_search(
+    store: &Store,
+    embedder: Option<&dyn Embedder>,
+    args: &Value,
+) -> ToolResult {
     let query = match get_str(args, "query") {
         Some(q) => q,
         None => return ToolResult::error("missing required field: query".into()),
     };
     let topic = get_str(args, "topic");
     let limit = get_i64(args, "limit", 5).clamp(1, 100) as usize;
+    let query_embedding = embedder.and_then(|emb| emb.embed_query(query).ok());
 
-    match store.search_feedback(query, topic, limit) {
+    match store.search_feedback(query, query_embedding.as_deref(), topic, limit) {
         Ok(results) => {
             if results.is_empty() {
                 return ToolResult::text("No feedback found.".into());
@@ -2541,6 +2570,90 @@ mod tests {
         assert!(
             !compact_out.contains('\n') || compact_out.matches('\n').count() == 1,
             "compact: embedded newline forged an extra line: {compact_out}"
+        );
+    }
+
+    /// Manual-testing finding: `tool_memoir_link` re-wrapped
+    /// `Relation::from_str`'s error (already "invalid relation: <value>")
+    /// in another "invalid relation: {e}", doubling the prefix.
+    #[test]
+    fn memoir_link_invalid_relation_error_is_not_doubled() {
+        let store = test_store();
+        call_tool(
+            &store,
+            None,
+            "icm_memoir_create",
+            &json!({"name": "m"}),
+            false,
+        );
+        call_tool(
+            &store,
+            None,
+            "icm_memoir_add_concept",
+            &json!({"memoir": "m", "name": "a", "definition": "a"}),
+            false,
+        );
+        call_tool(
+            &store,
+            None,
+            "icm_memoir_add_concept",
+            &json!({"memoir": "m", "name": "b", "definition": "b"}),
+            false,
+        );
+        let result = call_tool(
+            &store,
+            None,
+            "icm_memoir_link",
+            &json!({"memoir": "m", "from": "a", "to": "b", "relation": "relates_to"}),
+            false,
+        );
+        assert!(result.is_error);
+        let text = &result.content[0].text;
+        assert_eq!(
+            text.matches("invalid relation:").count(),
+            1,
+            "error prefix must not be doubled: {text}"
+        );
+    }
+
+    /// Manual-testing finding (against a real local Postgres backend):
+    /// `tool_consolidate` (icm_memory_consolidate) never received the
+    /// `embedder` that `call_tool_with_config` already threads through to
+    /// its sibling tools, so the merged memory it creates was always born
+    /// with `embedding: None` — same bug class as #394/#395/cmd_consolidate.
+    #[test]
+    fn tool_consolidate_attaches_an_embedding_to_the_merged_memory() {
+        use icm_core::{Embedder, IcmResult};
+
+        struct StubEmbedder;
+        impl Embedder for StubEmbedder {
+            fn embed(&self, _text: &str) -> IcmResult<Vec<f32>> {
+                Ok(vec![0.3_f32; 64])
+            }
+            fn embed_batch(&self, texts: &[&str]) -> IcmResult<Vec<Vec<f32>>> {
+                texts.iter().map(|t| self.embed(t)).collect()
+            }
+            fn dimensions(&self) -> usize {
+                64
+            }
+        }
+
+        let store = Store::in_memory_with_dims(64).unwrap();
+        let embedder = StubEmbedder;
+        let result = call_tool(
+            &store,
+            Some(&embedder),
+            "icm_memory_consolidate",
+            &json!({"topic": "t", "summary": "merged summary"}),
+            false,
+        );
+        assert!(!result.is_error, "{:?}", result.content);
+
+        let memories = store.get_by_topic("t").unwrap();
+        assert_eq!(memories.len(), 1);
+        assert!(
+            memories[0].embedding.is_some(),
+            "consolidated memory must have an embedding attached"
         );
     }
 

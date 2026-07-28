@@ -1811,12 +1811,20 @@ fn main() -> Result<()> {
                 corrected,
                 reason,
                 source,
-            } => cmd_feedback_record(&store, topic, context, predicted, corrected, reason, source),
+            } => {
+                let emb_ref = embedder.as_ref().map(|e| e as &dyn icm_core::Embedder);
+                cmd_feedback_record(
+                    &store, emb_ref, topic, context, predicted, corrected, reason, source,
+                )
+            }
             FeedbackCommands::Search {
                 query,
                 topic,
                 limit,
-            } => cmd_feedback_search(&store, &query, topic.as_deref(), limit),
+            } => {
+                let emb_ref = embedder.as_ref().map(|e| e as &dyn icm_core::Embedder);
+                cmd_feedback_search(&store, emb_ref, &query, topic.as_deref(), limit)
+            }
             FeedbackCommands::List { topic, limit } => {
                 cmd_feedback_list(&store, topic.as_deref(), limit)
             }
@@ -1925,30 +1933,38 @@ fn main() -> Result<()> {
             summarizer_provider,
             summarizer_model,
             summarizer_max_tokens,
-        } => cmd_consolidate(
-            &store,
-            &topic,
-            keep_originals,
-            &cfg.consolidate.summarizer,
-            summarizer_provider.as_deref(),
-            summarizer_model.as_deref(),
-            summarizer_max_tokens,
-        ),
+        } => {
+            let emb_ref = embedder.as_ref().map(|e| e as &dyn icm_core::Embedder);
+            cmd_consolidate(
+                &store,
+                &topic,
+                keep_originals,
+                &cfg.consolidate.summarizer,
+                summarizer_provider.as_deref(),
+                summarizer_model.as_deref(),
+                summarizer_max_tokens,
+                emb_ref,
+            )
+        }
         Commands::ConsolidateAll {
             threshold,
             summarizer_provider,
             summarizer_model,
             summarizer_max_tokens,
             dry_run,
-        } => cmd_consolidate_all(
-            &store,
-            threshold,
-            &cfg.consolidate.summarizer,
-            summarizer_provider.as_deref(),
-            summarizer_model.as_deref(),
-            summarizer_max_tokens,
-            dry_run,
-        ),
+        } => {
+            let emb_ref = embedder.as_ref().map(|e| e as &dyn icm_core::Embedder);
+            cmd_consolidate_all(
+                &store,
+                threshold,
+                &cfg.consolidate.summarizer,
+                summarizer_provider.as_deref(),
+                summarizer_model.as_deref(),
+                summarizer_max_tokens,
+                dry_run,
+                emb_ref,
+            )
+        }
         Commands::Embed {
             topic,
             force,
@@ -2280,12 +2296,14 @@ fn main() -> Result<()> {
         #[cfg(feature = "tui")]
         Commands::Dashboard => {
             let db_path_str = db_path.to_string_lossy().to_string();
-            tui::run_dashboard(&store, Some(&db_path_str))
+            let emb_ref = embedder.as_ref().map(|e| e as &dyn icm_core::Embedder);
+            tui::run_dashboard(&store, Some(&db_path_str), emb_ref)
         }
         #[cfg(feature = "tui")]
         Commands::Tui => {
             let db_path_str = db_path.to_string_lossy().to_string();
-            tui::run_dashboard(&store, Some(&db_path_str))
+            let emb_ref = embedder.as_ref().map(|e| e as &dyn icm_core::Embedder);
+            tui::run_dashboard(&store, Some(&db_path_str), emb_ref)
         }
     }
 }
@@ -2771,8 +2789,10 @@ fn cmd_health(store: &Store, topic_filter: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_feedback_record(
     store: &Store,
+    embedder: Option<&dyn icm_core::Embedder>,
     topic: String,
     context: String,
     predicted: String,
@@ -2780,7 +2800,7 @@ fn cmd_feedback_record(
     reason: Option<String>,
     source: String,
 ) -> Result<()> {
-    let feedback = Feedback::new(
+    let mut feedback = Feedback::new(
         topic.clone(),
         context,
         predicted.clone(),
@@ -2788,6 +2808,14 @@ fn cmd_feedback_record(
         reason,
         source,
     );
+    // Manual-testing finding: feedback search had no semantic fallback at
+    // all — attach an embedding here so search_feedback can blend
+    // semantic similarity in, mirroring cmd_store.
+    if let Some(emb) = embedder {
+        if let Ok(v) = emb.embed(&feedback.embed_text()) {
+            feedback.embedding = Some(v);
+        }
+    }
     let id = store.store_feedback(feedback)?;
     println!("Feedback recorded: {id}");
     println!("  topic: {topic}");
@@ -2798,11 +2826,13 @@ fn cmd_feedback_record(
 
 fn cmd_feedback_search(
     store: &Store,
+    embedder: Option<&dyn icm_core::Embedder>,
     query: &str,
     topic: Option<&str>,
     limit: usize,
 ) -> Result<()> {
-    let results = store.search_feedback(query, topic, limit)?;
+    let query_embedding = embedder.and_then(|emb| emb.embed_query(query).ok());
+    let results = store.search_feedback(query, query_embedding.as_deref(), topic, limit)?;
     if results.is_empty() {
         println!("No feedback found.");
         return Ok(());
@@ -7196,6 +7226,7 @@ fn cmd_consolidate(
     cli_provider: Option<&str>,
     cli_model: Option<&str>,
     cli_max_tokens: Option<usize>,
+    embedder: Option<&dyn icm_core::Embedder>,
 ) -> Result<()> {
     let memories = store.get_by_topic(topic)?;
     if memories.is_empty() {
@@ -7273,6 +7304,14 @@ fn cmd_consolidate(
 
     let mut consolidated = Memory::new(topic.to_string(), merged_summary, best_importance);
     consolidated.keywords = all_keywords;
+    // Same bug class as #394/#395: cmd_consolidate had no embedder param at
+    // all, so the merged memory was always born with embedding: None — a
+    // real gap found via manual testing against a real Postgres backend.
+    if let Some(emb) = embedder {
+        if let Ok(vec) = emb.embed(&consolidated.embed_text()) {
+            consolidated.embedding = Some(vec);
+        }
+    }
 
     if keep_originals {
         // The originals survive this call, so pointing the consolidated
@@ -7305,6 +7344,7 @@ fn cmd_consolidate(
 /// because a consolidated topic collapses to one memory (below the threshold)
 /// and is skipped next time. Never keeps originals — that would defeat the
 /// idempotency the cron use case relies on.
+#[allow(clippy::too_many_arguments)]
 fn cmd_consolidate_all(
     store: &Store,
     threshold: usize,
@@ -7313,6 +7353,7 @@ fn cmd_consolidate_all(
     cli_model: Option<&str>,
     cli_max_tokens: Option<usize>,
     dry_run: bool,
+    embedder: Option<&dyn icm_core::Embedder>,
 ) -> Result<()> {
     // `threshold = 0` would leave a just-consolidated single-memory topic still
     // "over" the threshold (1 > 0), so every run re-consolidates everything —
@@ -7375,6 +7416,7 @@ fn cmd_consolidate_all(
             cli_provider,
             cli_model,
             cli_max_tokens,
+            embedder,
         ) {
             Ok(()) => done += 1,
             Err(e) => {
@@ -9892,7 +9934,7 @@ mod hook_start_tests {
 
         let cfg = config::SummarizerConfig::default();
         // provider "none" → deterministic lexical consolidation, no LLM spawn.
-        cmd_consolidate_all(&store, 3, &cfg, Some("none"), None, None, false).unwrap();
+        cmd_consolidate_all(&store, 3, &cfg, Some("none"), None, None, false, None).unwrap();
 
         assert_eq!(store.count_by_topic("alpha").unwrap(), 1);
         assert_eq!(store.count_by_topic("gamma").unwrap(), 1);
@@ -9903,7 +9945,7 @@ mod hook_start_tests {
         );
 
         // Idempotent: nothing left over the threshold.
-        cmd_consolidate_all(&store, 3, &cfg, Some("none"), None, None, false).unwrap();
+        cmd_consolidate_all(&store, 3, &cfg, Some("none"), None, None, false, None).unwrap();
         assert_eq!(store.count_by_topic("alpha").unwrap(), 1);
         assert_eq!(store.count_by_topic("beta").unwrap(), 2);
     }
@@ -9918,7 +9960,7 @@ mod hook_start_tests {
                 .unwrap();
         }
         let cfg = config::SummarizerConfig::default();
-        cmd_consolidate_all(&store, 3, &cfg, Some("none"), None, None, true).unwrap();
+        cmd_consolidate_all(&store, 3, &cfg, Some("none"), None, None, true, None).unwrap();
         assert_eq!(
             store.count_by_topic("t").unwrap(),
             5,
@@ -9938,13 +9980,17 @@ mod hook_start_tests {
         let cfg = config::SummarizerConfig::default(); // provider defaults to "none"
                                                        // Bare run (no explicit provider) resolves to none → refuse (a batch
                                                        // lexical join + delete of originals across the whole store).
-        assert!(cmd_consolidate_all(&store, 3, &cfg, None, None, None, false).is_err());
+        assert!(cmd_consolidate_all(&store, 3, &cfg, None, None, None, false, None).is_err());
         // threshold 0 → refuse.
-        assert!(cmd_consolidate_all(&store, 0, &cfg, Some("none"), None, None, false).is_err());
+        assert!(
+            cmd_consolidate_all(&store, 0, &cfg, Some("none"), None, None, false, None).is_err()
+        );
         // Neither refused call touched the data.
         assert_eq!(store.count_by_topic("t").unwrap(), 5);
         // Explicit `none` is an accepted opt-in and does consolidate.
-        assert!(cmd_consolidate_all(&store, 3, &cfg, Some("none"), None, None, false).is_ok());
+        assert!(
+            cmd_consolidate_all(&store, 3, &cfg, Some("none"), None, None, false, None).is_ok()
+        );
         assert_eq!(store.count_by_topic("t").unwrap(), 1);
     }
 
@@ -11108,6 +11154,7 @@ mod cli_contracts_tests {
             None,
             None,
             None,
+            None,
         )
         .unwrap();
 
@@ -11149,6 +11196,7 @@ mod cli_contracts_tests {
             None,
             None,
             None,
+            None,
         )
         .unwrap();
 
@@ -11166,6 +11214,64 @@ mod cli_contracts_tests {
             consolidated.related_ids.contains(&id1) && consolidated.related_ids.contains(&id2),
             "kept originals are live, so related_ids pointing at them is meaningful: {:?}",
             consolidated.related_ids
+        );
+    }
+
+    /// Manual-testing finding (against a real local Postgres backend):
+    /// `cmd_consolidate` had no `embedder` parameter at all, so the merged
+    /// memory it creates was always born with `embedding: None` — same bug
+    /// class as #394/#395, in a third sibling code path.
+    #[test]
+    fn cmd_consolidate_attaches_an_embedding_to_the_merged_memory() {
+        use icm_core::{Embedder, IcmResult};
+
+        struct StubEmbedder;
+        impl Embedder for StubEmbedder {
+            fn embed(&self, _text: &str) -> IcmResult<Vec<f32>> {
+                Ok(vec![0.3_f32; 64])
+            }
+            fn embed_batch(&self, texts: &[&str]) -> IcmResult<Vec<Vec<f32>>> {
+                texts.iter().map(|t| self.embed(t)).collect()
+            }
+            fn dimensions(&self) -> usize {
+                64
+            }
+        }
+
+        let store = Store::in_memory_with_dims(64).unwrap();
+        store
+            .store(icm_core::Memory::new(
+                "t".into(),
+                "expendable 1".into(),
+                icm_core::Importance::Medium,
+            ))
+            .unwrap();
+        store
+            .store(icm_core::Memory::new(
+                "t".into(),
+                "expendable 2".into(),
+                icm_core::Importance::Medium,
+            ))
+            .unwrap();
+
+        let embedder = StubEmbedder;
+        cmd_consolidate(
+            &store,
+            "t",
+            false,
+            &config::SummarizerConfig::default(),
+            None,
+            None,
+            None,
+            Some(&embedder),
+        )
+        .unwrap();
+
+        let all = store.get_by_topic("t").unwrap();
+        assert_eq!(all.len(), 1);
+        assert!(
+            all[0].embedding.is_some(),
+            "consolidated memory must have an embedding attached"
         );
     }
 
